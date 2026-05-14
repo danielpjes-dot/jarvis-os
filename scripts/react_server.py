@@ -1876,7 +1876,6 @@ class ReactHandler(BaseHTTPRequestHandler):
     def log_message(self, fmt: str, *args: Any) -> None:
         return
 
-
 # -----------------------------------------------------------------------------
 # Entrypoint
 # -----------------------------------------------------------------------------
