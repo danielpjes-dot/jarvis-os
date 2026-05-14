@@ -42,6 +42,7 @@ entities.json
 mempalace.yaml
 *.log
 bridge/
+orpheus_env/
 
 # Next.js
 .next/

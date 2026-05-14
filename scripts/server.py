@@ -2,23 +2,26 @@
 Jarvis Local HTTP Server — browser bridge + local control API.
 
 Serves the browser voice UI and provides API endpoints for bridge files,
-live logs, model config visibility, and local helper actions.
+live logs, model config visibility, coding file access, and local helper actions.
 
 Endpoints:
-  GET  /                 -> jarvis_browser.html
-  GET  /api/state        -> current bridge state
-  GET  /api/output       -> current output
-  GET  /api/gpu          -> GPU stats
-  GET  /api/logs         -> tail of jarvis.log
-  GET  /api/models       -> current model-config.json + react model info
-  GET  /api/react-events -> recent ReAct activity events
-  GET  /api/file         -> serve allowed local files
-  GET  /api/flux/status  -> image generation status
-  POST /api/input        -> write to input.txt / internal commands
-  POST /api/settings     -> persist UI settings
-  POST /api/state-override -> force bridge state
-  POST /api/transcribe   -> whisper transcription
-  POST /api/flux         -> start FLUX generation
+  GET  /                         -> jarvis_browser.html
+  GET  /api/state                -> current bridge state
+  GET  /api/output               -> current output
+  GET  /api/gpu                  -> GPU stats
+  GET  /api/logs                 -> tail of jarvis.log
+  GET  /api/models               -> current model-config.json + react model info
+  GET  /api/react-events         -> recent ReAct activity events
+  GET  /api/file                 -> serve allowed local files
+  GET  /api/coding/read-file     -> read allowed text file for editor
+  GET  /api/flux/status          -> image generation status
+
+  POST /api/input                -> write to input.txt / internal commands
+  POST /api/settings             -> persist UI settings
+  POST /api/state-override       -> force bridge state
+  POST /api/transcribe           -> whisper transcription
+  POST /api/flux                 -> start FLUX generation
+  POST /api/coding/write-file    -> write allowed text file from editor
 
 Usage:
   python scripts/server.py [--port 4000]
@@ -47,24 +50,26 @@ sys.path.insert(0, str(PROJECT_ROOT))
 from scripts.model_config import get_models, get_planner_model, load_model_config
 
 BRIDGE_DIR = Path(os.environ.get("JARVIS_BRIDGE_DIR", "/tmp/jarvis"))
+
 VAULT_DIR = Path(
     os.environ.get(
         "JARVIS_VAULT_DIR",
         "D:/Jarvis_vault" if os.name == "nt" else "/mnt/d/Jarvis_vault",
     )
 )
+
 SCRIPTS_DIR = Path(__file__).resolve().parent
 MODEL_CONFIG_PATH = PROJECT_ROOT / "config/models-config.json"
 REACT_EVENTS_PATH = BRIDGE_DIR / "react_events.jsonl"
 REACT_HOST = os.environ.get("JARVIS_REACT_HOST", "http://127.0.0.1:7900")
 OLLAMA_HOST = os.environ.get("JARVIS_OLLAMA_API", "http://127.0.0.1:11434")
+
 PORT = int(sys.argv[sys.argv.index("--port") + 1]) if "--port" in sys.argv else 4000
 
 TRANSLATIONS: Dict[str, str] = {}
 TRANSLATIONS_FILE = VAULT_DIR / "References" / "voice-translations.md"
 _whisper_model = None
 
-# Endpoints that poll often and should not spam logs
 NOISY_PATHS = {
     "/api/state",
     "/api/output",
@@ -102,6 +107,7 @@ def log(msg: str) -> None:
             f.write(f"[{datetime.now().strftime('%H:%M:%S')}] [HTTP] {msg}\n")
     except Exception:
         pass
+
     print(f"[JARVIS HTTP] {msg}")
 
 
@@ -133,6 +139,7 @@ def read_json_file(path: Path, default: Any) -> Any:
 def read_json_body(handler: "JarvisHandler") -> Dict[str, Any]:
     length = int(handler.headers.get("Content-Length", 0))
     raw = handler.rfile.read(length).decode("utf-8") if length else "{}"
+
     try:
         data = json.loads(raw)
         return data if isinstance(data, dict) else {}
@@ -143,8 +150,12 @@ def read_json_body(handler: "JarvisHandler") -> Dict[str, Any]:
 def recent_react_events(limit: int = 100) -> List[Dict[str, Any]]:
     if not REACT_EVENTS_PATH.exists():
         return []
+
     try:
-        lines = REACT_EVENTS_PATH.read_text(encoding="utf-8", errors="replace").splitlines()[-limit:]
+        lines = REACT_EVENTS_PATH.read_text(
+            encoding="utf-8",
+            errors="replace",
+        ).splitlines()[-limit:]
         return [json.loads(line) for line in lines if line.strip()]
     except Exception as e:
         log(f"Failed reading react events: {e}")
@@ -164,13 +175,17 @@ def get_gpu_stats() -> list:
             timeout=5,
             check=False,
         )
+
         gpus = []
+
         for line in result.stdout.strip().split("\n"):
             if not line.strip():
                 continue
+
             parts = [p.strip() for p in line.split(",")]
             if len(parts) < 10:
                 continue
+
             gpus.append(
                 {
                     "name": parts[0],
@@ -185,7 +200,9 @@ def get_gpu_stats() -> list:
                     "clockMem": int(parts[9]),
                 }
             )
+
         return gpus
+
     except Exception as e:
         log(f"GPU stats failed: {e}")
         return []
@@ -203,7 +220,40 @@ def is_under_allowed_root(target: Path) -> bool:
             return True
         except ValueError:
             continue
+
     return False
+
+
+def read_text_file_for_editor(target: Path, max_bytes: int = 2_000_000) -> Dict[str, Any]:
+    if not is_under_allowed_root(target):
+        return {"ok": False, "error": "Path not allowed"}
+
+    if not target.exists():
+        return {"ok": False, "error": "File not found"}
+
+    if not target.is_file():
+        return {"ok": False, "error": "Not a file"}
+
+    try:
+        size = target.stat().st_size
+
+        if size > max_bytes:
+            return {
+                "ok": False,
+                "error": f"File too large for editor: {size} bytes",
+                "size": size,
+            }
+
+        return {
+            "ok": True,
+            "path": str(target),
+            "name": target.name,
+            "size": size,
+            "content": target.read_text(encoding="utf-8", errors="replace"),
+        }
+
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
 
 
 # -----------------------------------------------------------------------------
@@ -212,6 +262,7 @@ def is_under_allowed_root(target: Path) -> bool:
 
 def get_live_model_info() -> Dict[str, Any]:
     cfg = load_model_config()
+
     out: Dict[str, Any] = {
         "config": cfg,
         "models": get_models(),
@@ -244,26 +295,30 @@ def get_live_model_info() -> Dict[str, Any]:
 
 
 # -----------------------------------------------------------------------------
-# Whisper (lazy-loaded on first transcribe request)
+# Whisper
 # -----------------------------------------------------------------------------
 
 def get_whisper():
     global _whisper_model
+
     if _whisper_model is None:
-        os.environ["CUDA_VISIBLE_DEVICES"] = ""  # CPU only — GPU reserved for Ollama
+        os.environ["CUDA_VISIBLE_DEVICES"] = ""
         import whisper
 
         log("Loading Whisper base model")
         _whisper_model = whisper.load_model("base")
         log("Whisper ready")
+
     return _whisper_model
 
 
 def transcribe_audio(audio_bytes: bytes) -> str:
     model = get_whisper()
+
     with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f:
         f.write(audio_bytes)
         tmp_path = f.name
+
     try:
         result = model.transcribe(
             tmp_path,
@@ -272,6 +327,7 @@ def transcribe_audio(audio_bytes: bytes) -> str:
             initial_prompt="Hey JARVIS, OK JARVIS, play radio, check my projects, Suomipop, Radio Nova, StockWatch",
         )
         return result["text"].strip()
+
     finally:
         try:
             os.unlink(tmp_path)
@@ -285,26 +341,34 @@ def transcribe_audio(audio_bytes: bytes) -> str:
 
 def load_translations() -> None:
     global TRANSLATIONS
+
     try:
         if not TRANSLATIONS_FILE.exists():
             return
+
         with open(TRANSLATIONS_FILE, encoding="utf-8") as f:
             for line in f:
                 line = line.strip()
+
                 if line.startswith("|") and "|" in line[1:] and "Heard" not in line and "---" not in line:
                     parts = [p.strip() for p in line.split("|") if p.strip()]
+
                     if len(parts) == 2:
                         TRANSLATIONS[parts[0].lower()] = parts[1]
+
         log(f"Loaded {len(TRANSLATIONS)} voice translations")
+
     except Exception as e:
         log(f"Failed loading translations: {e}")
 
 
 def correct_text(text: str) -> str:
     lower = text.lower()
+
     for heard, corrected in TRANSLATIONS.items():
         if heard in lower:
             lower = lower.replace(heard, corrected.lower())
+
     return lower[0].upper() + lower[1:] if lower else text
 
 
@@ -345,20 +409,50 @@ class JarvisHandler(http.server.SimpleHTTPRequestHandler):
             self._json_response({"events": recent_react_events(100)})
             return
 
+        if path == "/api/coding/read-file":
+            params = parse_qs(urlparse(self.path).query)
+            file_path = params.get("path", [""])[0]
+
+            if not file_path:
+                self._json_response({"ok": False, "error": "Missing path"}, 400)
+                return
+
+            target = Path(file_path).resolve()
+            result = read_text_file_for_editor(target)
+
+            if not result.get("ok"):
+                error = result.get("error")
+                if error == "Path not allowed":
+                    code = 403
+                elif error == "File not found":
+                    code = 404
+                else:
+                    code = 400
+
+                self._json_response(result, code)
+                return
+
+            self._json_response(result)
+            return
+
         if path == "/api/file":
             params = parse_qs(urlparse(self.path).query)
             file_path = params.get("path", [""])[0]
+
             if not file_path:
                 self.send_error(400, "Missing path")
                 return
 
             target = Path(file_path).resolve()
+
             if not is_under_allowed_root(target):
                 self.send_error(403, "Path not allowed")
                 return
+
             if not target.exists():
                 self.send_error(404, "File not found")
                 return
+
             if not target.is_file():
                 self.send_error(400, "Not a file")
                 return
@@ -366,6 +460,7 @@ class JarvisHandler(http.server.SimpleHTTPRequestHandler):
             try:
                 data = target.read_bytes()
                 self.send_response(200)
+
                 ext = target.suffix.lower()
                 ct = {
                     ".png": "image/png",
@@ -378,14 +473,26 @@ class JarvisHandler(http.server.SimpleHTTPRequestHandler):
                     ".txt": "text/plain; charset=utf-8",
                     ".md": "text/markdown; charset=utf-8",
                     ".html": "text/html; charset=utf-8",
+                    ".ts": "text/plain; charset=utf-8",
+                    ".tsx": "text/plain; charset=utf-8",
+                    ".js": "text/plain; charset=utf-8",
+                    ".jsx": "text/plain; charset=utf-8",
+                    ".py": "text/plain; charset=utf-8",
+                    ".css": "text/plain; charset=utf-8",
+                    ".sh": "text/plain; charset=utf-8",
+                    ".yml": "text/plain; charset=utf-8",
+                    ".yaml": "text/plain; charset=utf-8",
                 }.get(ext, "application/octet-stream")
+
                 self.send_header("Content-Type", ct)
                 self.send_header("Content-Length", str(len(data)))
                 self.send_header("Access-Control-Allow-Origin", "*")
                 self.end_headers()
                 self.wfile.write(data)
+
             except Exception as e:
                 self.send_error(500, str(e))
+
             return
 
         if path == "/api/flux/status":
@@ -408,7 +515,10 @@ class JarvisHandler(http.server.SimpleHTTPRequestHandler):
             try:
                 log_path = VAULT_DIR / "jarvis.log"
                 if log_path.exists():
-                    lines = log_path.read_text(encoding="utf-8", errors="replace").strip().split("\n")
+                    lines = log_path.read_text(
+                        encoding="utf-8",
+                        errors="replace",
+                    ).strip().split("\n")
                     self._json_response({"lines": lines[-100:]})
                 else:
                     self._json_response({"lines": []})
@@ -423,26 +533,67 @@ class JarvisHandler(http.server.SimpleHTTPRequestHandler):
 
         if path == "/api/settings":
             data = read_json_body(self)
+
             if "voice" in data:
                 write_file("settings_voice.txt", str(data["voice"]))
+
             if "personality" in data:
                 write_file("settings_personality.txt", str(data["personality"]))
+
             debug_log_request(path, f"Settings updated: keys={list(data.keys())}")
             self._json_response({"status": "ok"})
             return
 
         if path == "/api/state-override":
             data = read_json_body(self)
+
             try:
                 if "state" in data:
                     write_file("state.txt", str(data["state"]))
                     debug_log_request(path, f"State override -> {data['state']}")
                     self._json_response({"status": "ok"})
                     return
+
                 self._json_response({"status": "error", "message": "Missing state"}, 400)
+
             except Exception as e:
                 log(f"State override failed: {e}")
                 self._json_response({"status": "error", "message": str(e)}, 500)
+
+            return
+
+        if path == "/api/coding/write-file":
+            data = read_json_body(self)
+
+            file_path = str(data.get("path", "")).strip()
+            content = str(data.get("content", ""))
+
+            if not file_path:
+                self._json_response({"ok": False, "error": "Missing path"}, 400)
+                return
+
+            target = Path(file_path).resolve()
+
+            if not is_under_allowed_root(target):
+                self._json_response({"ok": False, "error": "Path not allowed"}, 403)
+                return
+
+            try:
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_text(content, encoding="utf-8")
+                debug_log_request(path, f"Coding write file: {target}")
+
+                self._json_response(
+                    {
+                        "ok": True,
+                        "path": str(target),
+                        "size": target.stat().st_size,
+                    }
+                )
+
+            except Exception as e:
+                self._json_response({"ok": False, "error": str(e)}, 500)
+
             return
 
         if path == "/api/flux":
@@ -458,12 +609,15 @@ class JarvisHandler(http.server.SimpleHTTPRequestHandler):
                     log(f"FLUX generation started: {prompt[:100]}")
                     flux_mod = importlib.import_module("skills.flux")
                     result = flux_mod.exec_generate_image(prompt, enhance="no")
+
                     BRIDGE_DIR.mkdir(parents=True, exist_ok=True)
                     (BRIDGE_DIR / "flux_result.json").write_text(
                         json.dumps({"status": "done", "message": result}),
                         encoding="utf-8",
                     )
+
                     log("FLUX generation finished")
+
                 except Exception as e:
                     (BRIDGE_DIR / "flux_result.json").write_text(
                         json.dumps({"status": "error", "message": str(e)}),
@@ -473,6 +627,7 @@ class JarvisHandler(http.server.SimpleHTTPRequestHandler):
 
             result_file = BRIDGE_DIR / "flux_result.json"
             result_file.write_text(json.dumps({"status": "generating"}), encoding="utf-8")
+
             threading.Thread(target=_generate, daemon=True).start()
             self._json_response({"status": "generating", "poll": "/api/flux/status"})
             return
@@ -480,37 +635,47 @@ class JarvisHandler(http.server.SimpleHTTPRequestHandler):
         if path == "/api/transcribe":
             length = int(self.headers.get("Content-Length", 0))
             audio_bytes = self.rfile.read(length)
+
             try:
                 debug_log_request(path, f"Transcribe request: {len(audio_bytes)} bytes")
                 text = transcribe_audio(audio_bytes)
+
                 if text:
                     corrected = correct_text(text)
                     last_output = read_file("output.txt").lower()
+
                     heard_words = set(corrected.lower().split())
                     output_words = set(last_output.split()) if last_output else set()
+
                     overlap = len(heard_words & output_words) / max(len(heard_words), 1)
                     is_echo = overlap > 0.5
-                    self._json_response({
-                        "text": corrected,
-                        "raw": text if corrected != text else None,
-                        "echo": is_echo,
-                    })
+
+                    self._json_response(
+                        {
+                            "text": corrected,
+                            "raw": text if corrected != text else None,
+                            "echo": is_echo,
+                        }
+                    )
                 else:
                     self._json_response({"text": "", "echo": False})
+
             except Exception as e:
                 log(f"Transcribe failed: {e}")
                 self._json_response({"error": str(e)}, 500)
+
             return
 
         if path == "/api/input":
             length = int(self.headers.get("Content-Length", 0))
             raw_body = self.rfile.read(length).decode("utf-8")
+
             try:
                 data = json.loads(raw_body)
                 text = str(data.get("text", "")).strip()
             except json.JSONDecodeError:
                 text = raw_body.strip()
-
+            
             if text and not text.startswith("__"):
                 write_file("input.txt", text)
                 debug_log_request(path, f"Input accepted: {text[:120]}")
@@ -527,6 +692,7 @@ class JarvisHandler(http.server.SimpleHTTPRequestHandler):
                     try:
                         safe = tts_text.replace("'", "''")
                         ps = "/mnt/c/Windows/System32/WindowsPowerShell/v1.0/powershell.exe"
+
                         subprocess.run(
                             [
                                 ps,
@@ -538,18 +704,37 @@ class JarvisHandler(http.server.SimpleHTTPRequestHandler):
                             timeout=15,
                             capture_output=True,
                         )
+
                     except Exception as e:
                         log(f"Internal TTS failed: {e}")
+
                     write_file("state.txt", "standby")
 
                 threading.Thread(target=_speak_tts, daemon=True).start()
                 self._json_response({"status": "ok", "tts": tts_text})
                 return
+            if text.lower() in ["stop radio", "radio off", "kill radio"]:
+                log("Direct command: STOP RADIO")
 
+                def _stop_radio():
+                    try:
+                        subprocess.run(["pkill", "-f", "mpv"])
+                        subprocess.run(["pkill", "-f", "radio"])
+                        
+                        
+                    except Exception as e:
+                        log(f"Radio stop failed: {e}")
+
+                threading.Thread(target=_stop_radio, daemon=True).start()
+
+                write_file("output.txt", "Radio stopped.")
+                write_file("state.txt", "standby")
+
+                self._json_response({"status": "ok", "direct": "stop_radio"})
+                return
             if text.startswith("__exec:"):
                 cmd = text[7:]
 
-                # Explicit allowlist without shell=True
                 allowed_execs = {
                     "stop_main": ["pkill", "-f", "python3 main.py"],
                     "stop_comfyui": ["pkill", "-f", "comfyui"],
@@ -571,9 +756,11 @@ class JarvisHandler(http.server.SimpleHTTPRequestHandler):
 
                     threading.Thread(target=_run_exec, daemon=True).start()
                     self._json_response({"status": "ok", "exec": cmd})
+
                 else:
                     log(f"Internal exec blocked: {cmd}")
                     self._json_response({"status": "error", "message": "Command not allowed"}, 403)
+
                 return
 
             if text.startswith("__"):
@@ -587,6 +774,7 @@ class JarvisHandler(http.server.SimpleHTTPRequestHandler):
 
     def _json_response(self, data: dict, code: int = 200):
         body = json.dumps(data, ensure_ascii=False).encode("utf-8")
+
         self.send_response(code)
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Access-Control-Allow-Origin", "*")
@@ -604,20 +792,16 @@ class JarvisHandler(http.server.SimpleHTTPRequestHandler):
         self.end_headers()
 
     def log_message(self, format, *args):
-        """
-        Suppress noisy access logging.
-        Only log non-polling requests and errors worth keeping.
-        """
         try:
             msg = format % args
         except Exception:
             msg = str(args[0]) if args else format
 
         path = urlparse(getattr(self, "path", "")).path
+
         if path in NOISY_PATHS:
             return
 
-        # Optional: also suppress static asset noise
         if path.startswith("/jarvis_browser") or path.endswith((".js", ".css", ".map", ".ico")):
             return
 
@@ -626,12 +810,15 @@ class JarvisHandler(http.server.SimpleHTTPRequestHandler):
 
 if __name__ == "__main__":
     ensure_dirs()
+
     log(f"HTTP server starting on http://127.0.0.1:{PORT}")
     log(f"Serving HTML from {SCRIPTS_DIR}")
     log(f"Bridge files at {BRIDGE_DIR}")
     log(f"Model config path: {MODEL_CONFIG_PATH}")
+    log(f"Allowed file roots: {[str(p) for p in ALLOWED_FILE_ROOTS]}")
 
     server = http.server.ThreadingHTTPServer(("127.0.0.1", PORT), JarvisHandler)
+
     try:
         server.serve_forever()
     except KeyboardInterrupt:

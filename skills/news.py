@@ -2,11 +2,8 @@
 JARVIS Skill — News by topic and optional location.
 
 Uses Google News RSS feeds.
-Supports:
-- top headlines by location
-- topic search with optional location boost
-
-No API key required.
+Returns structured UI result when supported by frontend.
+Still works with old/plain text fallback through speech.summary.
 """
 
 import html
@@ -14,20 +11,17 @@ import re
 import urllib.parse
 import urllib.request
 import xml.etree.ElementTree as ET
-from typing import Dict, List, Tuple
+from typing import Dict, List, Tuple, Any
 
 
 SKILL_NAME = "news"
 SKILL_DESCRIPTION = "News headlines by topic and optional location"
-SKILL_VERSION = "1.1.0"
+SKILL_VERSION = "1.2.0"
 SKILL_AUTHOR = "Sami Porokka"
 SKILL_CATEGORY = "utility"
-SKILL_TAGS = ["news", "headlines", "location", "topic", "rss"]
+SKILL_TAGS = ["news", "headlines", "location", "topic", "rss", "ui"]
 SKILL_REQUIREMENTS = []
-SKILL_CAPABILITIES = [
-    "top_news",
-    "search_news",
-]
+SKILL_CAPABILITIES = ["top_news", "search_news"]
 
 SKILL_META = {
     "name": SKILL_NAME,
@@ -42,8 +36,12 @@ SKILL_META = {
     "reads_files": False,
     "network_access": True,
     "entrypoint": "exec_news",
+    "route": "tools",
+    "intent_aliases": ["news", "headlines", "latest news", "top stories"],
+    "keywords": ["news", "headlines", "latest news", "what's happening", "top stories", "local news"],
+    "direct_match": ["news", "headlines", "latest news", "top stories"],
     "response_style": {
-        "default": "compact_numbered_digest",
+        "default": "structured_news_ui",
         "avoid_raw_dump": True,
         "followup_hint": True,
     },
@@ -68,13 +66,6 @@ LANG_BY_LOCATION = {
 }
 
 
-def _truncate(text: str, limit: int = 5000) -> str:
-    text = text.replace("**", "").strip()
-    if len(text) <= limit:
-        return text
-    return text[:limit].rstrip() + "\n...[truncated]"
-
-
 def _clean_text(text: str) -> str:
     text = html.unescape((text or "").strip())
     text = re.sub(r"<[^>]+>", " ", text)
@@ -85,7 +76,6 @@ def _clean_text(text: str) -> str:
 def _clean_title(title: str, source: str = "") -> str:
     title = _clean_text(title)
 
-    # Google titles often end with " - Source"
     if source:
         suffix = f" - {source}"
         if title.endswith(suffix):
@@ -94,7 +84,7 @@ def _clean_title(title: str, source: str = "") -> str:
     return title.strip(" -–—")
 
 
-def _shorten(text: str, max_len: int = 140) -> str:
+def _shorten(text: str, max_len: int = 180) -> str:
     text = _clean_text(text)
     if len(text) <= max_len:
         return text
@@ -152,7 +142,7 @@ def _rss_fetch(url: str, timeout: int = 12) -> List[Dict[str, str]]:
 
 def _dedupe_items(items: List[Dict[str, str]]) -> List[Dict[str, str]]:
     seen = set()
-    out = []
+    out: List[Dict[str, str]] = []
 
     for item in items:
         key = (item.get("title", "").lower(), item.get("source", "").lower())
@@ -164,38 +154,121 @@ def _dedupe_items(items: List[Dict[str, str]]) -> List[Dict[str, str]]:
     return out
 
 
-def _format_digest(title: str, items: List[Dict[str, str]], limit: int = 6) -> str:
-    if not items:
+def _plain_digest(title: str, ui_items: List[Dict[str, Any]]) -> str:
+    if not ui_items:
         return f"{title}:\nNo news found."
 
-    limit = max(1, min(limit, 10))
-    items = _dedupe_items(items)[:limit]
-
-    lines = [f"{title}:"]
-    lines.append("")
-
-    for idx, item in enumerate(items, start=1):
-        headline = _shorten(item.get("title", ""), 160)
-        source = item.get("source", "").strip()
-
+    lines = [f"{title}:", ""]
+    for item in ui_items:
+        source = item.get("source", "")
+        headline = item.get("title", "")
         if source:
-            lines.append(f"{idx}. {headline} ({source})")
+            lines.append(f"{item.get('id')}. {headline} ({source})")
         else:
-            lines.append(f"{idx}. {headline}")
+            lines.append(f"{item.get('id')}. {headline}")
 
     lines.append("")
     lines.append("Say: summarize number 5")
     return "\n".join(lines)
 
 
-def exec_news(action: str, topic: str = "", location: str = "", limit: int = 6) -> str:
+def _build_news_result(title: str, items: List[Dict[str, str]], limit: int = 6) -> Dict[str, Any]:
+    limit = max(1, min(int(limit), 10))
+    items = _dedupe_items(items)[:limit]
+
+    ui_items: List[Dict[str, Any]] = []
+    for idx, item in enumerate(items, start=1):
+        ui_items.append(
+            {
+                "id": idx,
+                "title": _shorten(item.get("title", ""), 180),
+                "source": item.get("source", "").strip(),
+                "published": item.get("pubDate", "").strip(),
+                "story": _shorten(item.get("description", ""), 260),
+                "url": item.get("link", "").strip(),
+            }
+        )
+
+    if not ui_items:
+        speech = f"No news found for {title}."
+    else:
+        speech = f"I found {len(ui_items)} headlines for {title}."
+
+    plain = _plain_digest(title, ui_items)
+
+    return {
+    "ok": True,
+    "speech": {
+        "text": speech,
+        "priority": "normal",
+    },
+    "ui": {
+        "placement": "tab",
+        "format": "news",
+        "title": title,
+        "summary": speech,
+        "items": ui_items,
+        "ttl_seconds": 600,
+        "closable": True,
+        "actions": [
+            {
+                "type": "close_tab",
+                "label": "Close news",
+            }
+        ],
+    },
+    "action": {
+        "type": "open_tab",
+        "payload": {
+            "tab_id": "news",
+            "label": "NEWS",
+        },
+    },
+    "data": {
+        "title": title,
+        "items": ui_items,
+        "plain": plain,
+    },
+}
+
+
+def _error_result(title: str, message: str, error: str = "") -> Dict[str, Any]:
+    return {
+        "ok": False,
+        "speech": {
+            "text": message,
+            "priority": "normal",
+        },
+        "ui": {
+            "placement": "right-side-hud",
+            "format": "status",
+            "title": title,
+            "summary": message,
+            "ttl_seconds": 300,
+        },
+        "data": {
+            "plain": f"{title}: {message}",
+        },
+        "error": error or message,
+    }
+
+
+def exec_news(action: str, topic: str = "", location: str = "", limit: int = 6) -> Dict[str, Any]:
     action = (action or "").strip().lower()
     topic = (topic or "").strip()
     location = (location or "").strip()
-    limit = max(1, min(int(limit), 10))
+
+    try:
+        limit = max(1, min(int(limit), 10))
+    except Exception:
+        limit = 6
 
     if action not in {"top", "search"}:
-        return "Available actions: top, search"
+        return _error_result(
+            "News",
+            "Available news actions are top and search.",
+            "invalid_action",
+        )
 
     lang, ceid = _lang_region(location)
 
@@ -212,7 +285,7 @@ def exec_news(action: str, topic: str = "", location: str = "", limit: int = 6) 
                 )
                 url = f"{GOOGLE_NEWS_SEARCH}?{query}"
                 items = _rss_fetch(url)
-                return _truncate(_format_digest(f"Top news for {location}", items, limit=limit), 5000)
+                return _build_news_result(f"Top news for {location}", items, limit=limit)
 
             query = urllib.parse.urlencode(
                 {
@@ -223,10 +296,14 @@ def exec_news(action: str, topic: str = "", location: str = "", limit: int = 6) 
             )
             url = f"{GOOGLE_NEWS_TOP}?{query}"
             items = _rss_fetch(url)
-            return _truncate(_format_digest("Top news", items, limit=limit), 5000)
+            return _build_news_result("Top news", items, limit=limit)
 
         if not topic:
-            return "Error: topic is required for search."
+            return _error_result(
+                "News search",
+                "A topic is required for news search.",
+                "topic_required",
+            )
 
         query_text = topic
         if location:
@@ -247,10 +324,14 @@ def exec_news(action: str, topic: str = "", location: str = "", limit: int = 6) 
         if location:
             title += f" in {location}"
 
-        return _truncate(_format_digest(title, items, limit=limit), 5000)
+        return _build_news_result(title, items, limit=limit)
 
     except Exception as e:
-        return f"News error: {e}"
+        return _error_result(
+            "News error",
+            "I could not fetch the news.",
+            str(e),
+        )
 
 
 TOOLS = [
@@ -304,7 +385,19 @@ KEYWORDS = {
 }
 
 SKILL_EXAMPLES = [
-    {"command": "top news in Estonia", "tool": "news", "args": {"action": "top", "location": "Estonia"}},
-    {"command": "latest AI news", "tool": "news", "args": {"action": "search", "topic": "AI"}},
-    {"command": "Ukraine news in Europe", "tool": "news", "args": {"action": "search", "topic": "Ukraine", "location": "Europe"}},
+    {
+        "command": "top news in Estonia",
+        "tool": "news",
+        "args": {"action": "top", "location": "Estonia"},
+    },
+    {
+        "command": "latest AI news",
+        "tool": "news",
+        "args": {"action": "search", "topic": "AI"},
+    },
+    {
+        "command": "Ukraine news in Europe",
+        "tool": "news",
+        "args": {"action": "search", "topic": "Ukraine", "location": "Europe"},
+    },
 ]
