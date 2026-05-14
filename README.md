@@ -12,6 +12,9 @@ Built by [Sami Porokka](https://poro-it.com) / Poro-IT OÜ
 
 - **Multi-Model Routing** — Queries routed to the best local model (fast / reason / code / deep / cloud)
 - **ReAct Agent Loop** — Think → Tool → Observe → Repeat until task complete
+- **Telegram control** — Telegram gateway and connected to react server (Mobile hud)
+- **Coder tab and loop** — Coding tool connected to react server and agent loop. 
+- **Running services** — Jarvis can run services Like dication that monitors and logs all the time or watch emails, calendar
 - **Modular Skills** — 20 plug-and-play skill modules with 35+ tools, enable/disable via config
 - **Voice I/O** — Wake word "Hey JARVIS", Whisper STT, Orpheus TTS with 5.1 center-channel output
 - **Persistent Memory** — [MemPalace](https://github.com/milla-jovovich/mempalace) vector DB + Obsidian vault (2000+ memories)
@@ -79,6 +82,7 @@ JARVIS uses a modular skill system. Each skill is a self-contained Python module
 | **phone** | `phone` | Phone calls via Twilio — make/receive calls, voicemail | [Guide](docs/skills/phone.md) |
 | **sms** | `sms` | SMS text messages via Twilio | [Guide](docs/skills/sms.md) |
 | **email** | `email` | Email — send, inbox, search via SMTP/IMAP | [Guide](docs/skills/email.md) |
+| **coding** | `coding` | Coding skill both generic and qwen3-coder 
 
 **Full skill system documentation:** [docs/SKILLS.md](docs/SKILLS.md)
 
