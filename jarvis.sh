@@ -120,7 +120,7 @@ stop_named_processes() {
   sudo pkill -f "/usr/local/bin/ollama runner" 2>/dev/null || true
 }
 telegram_watcher() {
-  
+
   cd "$PROJECT_DIR" || return 1
 
   set -a
