@@ -6,11 +6,11 @@
     "fast": "qwen3:8b",
     "tools":"qwen3:14b",
     "reason": "gemma4:26b",
-    "code": "gemma4:26b",
+    "code": "qwen3-coder:30b",
     "deep": "gemma4:26b"
   },
   "skill_models": {
-    "coding": "gemma4:26b",
+    "coding": "qwen3-coder:30b",
     "web": "qwen3:14b",
     "memory": "qwen3:14b",
     "shell": "qwen3:14b"

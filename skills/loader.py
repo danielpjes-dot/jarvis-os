@@ -163,7 +163,7 @@ def load_skills() -> List[Dict[str, Any]]:
         except Exception as e:
             print(f"[SKILLS] Config error: {e}")
 
-    skip = {"__init__", "loader"}
+    skip = {"__init__", "loader","coding_generic", "coding_qwen3_coder"}
     seen_tool_names = set()
 
     for path in sorted(SKILLS_DIR.glob("*.py")):

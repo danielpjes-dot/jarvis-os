@@ -15,7 +15,7 @@ function classifyLine(text: string): string {
 
 export function SystemLog() {
   const [lines, setLines] = useState<string[]>([]);
-  const [expanded, setExpanded] = useState(false);
+  const [expanded, setExpanded] = useState(true);
   const [lastLine, setLastLine] = useState("");
   const scrollRef = useRef<HTMLDivElement>(null);
 
@@ -26,10 +26,13 @@ export function SystemLog() {
       try {
         const res = await fetch("/api/logs", { cache: "no-store" });
         const data = await res.json();
+
         if (active && Array.isArray(data.lines)) {
-          const last = data.lines[data.lines.length - 1] || "";
-          if (last !== lastLine) {
-            setLines(data.lines);
+          const nextLines = data.lines;
+          const last = nextLines[nextLines.length - 1] || "";
+
+          if (last !== lastLine || nextLines.length !== lines.length) {
+            setLines(nextLines);
             setLastLine(last);
           }
         }
@@ -38,8 +41,12 @@ export function SystemLog() {
 
     poll();
     const id = setInterval(poll, 1000);
-    return () => { active = false; clearInterval(id); };
-  }, [lastLine]);
+
+    return () => {
+      active = false;
+      clearInterval(id);
+    };
+  }, [lastLine, lines.length]);
 
   useEffect(() => {
     if (expanded && scrollRef.current) {
@@ -47,36 +54,47 @@ export function SystemLog() {
     }
   }, [lines, expanded]);
 
-  const visibleLines = expanded ? lines : lines.slice(-8);
+  const visibleLines = expanded ? lines : lines.slice(0, 5);
 
   return (
-    <div
-      className={`system-log ${expanded ? "expanded" : ""}`}
-      onClick={() => setExpanded((e) => !e)}
-    >
-      {/* Holographic header */}
-      <div className="log-header">
-        <span className="log-header-dot" />
-        <span>SYSTEM LOG</span>
-        <span className="log-header-count">{lines.length}</span>
-      </div>
+    <div className={`system-log ${expanded ? "expanded" : ""}`}>
+      <button
+        type="button"
+        className="log-toggle"
+        onClick={() => setExpanded((e) => !e)}
+        aria-expanded={expanded}
+      >
+        <div className="log-header">
+          <span className="log-header-dot" />
+          <span>SYSTEM LOG</span>
+          <span className="log-header-count">{lines.length}</span>
+        </div>
 
-      {/* Log lines */}
-      <div ref={scrollRef} className={`log-content ${expanded ? "log-expanded" : ""}`}>
+        <div className="log-hint">
+          {expanded ? "COLLAPSE" : "EXPAND"}
+        </div>
+      </button>
+
+      <div
+        ref={scrollRef}
+        className={`log-content ${expanded ? "log-expanded" : ""}`}
+      >
         {visibleLines.length === 0 ? (
           <div className="log-empty">AWAITING DATA STREAM</div>
         ) : (
           visibleLines.map((line, i) => {
             const age = visibleLines.length - 1 - i;
             const cls = classifyLine(line);
+
             return (
               <div
-                key={`${i}-${line.slice(0, 20)}`}
-                className={`log-line ${cls}`}
+                key={`${i}-${line.slice(0, 40)}`}
+                className={`log-line ${cls} ${expanded ? "log-line-expanded" : ""}`}
                 style={{
-                  opacity: expanded ? 0.8 : Math.max(0.05, 1 - age * 0.18),
+                  opacity: expanded ? 0.9 : Math.max(0.2, 1 - age * 0.18),
                   animationDelay: `${i * 0.05}s`,
                 }}
+                title={line}
               >
                 {line}
               </div>
@@ -85,17 +103,22 @@ export function SystemLog() {
         )}
       </div>
 
-      {/* Expand hint */}
-      <div className="log-hint">
-        {expanded ? "COLLAPSE" : "EXPAND"}
-      </div>
-
       <style jsx>{`
         .system-log {
           position: relative;
           width: 100%;
+        }
+
+        .log-toggle {
+          width: 100%;
+          background: transparent;
+          border: 0;
+          padding: 0;
+          margin: 0;
           cursor: pointer;
-          user-select: none;
+          text-align: left;
+          color: inherit;
+          font: inherit;
         }
 
         .log-header {
@@ -130,23 +153,36 @@ export function SystemLog() {
           font-size: 9px;
           line-height: 1.7;
           overflow: hidden;
-          max-height: 160px;
+          max-height: 110px;
+          user-select: none;
+          -webkit-user-select: none;
           mask-image: linear-gradient(to bottom, transparent 0%, black 15%, black 85%, transparent 100%);
           -webkit-mask-image: linear-gradient(to bottom, transparent 0%, black 15%, black 85%, transparent 100%);
         }
 
         .log-content.log-expanded {
           overflow-y: auto;
+          overflow-x: hidden;
           max-height: 500px;
+          padding-right: 4px;
+          user-select: text;
+          -webkit-user-select: text;
+          cursor: text;
           mask-image: none;
           -webkit-mask-image: none;
         }
 
         .log-content.log-expanded::-webkit-scrollbar {
-          width: 2px;
+          width: 6px;
         }
+
         .log-content.log-expanded::-webkit-scrollbar-thumb {
-          background: rgba(64, 160, 240, 0.2);
+          background: rgba(64, 160, 240, 0.25);
+          border-radius: 999px;
+        }
+
+        .log-content.log-expanded::-webkit-scrollbar-track {
+          background: transparent;
         }
 
         .log-line {
@@ -155,6 +191,13 @@ export function SystemLog() {
           text-overflow: ellipsis;
           padding: 1px 0;
           animation: line-in 0.3s ease-out;
+        }
+
+        .log-line-expanded {
+          white-space: pre-wrap;
+          overflow: visible;
+          text-overflow: unset;
+          word-break: break-word;
         }
 
         .log-heard { color: #40f060; }

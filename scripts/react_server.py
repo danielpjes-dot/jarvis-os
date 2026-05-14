@@ -3,12 +3,18 @@ JARVIS ReAct Server v3 — tool-augmented Ollama proxy with shared model routing
 profile-aware prompting, dynamic skill discovery, better logging, runtime mode
 resolution, and Claude Code–style behavior.
 
+Important coder-route behavior:
+- qwen3-coder models do NOT receive native Ollama tools.
+- code route + coder model executes the local coding skill directly.
+- coding skill is expected to read files and call qwen3-coder itself.
+
 Endpoints:
   POST /api/chat
   GET  /api/health
   GET  /api/skills
   GET  /api/models
   GET  /api/events
+  GET  /api/coding-log
   GET  /api/timers
   GET  /api/radio
   GET  /api/network
@@ -32,19 +38,21 @@ import time
 import traceback
 import uuid
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime,timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 from urllib.parse import urlparse
-
+import re
 import urllib.error
 import urllib.request
 
-# -- Add project root to sys.path so `skills` package is importable --
 PROJECT_ROOT = Path(__file__).parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
-
+from scripts.agent_loop import run_agent_loop
+from services.communications_gateway import CommunicationsGateway
+from services.telegram_gateway import TelegramGateway
+from scripts.jarvis_history import make_plan_id, save_json, append_event, plan_dir
 from skills.loader import (  # type: ignore
     get_all_keywords,
     get_all_skill_meta,
@@ -53,31 +61,32 @@ from skills.loader import (  # type: ignore
     get_loaded_skills,
     load_skills,
 )
-from scripts.model_config import (
+from scripts.model_config import (  # type: ignore
     get_planner_model,
     load_model_config,
     resolve_model,
 )
 
+
 # -----------------------------------------------------------------------------
 # Config
 # -----------------------------------------------------------------------------
-
+TELEGRAM_NOTIFY_CHAT_ID = os.environ.get("JARVIS_TELEGRAM_CHAT_ID", "6987301428")
 OLLAMA_HOST = os.environ.get("OLLAMA_HOST", "http://127.0.0.1:11434")
 PORT = (
     int(sys.argv[sys.argv.index("--port") + 1])
     if "--port" in sys.argv
     else int(os.environ.get("JARVIS_PORT", "7900"))
 )
-
+TELEGRAM_ENABLED = int(os.environ.get("JARVIS_TELEGRAM_ENABLED", "1"))
 VALID_ROUTES = {"fast", "tools", "reason", "code", "deep"}
 MODE_PROFILE_PATH = PROJECT_ROOT / "config" / "mode_profiles.json"
 
 MAX_ITERATIONS = int(os.environ.get("JARVIS_MAX_ITERATIONS", "8"))
 MAX_TOOL_SELECTION = int(os.environ.get("JARVIS_MAX_TOOL_SELECTION", "6"))
 MAX_CONTEXT_MESSAGES = int(os.environ.get("JARVIS_MAX_CONTEXT_MESSAGES", "12"))
-PLANNER_TIMEOUT_SEC = int(os.environ.get("JARVIS_PLANNER_TIMEOUT_SEC", "45"))
-CHAT_TIMEOUT_SEC = int(os.environ.get("JARVIS_CHAT_TIMEOUT_SEC", "180"))
+PLANNER_TIMEOUT_SEC = int(os.environ.get("JARVIS_PLANNER_TIMEOUT_SEC", "120"))
+CHAT_TIMEOUT_SEC = int(os.environ.get("JARVIS_CHAT_TIMEOUT_SEC", "600"))
 TOOL_RESULT_CHAR_LIMIT = int(os.environ.get("JARVIS_TOOL_RESULT_CHAR_LIMIT", "12000"))
 
 ENABLE_TTS_ACK = os.environ.get("JARVIS_ENABLE_TTS_ACK", "1") == "1"
@@ -90,6 +99,8 @@ VAULT_DIR = Path(
         "D:/Jarvis_vault" if os.name == "nt" else "/mnt/d/Jarvis_vault",
     )
 )
+COMMUNICATIONS = CommunicationsGateway(VAULT_DIR)
+TELEGRAM_GATEWAY = TelegramGateway(VAULT_DIR)
 BRIDGE_DIR = Path(os.environ.get("JARVIS_BRIDGE_DIR", "/tmp/jarvis"))
 RUNTIME_MODE_PATH = BRIDGE_DIR / "runtime_mode.json"
 EVENTS_FILE = BRIDGE_DIR / "react_events.jsonl"
@@ -97,45 +108,32 @@ POWERSHELL = os.environ.get(
     "JARVIS_POWERSHELL",
     "/mnt/c/Windows/System32/WindowsPowerShell/v1.0/powershell.exe",
 )
-
+TASK_GRAPH_PATH = VAULT_DIR / ".jarvis" / "tasks" / "task_graph.json"
 ACTIVE_PROFILE_PATH = VAULT_DIR / ".jarvis" / "active_profile.json"
 PROFILES_DIR = VAULT_DIR / ".jarvis" / "profiles"
 SETTINGS_PATH = VAULT_DIR / ".jarvis" / "settings.json"
+ORPHEUS_ENABLED = os.environ.get("JARVIS_ORPHEUS_ENABLED", "1") == "1"
+ORPHEUS_HOST = os.environ.get("JARVIS_ORPHEUS_HOST", "http://127.0.0.1:5100")
+ORPHEUS_START_CMD = os.environ.get(
+    "JARVIS_ORPHEUS_START_CMD",
+    str(PROJECT_ROOT / "scripts" / "start_orpheus.sh"),
+)
+ORPHEUS_STOP_MATCH = os.environ.get("JARVIS_ORPHEUS_STOP_MATCH", "orpheus_server.py")
+ORPHEUS_WARM_ROUTES = {"fast", "reason", "tools"}
+ORPHEUS_COLD_ROUTES = {"code", "deep"}
+ORPHEUS_BOOT_TIMEOUT_SEC = int(os.environ.get("JARVIS_ORPHEUS_BOOT_TIMEOUT_SEC", "25"))
+ORPHEUS_POLL_INTERVAL_SEC = float(os.environ.get("JARVIS_ORPHEUS_POLL_INTERVAL_SEC", "0.5"))
 
 NO_TOOLS_MODELS: set[str] = set()
-
+stage_start_events = {"plan", "code_phase", "tool_start", "agent_start", "agent_step"}
+stage_end_events = {"tool_result", "code_step_ready", "agent_final", "final", "warning"}
 DEFAULT_MODE_PROFILES: Dict[str, Any] = {
     "defaults": {
-        "fast": {
-            "mode": "conversation",
-            "persona": "jarvis",
-            "tts_engine": "orpheus",
-            "tts_enabled": True,
-        },
-        "tools": {
-            "mode": "tools",
-            "persona": "jarvis",
-            "tts_engine": "orpheus",
-            "tts_enabled": True,
-        },
-        "code": {
-            "mode": "deep_engineer",
-            "persona": "the_one",
-            "tts_engine": "fallback",
-            "tts_enabled": False,
-        },
-        "deep": {
-            "mode": "deep_reasoning",
-            "persona": "architect",
-            "tts_engine": "fallback",
-            "tts_enabled": False,
-        },
-        "reason": {
-            "mode": "analysis",
-            "persona": "jarvis",
-            "tts_engine": "orpheus",
-            "tts_enabled": True,
-        },
+        "fast": {"mode": "conversation", "persona": "jarvis", "tts_engine": "orpheus", "tts_enabled": True},
+        "tools": {"mode": "tools", "persona": "jarvis", "tts_engine": "orpheus", "tts_enabled": True},
+        "code": {"mode": "deep_engineer", "persona": "the_one", "tts_engine": "fallback", "tts_enabled": False},
+        "deep": {"mode": "deep_reasoning", "persona": "architect", "tts_engine": "fallback", "tts_enabled": False},
+        "reason": {"mode": "analysis", "persona": "jarvis", "tts_engine": "orpheus", "tts_enabled": True},
     },
     "tool_overrides": [
         {
@@ -152,6 +150,7 @@ DEFAULT_MODE_PROFILES: Dict[str, Any] = {
 SYSTEM_ORCHESTRATOR_PROMPT = """You are JARVIS, a capable local coding and systems assistant.
 
 Operating mode:
+- You have access to TTS and what your replies are spoken aloud by Orpheus, a local TTS engine. Use it for acknowledgments and when it adds to the user experience, but you can skip it for internal thoughts or when a quick response is best.
 - Be concise, direct, and action-oriented.
 - Use tools when they will materially improve accuracy.
 - Do not call tools speculatively.
@@ -165,6 +164,21 @@ Operating mode:
 - Call all weekdays with full name, e.g. "Monday", not "Mon" or "Mon.".
 - Make dates and times human-friendly, e.g. "2024-06-01T14:30:00Z" becomes "First of June, 2024 at 2:30 PM UTC".
 
+When modifying code:
+
+- NEVER rewrite the whole file unless explicitly asked
+- ALWAYS prefer minimal patches
+- Preserve existing structure, imports, and logic
+- Only change the exact functions relevant to the request
+- If adding functionality, wrap it in helper functions
+- Do NOT remove existing behavior unless explicitly required
+- Keep diffs small and surgical
+
+Output format:
+
+1. Explain what will change (1–3 lines)
+2. Show ONLY the modified parts (diff-style or clearly scoped blocks)
+3. Do NOT output full file unless asked
 
 Tool rules:
 - Only call tools that are relevant to the user's current request.
@@ -172,6 +186,31 @@ Tool rules:
 - After tool results arrive, integrate them and continue toward a final answer.
 - If no tools are needed, answer directly.
 """
+CODER_WORKSPACE_HINT = """
+You are coding inside the local workspace.
+
+Default code root:
+/mnt/e/coding
+
+If the user asks to fix, edit, inspect, or create a skill:
+- First look under /mnt/e/coding for project folders.
+- Prefer folders that contain a skills/ directory.
+- If exactly one matching project exists, proceed.
+- If multiple matching projects exist, ask which project folder to use.
+- If the user mentions JARVIS, jarvis-os, React server, coding skill, news skill, or local assistant, assume:
+  /mnt/e/coding/jarvis-os
+
+For skill files:
+- Skills are usually under:
+  /mnt/e/coding/jarvis-os/skills
+- Example:
+  news skill = /mnt/e/coding/jarvis-os/skills/news.py
+  coding skill = /mnt/e/coding/jarvis-os/skills/coding_qwen3_coder.py
+
+Do not run coding_review automatically unless explicitly requested.
+For normal fix/edit requests, read the relevant file, make the smallest safe patch, and return only the patch or exact changed code.
+"""
+
 
 MODE_PROMPTS: Dict[str, str] = {
     "fast": """Respond quickly and directly.
@@ -204,36 +243,319 @@ Use deeper reasoning, compare alternatives, and make justified recommendations.
 """,
 }
 
-ACKS = [
-    "On it.",
-    "Working.",
-    "Understood.",
-    "Processing now.",
-    "Let me handle that.",
-]
+ACKS = ["On it.", "Working.", "Understood.", "Processing now.", "Let me handle that."]
 
 # -----------------------------------------------------------------------------
 # Skill loading
 # -----------------------------------------------------------------------------
 
 
-def build_intent_tool_candidates(
-    tool_skill_meta: Dict[str, Dict[str, Any]],
-) -> Dict[str, List[str]]:
+def build_intent_tool_candidates(tool_skill_meta: Dict[str, Dict[str, Any]]) -> Dict[str, List[str]]:
     out: Dict[str, List[str]] = {}
     for tool_name, meta in tool_skill_meta.items():
         aliases = meta.get("intent_aliases", [])
         if not isinstance(aliases, list):
             continue
         for alias in aliases:
-            if not isinstance(alias, str):
-                continue
-            key = alias.strip().lower()
-            if not key:
-                continue
-            out.setdefault(key, []).append(tool_name)
+            if isinstance(alias, str) and alias.strip():
+                out.setdefault(alias.strip().lower(), []).append(tool_name)
     return out
 
+from pathlib import Path
+
+CODER_MEMORY_PATH = Path(VAULT_DIR) / ".jarvis" / "coder_memory.md"
+
+def load_coder_memory(max_chars: int = 4000) -> str:
+    if not CODER_MEMORY_PATH.exists():
+        return ""
+
+    text = CODER_MEMORY_PATH.read_text(encoding="utf-8", errors="ignore").strip()
+    if not text:
+        return ""
+
+    if len(text) > max_chars:
+        text = text[-max_chars:]
+
+    return f"""Recent coder memory:
+{text}"""
+PLANNER_STATE_PATH = Path(VAULT_DIR) / ".jarvis" / "planner" / "active_plan.json"
+
+def load_task_graph() -> dict:
+    if not TASK_GRAPH_PATH.exists():
+        return {"tasks": {}, "active_task_id": None}
+    try:
+        data = json.loads(TASK_GRAPH_PATH.read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else {"tasks": {}, "active_task_id": None}
+    except Exception:
+        return {"tasks": {}, "active_task_id": None}
+
+
+def save_task_graph(graph: dict) -> None:
+    TASK_GRAPH_PATH.parent.mkdir(parents=True, exist_ok=True)
+    TASK_GRAPH_PATH.write_text(
+        json.dumps(graph, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+
+
+def create_task(title: str, user_request: str, route: str, model: str) -> dict:
+    graph = load_task_graph()
+    task_id = "task_" + str(uuid.uuid4())[:8]
+    now = now_iso()
+
+    task = {
+        "id": task_id,
+        "title": title,
+        "status": "running",
+        "created_at": now,
+        "updated_at": now,
+        "route": route,
+        "model": model,
+        "user_request": user_request,
+        "steps": [],
+        "events": [],
+    }
+
+    graph.setdefault("tasks", {})[task_id] = task
+    graph["active_task_id"] = task_id
+    save_task_graph(graph)
+    return task
+
+def load_active_plan() -> Dict[str, Any]:
+    if not PLANNER_STATE_PATH.exists():
+        return {}
+    try:
+        data = json.loads(PLANNER_STATE_PATH.read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+def load_plan_by_id(plan_id: str) -> Dict[str, Any]:
+    plan_root = VAULT_DIR / ".jarvis" / "history" / "plans" / plan_id
+
+    for filename in ["status.json", "plan.json"]:
+        path = plan_root / filename
+        if not path.exists():
+            continue
+
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+            if isinstance(data, dict):
+                return data
+        except Exception:
+            pass
+
+    return {}
+
+def save_active_plan(plan: Dict[str, Any]) -> None:
+    PLANNER_STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
+    PLANNER_STATE_PATH.write_text(json.dumps(plan, ensure_ascii=False, indent=2), encoding="utf-8")
+
+def execute_skill_safely(tool_name: str, args: dict, skills: dict) -> str:
+    try:
+        skill = skills[tool_name]
+
+        if hasattr(skill, "run"):
+            result = skill.run(**args)
+        elif callable(skill):
+            result = skill(**args)
+        else:
+            return f"Skill {tool_name} is not executable."
+
+        return json.dumps(result, ensure_ascii=False, default=str)
+
+    except Exception as e:
+        return f"Skill execution failed: {type(e).__name__}: {e}"
+    
+def is_plan_continue_command(text: str) -> bool:
+    command, _ = parse_plan_command(text)
+    return command in {"proceed", "continue", "next", "run next", "yes proceed"}
+
+def is_plan_cancel_command(text: str) -> bool:
+    command, _ = parse_plan_command(text)
+    return command == "cancel"
+
+def is_plan_modify_command(text: str) -> bool:
+    command, _ = parse_plan_command(text)
+    return command == "modify"
+
+def extract_planner_steps(answer: str) -> List[Dict[str, Any]]:
+    text = strip_thinking_tags(answer or "").strip()
+    if not text:
+        return []
+
+    steps: List[Dict[str, Any]] = []
+
+    # Fast path: valid JSON
+    try:
+        data = json.loads(text)
+        raw_steps = data.get("steps", []) if isinstance(data, dict) else data
+        if isinstance(raw_steps, list):
+            for item in raw_steps:
+                if isinstance(item, dict) and item.get("goal"):
+                    steps.append({"goal": str(item["goal"]).strip()})
+            if steps:
+                return steps
+    except Exception:
+        pass
+
+        # Recovery path: extract every complete "goal": "..." from broken JSON
+    for match in re.finditer(r'"goal"\s*:\s*"([^"]+)"', text):
+        goal = match.group(1).strip()
+
+        if "Make the smallest safe code change" in goal:
+            goal = goal.split("Make the smallest safe code change", 1)[0].strip()
+
+        if goal:
+            steps.append({"goal": goal})
+
+    return steps
+
+def build_simple_code_plan(user_text: str, paths: List[str]) -> Dict[str, Any]:
+    planner_model = get_planner_model()
+
+    prompt = (
+    "Create a concrete coding implementation plan.\n"
+    "Return ONLY valid JSON with this exact shape:\n"
+    "{\n"
+    '  "files": ["relative/path.ext"],\n'
+    '  "steps": [\n'
+    '    {\n'
+    '      "id": 1,\n'
+    '      "goal": "specific implementation step",\n'
+    '      "target_files": ["relative/path.ext"]\n'
+    '    }\n'
+    "  ]\n"
+    "}\n\n"
+    "Rules:\n"
+    "- Return JSON only. No markdown. No explanations.\n"
+    "- Extract exact file names from the user request when present.\n"
+    "- If the user says save/write/create to a filename, include that exact filename in files.\n"
+    "- For single-file tasks, files must contain exactly that one file.\n"
+    "- For multi-file tasks, files must list every file the implementation will create or modify.\n"
+    "- Every step must include target_files.\n"
+    "- Every target_files entry must also exist in files.\n"
+    "- Do not use directories as files. For example, use love.html, not skills.\n"
+    "- Split work into small executable steps.\n"
+    "- Avoid generic steps like inspect/analyze unless debugging requires inspection.\n"
+    "- Keep 3–10 steps.\n"
+    "- Each step must be concrete enough for an executor agent to implement directly.\n"
+    "- For debugging tasks, include steps to identify the failure point and verify the fix.\n"
+    "- The final step must verify or complete the requested file/code change.\n"
+    "- Do not create a plan with only setup/directory steps.\n\n"
+    "Examples:\n"
+    "{\n"
+    '  "files": ["love.html"],\n'
+    '  "steps": [\n'
+    '    {"id": 1, "goal": "Create the HTML structure for the page.", "target_files": ["love.html"]},\n'
+    '    {"id": 2, "goal": "Add CSS for the animated pulsing red heart.", "target_files": ["love.html"]},\n'
+    '    {"id": 3, "goal": "Add the visible text requested by the user and ensure the file is complete.", "target_files": ["love.html"]}\n'
+    "  ]\n"
+    "}\n\n"
+    f"User request:\n{user_text}\n\n"
+    f"Likely paths:\n{json.dumps(paths, ensure_ascii=False)}\n"
+    )
+
+    payload = {
+        "model": planner_model,
+        "messages": [{"role": "user", "content": prompt}],
+        "stream": False,
+        "options": {"temperature": 0, "num_predict": 600},
+    }
+    plan_files = data.get("files", []) if isinstance(data, dict) else []
+    try:
+        answer = ""
+        raw_steps = []
+        with request_ollama_chat(payload, timeout=PLANNER_TIMEOUT_SEC) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+
+            emit_event(
+                "code_phase",
+                "Coding planner full response",
+                {    "route": "code",
+                    "model": planner_model,
+                    "planner_model": planner_model,
+                    "data": data,
+                },
+            )
+
+            raw_content = data.get("message", {}).get("content", "")
+
+            answer = strip_thinking_tags(raw_content).strip()
+
+            if not answer and raw_content:
+                answer = raw_content.strip()
+            raw_steps = extract_planner_steps(answer)
+
+            emit_event(
+                "code_phase",
+                "Planner steps extracted",
+                {
+                    "count": len(raw_steps),
+                    "raw_steps": raw_steps,
+                    "preview": answer[:500],
+                },
+            )
+
+        steps = []
+        for i, raw_step in enumerate(raw_steps, start=1):
+            if not isinstance(raw_step, dict):
+                continue
+            goal = str(raw_step.get("goal", "")).strip()
+            if not goal:
+                continue
+            steps.append({"id": i, "status": "pending", "goal": goal})
+       
+        if not steps:
+            raise ValueError(f"planner returned no usable steps. Raw answer: {answer[:500]}")
+
+    except Exception as e:
+            emit_event("warning", "Coding planner failed, using fallback plan", {"error": str(e)})
+            steps = [
+                {
+                    "id": 1,
+                    "status": "pending",
+                    "goal": f"PLANNER FAILED: {e}. Make the smallest safe code change requested by the user. Return patch format only.",
+                }
+            ]
+
+    plan_id = make_plan_id()
+
+    plan = {
+    "plan_id": plan_id,
+    "current_step": 0,
+    "user_request": user_text,
+    "paths": paths,
+    "files": plan_files or paths,
+    "planner_model": planner_model,
+    "steps": steps,
+    "created_at": now_iso(),
+    "status": "waiting_for_approval",
+    }
+
+    save_json(plan_id, "plan.json", plan)
+
+    append_event(
+        "plan.created",
+        "Coding plan created",
+        plan_id=plan_id,
+        route="code",
+        model=planner_model,
+        payload={
+            "user_request": user_text,
+            "paths": paths,
+            "step_count": len(steps),
+        },
+    )
+
+    return plan
+
+def render_plan(plan: Dict[str, Any]) -> str:
+    lines = [f"PLAN_ID: {plan.get('plan_id')}", ""]
+    for step in plan.get("steps", []):
+        lines.append(f"{step.get('id')}. [{step.get('status')}] {step.get('goal')}")
+    lines.append("")
+    lines.append("WAITING_FOR: proceed / modify step / cancel")
+    return "\n".join(lines)
 
 def build_tool_hints(tool_skill_meta: Dict[str, Dict[str, Any]]) -> Dict[str, List[str]]:
     out: Dict[str, List[str]] = {}
@@ -262,7 +584,27 @@ def build_tool_route_hints(tool_skill_meta: Dict[str, Dict[str, Any]]) -> Dict[s
         if isinstance(route, str) and route.strip():
             out[tool_name] = route.strip().lower()
     return out
+def normalize_patch_text(content: str) -> str:
+    text = content or ""
 
+    # Remove markdown fence leftovers
+    text = text.replace("```html", "").replace("```python", "").replace("```", "").strip()
+
+    # If model forgot @@, insert it after FILE line
+    if "--- FILE:" in text and "@@" not in text:
+        lines = text.splitlines()
+        out = []
+        inserted = False
+
+        for i, line in enumerate(lines):
+            out.append(line)
+            if not inserted and line.strip().startswith("--- FILE:"):
+                out.append("@@")
+                inserted = True
+
+        text = "\n".join(out)
+
+    return text
 
 def reload_all_skills() -> Dict[str, Any]:
     global TOOLS, TOOL_MAP, TOOL_KEYWORDS, TOOL_SKILL_META
@@ -270,27 +612,18 @@ def reload_all_skills() -> Dict[str, Any]:
     global INTENT_TOOL_CANDIDATES, TOOL_HINTS, TOOL_DIRECT_MATCH, TOOL_ROUTE_HINTS
 
     load_skills()
-
     TOOLS = get_all_tools()
     TOOL_MAP = get_all_tool_map()
     TOOL_KEYWORDS = get_all_keywords()
     TOOL_SKILL_META = get_all_skill_meta()
     TOOLS_BY_NAME = {t["function"]["name"]: t for t in TOOLS}
-
-    TOOL_LIST_TEXT = "\n".join(
-        f"- {t['function']['name']}: {t['function'].get('description', '')}" for t in TOOLS
-    )
-
+    TOOL_LIST_TEXT = "\n".join(f"- {t['function']['name']}: {t['function'].get('description', '')}" for t in TOOLS)
     INTENT_TOOL_CANDIDATES = build_intent_tool_candidates(TOOL_SKILL_META)
     TOOL_HINTS = build_tool_hints(TOOL_SKILL_META)
     TOOL_DIRECT_MATCH = build_tool_direct_match(TOOL_SKILL_META)
     TOOL_ROUTE_HINTS = build_tool_route_hints(TOOL_SKILL_META)
 
-    return {
-        "status": "ok",
-        "tool_count": len(TOOLS),
-        "tools": list(TOOL_MAP.keys()),
-    }
+    return {"status": "ok", "tool_count": len(TOOLS), "tools": list(TOOL_MAP.keys())}
 
 
 print(f"[REACT] Loading skills from {PROJECT_ROOT / 'skills'}...")
@@ -299,7 +632,199 @@ reload_all_skills()
 # -----------------------------------------------------------------------------
 # Utilities
 # -----------------------------------------------------------------------------
+def needs_output_path(task: str, paths: list[str]) -> bool:
+    lower = (task or "").lower()
 
+    create_keywords = [
+        "create",
+        "make",
+        "generate",
+        "write",
+        "save",
+        "build",
+        "code",
+    ]
+
+    wants_file = any(k in lower for k in create_keywords)
+
+    has_real_file = any(
+        "." in p.split("/")[-1]
+        for p in paths
+    )
+
+    return wants_file and not has_real_file
+
+def clean_telegram_prefix(text: str) -> str:
+    text = text or ""
+    prefix = "Telegram message:"
+    if text.startswith(prefix):
+        return text[len(prefix):].strip()
+    return text
+
+def notify_telegram(text: str) -> None:
+    if not TELEGRAM_NOTIFY_CHAT_ID:
+        debug("Telegram notify skipped: missing JARVIS_TELEGRAM_CHAT_ID")
+        return
+
+    try:
+        TELEGRAM_GATEWAY.send_message(TELEGRAM_NOTIFY_CHAT_ID, text)
+    except Exception as e:
+        debug(f"Telegram notify failed: {e}")
+def parse_file_patch(content: str) -> Optional[Dict[str, str]]:
+    text = content or ""
+
+    if "### PATCH" in text:
+        text = text.split("### PATCH", 1)[1].strip()
+
+    text = text.replace("\\n", "\n")
+
+    try:
+        data = json.loads(text.strip().strip("`"))
+        if isinstance(data, dict) and isinstance(data.get("path"), str) and isinstance(data.get("content"), str):
+            return {"path": data["path"], "content": data["content"]}
+    except Exception:
+        pass
+
+    marker = "--- FILE:"
+    if marker not in text:
+        return None
+
+    after = text.split(marker, 1)[1].strip()
+    first_line, _, rest = after.partition("\n")
+    if "@@" in rest:
+        rest = rest.split("@@", 1)[1].strip()
+    else:
+        rest = rest.strip()
+    path = first_line.strip()
+    path = path.split("@@", 1)[0].strip()
+    path = path.split(" ", 1)[0].strip()
+
+    if "@@" in rest:
+        rest = rest.split("@@", 1)[1].strip()
+
+    # Remove unified diff + prefixes if model returned diff format
+    cleaned_lines = []
+    for line in rest.splitlines():
+        if line.startswith("@@"):
+            continue
+        if line.startswith("+") and not line.startswith("+++"):
+            cleaned_lines.append(line[1:])
+        elif line.startswith("-") and not line.startswith("---"):
+            continue
+        else:
+            cleaned_lines.append(line)
+
+    rest = "\n".join(cleaned_lines).strip()
+
+    if not path or not rest:
+        return None
+
+    if "\n" in path or "\\n" in path or "@@" in path:
+        return None
+
+    return {"path": path, "content": rest}
+
+def apply_file_patch(content: str) -> Dict[str, Any]:
+    patch = parse_file_patch(content)
+    if not patch:
+        return {"ok": False, "error": "No writable file patch found"}
+
+    path = Path(patch["path"])
+    if not path.is_absolute():
+        path = PROJECT_ROOT / path
+
+    path = path.resolve()
+
+    if not str(path).startswith(str(PROJECT_ROOT.resolve())):
+        return {"ok": False, "error": f"Refusing to write outside project root: {path}"}
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(patch["content"], encoding="utf-8")
+
+    return {"ok": True, "path": str(path)}
+
+def validate_coder_output(content: str) -> Dict[str, Any]:
+    text = content or ""
+    lower = text.lower()
+
+    problems = []
+
+    dangerous_patterns = [
+        "rm -rf",
+        "sudo rm",
+        "mkfs",
+        "dd if=",
+        ":(){",
+        "chmod -r 777 /",
+        "chown -r",
+        "curl ",
+        "wget ",
+        "powershell -enc",
+        "invoke-expression",
+        "eval(",
+        "exec(",
+    ]
+
+    for pattern in dangerous_patterns:
+        if pattern in lower:
+            problems.append(f"dangerous pattern detected: {pattern}")
+
+    # Detect full-file rewrite tendency
+    code_fence_count = text.count("```")
+    line_count = len(text.splitlines())
+
+    if line_count > 500:
+        problems.append("output too large; likely full-file rewrite")
+
+    if code_fence_count >= 6:
+        problems.append("too many code blocks; likely not a minimal patch")
+
+    # Prefer scoped patch/diff output
+    has_patch_marker = (
+        "--- FILE:" in text
+        or "diff --git" in text
+        or "@@" in text
+        or "replace this" in lower
+        or "modified parts" in lower
+    )
+
+    if not has_patch_marker:
+        problems.append("no clear patch marker or scoped replacement block found")
+
+    return {
+        "ok": len(problems) == 0,
+        "problems": problems,
+        "line_count": line_count,
+        "code_fence_count": code_fence_count,
+    }
+
+
+def wrap_invalid_coder_output(content: str, validation: Dict[str, Any]) -> str:
+    problems = "\n".join(f"- {p}" for p in validation.get("problems", []))
+
+    return f"""Coder output was rejected by validation.
+
+Problems:
+{problems}
+
+The model must return a smaller, safer patch.
+
+Required format:
+
+--- FILE: path/to/file.py
+@@
+<only changed function/helper blocks>
+
+Rules:
+- Do not rewrite full files
+- Do not include dangerous shell commands
+- Do not include unrelated changes
+- Keep the patch minimal
+
+Original rejected output preview:
+
+{content[:3000]}
+"""
 
 def debug(msg: str) -> None:
     if DEBUG:
@@ -307,7 +832,7 @@ def debug(msg: str) -> None:
 
 
 def now_iso() -> str:
-    return datetime.utcnow().isoformat(timespec="seconds") + "Z"
+    return  datetime.now(timezone.utc).isoformat()
 
 
 def ensure_dirs() -> None:
@@ -322,11 +847,155 @@ def append_log(line: str) -> None:
             f.write(line + "\n")
     except Exception:
         pass
+def character_stage_message(event_type: str, message: str, data: Optional[Dict[str, Any]] = None) -> Optional[str]:
+    data = data or {}
 
+    plan_id = data.get("plan_id")
+    step = data.get("step") or {}
+    step_id = step.get("id") if isinstance(step, dict) else data.get("task_id")
+    route = data.get("route") or data.get("resolved_route")
+    model = data.get("model") or data.get("resolved_model") or data.get("planner_model")
+    if event_type == "code_edit_output":
+        preview = str(data.get("result_preview", ""))[:1500]
 
-def emit_event(event_type: str, message: str, data: Optional[Dict[str, Any]] = None) -> None:
+        return (
+            "💻 Coder produced output.\n\n"
+            f"Path: {data.get('path')}\n"
+            f"Mode: {data.get('mode')}\n\n"
+            f"{preview}"
+        )
+    if event_type == "agent_start":
+        return (
+            "🧠 Agent mode started.\n"
+            f"Route: {route or 'unknown'}\n"
+            f"Model: {model or 'unknown'}\n\n"
+            "I am breaking the task into reasoning steps."
+        )
+
+    if event_type == "agent_step":
+        step_no = data.get("step") or data.get("step_no") or data.get("iteration")
+        return (
+            "⚙️ Agent is working.\n"
+            f"Step: {step_no or 'unknown'}\n"
+            f"Route: {route or 'unknown'}\n"
+            f"Model: {model or 'unknown'}\n\n"
+            f"{message}"
+        )
+
+    if event_type == "agent_final":
+        return (
+            "🏁 Agent completed the task.\n"
+            f"Route: {route or 'unknown'}\n"
+            f"Model: {model or 'unknown'}"
+        )
+    if event_type == "code_phase":
+        phase = data.get("phase")
+
+        if phase == "plan_created":
+            return (
+                "🧠 Planning complete.\n"
+                f"Plan: {plan_id}\n"
+                f"Steps: {len(data.get('steps', []))}\n\n"
+                "I have a structured route now. Waiting for approval."
+            )
+
+        if phase == "running_step":
+            return (
+                "💻 Executing coding step.\n"
+                f"Plan: {plan_id}\n"
+                f"Step: {step_id}\n\n"
+                f"{step.get('goal', message) if isinstance(step, dict) else message}"
+            )
+
+        if phase == "validating_patch":
+            return (
+                "🔎 Patch returned.\n"
+                f"Plan: {plan_id}\n\n"
+                "I am validating the output before applying it."
+            )
+
+        if phase == "repairing_patch":
+            return (
+                "🛠️ Patch failed validation.\n"
+                f"Plan: {plan_id}\n\n"
+                "I am asking the coder to repair the patch."
+            )
+
+        if phase == "patch_applied":
+            return (
+                "✅ Patch applied successfully.\n"
+                f"Plan: {plan_id}\n\n"
+                "Step is complete."
+            )
+
+        if phase == "patch_apply_failed":
+            return (
+                "❌ Patch could not be applied.\n"
+                f"Plan: {plan_id}\n\n"
+                "I saved the failure details for inspection."
+            )
+
+    if event_type == "code_step_ready":
+        remaining = data.get("remaining")
+        next_step = data.get("next_step")
+
+        text = (
+            "✅ Coding step complete.\n"
+            f"Plan: {plan_id}\n"
+            f"Remaining steps: {remaining}\n"
+        )
+
+        if isinstance(next_step, dict):
+            text += f"\nNext: {next_step.get('goal')}"
+
+        return text
+
+    if event_type == "plan":
+        return (
+            "🧭 Selecting tools and route.\n"
+            f"Model: {model or 'unknown'}\n"
+            f"{message}"
+        )
+
+    if event_type == "tool_start":
+        return (
+            "🔧 Running tool.\n"
+            f"Tool: {data.get('tool')}\n"
+            f"{message}"
+        )
+
+    if event_type == "tool_result":
+        return (
+            "📦 Tool completed.\n"
+            f"Tool: {data.get('tool')}\n"
+            f"Elapsed: {data.get('elapsed_sec')}s"
+        )
+
+    if event_type == "warning":
+        return (
+            "⚠️ JARVIS warning.\n"
+            f"{message}\n\n"
+            f"{str(data.get('error', ''))[:800]}"
+        )
+
+    if event_type == "final":
+        return (
+            "🏁 Final response ready.\n"
+            f"Route: {route or 'unknown'}\n"
+            f"Model: {model or 'unknown'}"
+        )
+
+    return None
+
+def emit_event(
+    event_type: str,
+    message: str,
+    data: Optional[Dict[str, Any]] = None,
+) -> None:
+    event_type = (event_type or "").lower()
     try:
         ensure_dirs()
+
         payload = {
             "ts": time.time(),
             "time": now_iso(),
@@ -334,8 +1003,91 @@ def emit_event(event_type: str, message: str, data: Optional[Dict[str, Any]] = N
             "message": message,
             "data": data or {},
         }
+        stage_text = character_stage_message(event_type, message, data)
+
+        if TELEGRAM_ENABLED and stage_text:
+            notify_telegram(stage_text)
+
+
         with open(EVENTS_FILE, "a", encoding="utf-8") as f:
             f.write(json.dumps(payload, ensure_ascii=False) + "\n")
+
+        typing_events = {
+        "plan",
+        "code_phase",
+        "tool_start",
+        "status",
+        "agent_start",
+        "agent_step",
+        }
+
+        if TELEGRAM_ENABLED and event_type in typing_events:
+            telegram_chat_action("typing")
+
+        # ------------------------------------------------------------------
+        # Telegram notifications
+        # ------------------------------------------------------------------
+        if event_type in {"planner.start", "coder.start", "tool_start", "agent_start", "agent_step"}:
+            stage_id = str((data or {}).get("stage_id") or event_type)
+            TELEGRAM_GATEWAY.start_typing_stage(TELEGRAM_NOTIFY_CHAT_ID, stage_id)
+
+
+
+        if event_type in {"planner.done", "coder.done", "tool_result", "agent_final", "final", "warning"}:
+            stage_id = str((data or {}).get("stage_id") or event_type.replace(".done", ".start"))
+            TELEGRAM_GATEWAY.stop_typing_stage(stage_id)
+        important_events = {
+            "critical",
+            "warning",
+            "plan",
+            "final",
+            "code_phase",
+            "code_step_ready",
+            "agent_start",
+            "agent_step",
+            "agent_final",
+            "code_edit_output",
+        }
+        if "coder" in model:
+            emoji = "💻"
+        elif "planner" in model:
+            emoji = "🧠"
+        else:
+            emoji = "🤖"
+        if event_type == "warning":
+            emoji = "⚠️"
+        if TELEGRAM_ENABLED and event_type in important_events:
+
+            route = str(payload["data"].get("route", ""))
+            model = str(
+                payload["data"].get("model")
+                or payload["data"].get("resolved_model")
+                or ""
+            )
+
+            telegram_text = (
+                f"{emoji} JARVIS EVENT\n\n"
+                f"Type: {event_type}\n"
+                f"Message: {message}\n"
+            )
+
+            if route:
+                telegram_text += f"Route: {route}\n"
+
+            if model:
+                telegram_text += f"Model: {model}\n"
+
+            if payload["data"]:
+                preview = json.dumps(
+                    payload["data"],
+                    ensure_ascii=False,
+                    indent=2,
+                )[:1200]
+
+                telegram_text += f"\nData:\n{preview}"
+
+            notify_telegram(telegram_text)
+
     except Exception:
         pass
 
@@ -348,6 +1100,32 @@ def recent_events(limit: int = 100) -> List[Dict[str, Any]]:
         return [json.loads(line) for line in lines if line.strip()]
     except Exception:
         return []
+
+
+def recent_coding_events(limit: int = 120) -> List[Dict[str, Any]]:
+    events = recent_events(500)
+    coding: List[Dict[str, Any]] = []
+
+    for e in events:
+        data = e.get("data", {}) or {}
+        model = str(
+            data.get("model")
+            or data.get("resolved_model")
+            or data.get("planner_model")
+            or ""
+        ).lower()
+        route = str(data.get("route") or data.get("resolved_route") or "").lower()
+        event_type = str(e.get("type") or "").lower()
+
+        if (
+            route == "code"
+            or "coder" in model
+            or event_type == "code_phase"
+            or "planner" in str(e.get("message", "")).lower()
+        ):
+            coding.append(e)
+
+    return coding[-limit:]
 
 
 def safe_json_dumps(obj: Any) -> str:
@@ -367,14 +1145,72 @@ def truncate_text(value: Any, limit: int = TOOL_RESULT_CHAR_LIMIT) -> str:
     return value[:limit] + f"\n\n[truncated to {limit} chars]"
 
 
+def http_get_ok_simple(url: str, timeout: int = 2) -> bool:
+    try:
+        with urllib.request.urlopen(url, timeout=timeout) as resp:
+            return 200 <= resp.status < 300
+    except Exception:
+        return False
+
+
+def is_orpheus_running() -> bool:
+    if not ORPHEUS_ENABLED:
+        return False
+    return http_get_ok_simple(f"{ORPHEUS_HOST}/health", timeout=2)
+
+
+def start_orpheus_process() -> bool:
+    if not ORPHEUS_ENABLED:
+        return False
+    if is_orpheus_running():
+        return True
+    if not ORPHEUS_START_CMD.strip():
+        emit_event("warning", "Orpheus start requested but no start command configured", {"orpheus_host": ORPHEUS_HOST})
+        return False
+    try:
+        emit_event("status", "Starting Orpheus", {"cmd": ORPHEUS_START_CMD, "orpheus_host": ORPHEUS_HOST})
+        subprocess.Popen(ORPHEUS_START_CMD, shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except Exception as e:
+        emit_event("warning", "Failed to launch Orpheus", {"error": str(e), "cmd": ORPHEUS_START_CMD})
+        return False
+
+    deadline = time.time() + ORPHEUS_BOOT_TIMEOUT_SEC
+    while time.time() < deadline:
+        if is_orpheus_running():
+            emit_event("status", "Orpheus is ready", {"orpheus_host": ORPHEUS_HOST})
+            return True
+        time.sleep(ORPHEUS_POLL_INTERVAL_SEC)
+    emit_event("warning", "Orpheus did not become ready in time", {"orpheus_host": ORPHEUS_HOST})
+    return False
+
+
+def stop_orpheus_process() -> bool:
+    if not ORPHEUS_ENABLED:
+        return False
+    if not is_orpheus_running():
+        return True
+    try:
+        req = urllib.request.Request(f"{ORPHEUS_HOST}/shutdown", data=b"{}", headers={"Content-Type": "application/json"}, method="POST")
+        with urllib.request.urlopen(req, timeout=3):
+            pass
+    except Exception:
+        try:
+            subprocess.run(["pkill", "-f", ORPHEUS_STOP_MATCH], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
+        except Exception:
+            pass
+
+    deadline = time.time() + 8
+    while time.time() < deadline:
+        if not is_orpheus_running():
+            emit_event("status", "Orpheus stopped", {"orpheus_host": ORPHEUS_HOST})
+            return True
+        time.sleep(0.25)
+    emit_event("warning", "Orpheus stop requested but it still appears alive", {"orpheus_host": ORPHEUS_HOST})
+    return False
+
+
 def sanitize_for_tts(text: str) -> str:
-    return (
-        text.replace("'", "''")
-        .replace("JARVIS", "Jarvis")
-        .replace("FRIDAY", "Friday")
-        .replace("EDITH", "Edith")
-        .replace("HAL", "Hal")
-    )
+    return text.replace("'", "''").replace("JARVIS", "Jarvis").replace("FRIDAY", "Friday").replace("EDITH", "Edith").replace("HAL", "Hal")
 
 
 def speak_ack(text: str) -> None:
@@ -434,13 +1270,11 @@ def request_ollama_tags() -> Dict[str, Any]:
 def strip_thinking_tags(text: str) -> str:
     if not text:
         return text
-
     start_tag = "<think>"
     end_tag = "</think>"
     result: List[str] = []
     i = 0
     in_think = False
-
     while i < len(text):
         if text.startswith(start_tag, i):
             in_think = True
@@ -453,7 +1287,6 @@ def strip_thinking_tags(text: str) -> str:
         if not in_think:
             result.append(text[i])
         i += 1
-
     return "".join(result).replace(end_tag, "").strip()
 
 
@@ -461,14 +1294,12 @@ def parse_json_object_from_text(text: str) -> Optional[Dict[str, Any]]:
     text = strip_thinking_tags(text or "").strip()
     if not text:
         return None
-
     try:
         data = json.loads(text)
         if isinstance(data, dict):
             return data
     except Exception:
         pass
-
     start = text.find("{")
     end = text.rfind("}")
     if start != -1 and end != -1 and end > start:
@@ -509,16 +1340,13 @@ def load_active_profile(profile_override: Optional[str] = None) -> Dict[str, Any
         profile = load_profile_by_id(profile_override)
         if profile:
             return profile
-
     try:
         if ACTIVE_PROFILE_PATH.exists():
             data = json.loads(ACTIVE_PROFILE_PATH.read_text(encoding="utf-8"))
-
             if isinstance(data, dict) and data.get("active"):
                 profile = load_profile_by_id(str(data.get("active")))
                 if profile:
                     return profile
-
             if isinstance(data, dict) and data.get("systemPrompt"):
                 return data
     except Exception as e:
@@ -529,15 +1357,12 @@ def load_active_profile(profile_override: Optional[str] = None) -> Dict[str, Any
 def get_profile_options(profile_override: Optional[str] = None) -> Dict[str, Any]:
     profile = load_active_profile(profile_override=profile_override)
     options: Dict[str, Any] = {}
-
     temperature = profile.get("temperature")
     if isinstance(temperature, (int, float)):
         options["temperature"] = temperature
-
     top_p = profile.get("topP")
     if isinstance(top_p, (int, float)):
         options["top_p"] = top_p
-
     return options
 
 
@@ -556,7 +1381,6 @@ def resolve_runtime_mode(route: str, selected_tools: List[Dict[str, Any]]) -> Di
     for override in overrides:
         if override.get("route") != route:
             continue
-
         tools_any = set(override.get("tools_any", []))
         if tools_any and (tool_names & tools_any):
             return {
@@ -585,33 +1409,26 @@ def write_runtime_mode(route: str, model: str, selected_tools: List[Dict[str, An
         "tools": [
             t["function"]["name"]
             for t in selected_tools
-            if isinstance(t, dict) and "function" in t and isinstance(t["function"], dict)
+            if isinstance(t, dict) and isinstance(t.get("function"), dict)
         ],
     }
-
     try:
         ensure_dirs()
-        RUNTIME_MODE_PATH.write_text(
-            json.dumps(payload, ensure_ascii=False, indent=2),
-            encoding="utf-8",
-        )
+        RUNTIME_MODE_PATH.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
     except Exception as e:
         debug(f"Failed writing runtime mode: {e}")
-
     return payload
 
 
 def build_self_context(persona: Optional[str] = None) -> Dict[str, Any]:
     profile = load_active_profile(profile_override=persona)
     cfg = load_model_config()
-
     capabilities = []
     for tool_name, meta in TOOL_SKILL_META.items():
         try:
             tool_desc = TOOLS_BY_NAME[tool_name]["function"].get("description", "")
         except Exception:
             tool_desc = meta.get("description", "")
-
         capabilities.append(
             {
                 "tool": tool_name,
@@ -624,17 +1441,9 @@ def build_self_context(persona: Optional[str] = None) -> Dict[str, Any]:
                 "intent_aliases": meta.get("intent_aliases", []),
             }
         )
-
     return {
-        "identity": {
-            "id": profile.get("id"),
-            "label": profile.get("label"),
-            "systemPrompt": profile.get("systemPrompt"),
-        },
-        "models": {
-            "routes": cfg.get("models", {}),
-            "planner_model": cfg.get("planner_model"),
-        },
+        "identity": {"id": profile.get("id"), "label": profile.get("label"), "systemPrompt": profile.get("systemPrompt")},
+        "models": {"routes": cfg.get("models", {}), "planner_model": cfg.get("planner_model")},
         "skills": get_loaded_skills(),
         "capabilities": capabilities,
         "tool_count": len(TOOL_MAP),
@@ -644,82 +1453,76 @@ def build_self_context(persona: Optional[str] = None) -> Dict[str, Any]:
 
 def build_self_context_prompt(persona: Optional[str] = None, max_tools: int = 20) -> str:
     ctx = build_self_context(persona=persona)
-
     identity = ctx.get("identity", {})
     models = ctx.get("models", {})
     capabilities = ctx.get("capabilities", [])
-
-    parts = []
-    parts.append("Runtime self-context:")
+    parts = ["Runtime self-context:"]
     parts.append(f"- Persona: {identity.get('label') or identity.get('id') or 'JARVIS'}")
-
     if models.get("routes"):
         parts.append(f"- Model routes: {models['routes']}")
     if models.get("planner_model"):
         parts.append(f"- Planner model: {models['planner_model']}")
-
     parts.append("- Available tools:")
     for item in capabilities[:max_tools]:
-        tool = item.get("tool", "")
-        desc = item.get("description", "")
-        parts.append(f"  - {tool}: {desc}")
-
+        parts.append(f"  - {item.get('tool', '')}: {item.get('description', '')}")
     if len(capabilities) > max_tools:
         parts.append(f"  - ...and {len(capabilities) - max_tools} more tools available")
-
     return "\n".join(parts)
-
 
 def build_system_prompt_for_route(route: str, persona: Optional[str] = None) -> str:
     profile = load_active_profile(profile_override=persona)
 
-    profile_prompt = (profile.get("systemPrompt") or "").strip()
-    if not profile_prompt:
-        profile_prompt = "You are JARVIS, a capable local assistant."
+    profile_prompt = (
+        profile.get("systemPrompt") or ""
+    ).strip() or "You are JARVIS, a capable local assistant."
 
-    profile_mode_prompt = (
-        ((profile.get("modePrompts") or {}).get(route) or "").strip()
-        if isinstance(profile.get("modePrompts"), dict)
-        else ""
-    )
+    if route == "code":
+        parts = [
+            profile_prompt,
+            CODER_WORKSPACE_HINT.strip(),
+            load_coder_memory(),
+            build_self_context_prompt(persona=persona),
+        ]
+    else:
+        mode_prompts = profile.get("modePrompts")
+        profile_mode_prompt = ""
 
-    base_mode_prompt = MODE_PROMPTS.get(route or "reason", "").strip()
-    orchestrator = SYSTEM_ORCHESTRATOR_PROMPT.strip()
-    self_context = build_self_context_prompt(persona=persona)
+        if isinstance(mode_prompts, dict):
+            profile_mode_prompt = (mode_prompts.get(route) or "").strip()
 
-    parts = [profile_prompt]
+        route_prompt = profile_mode_prompt or MODE_PROMPTS.get(route or "reason", "").strip()
 
-    if profile_mode_prompt:
-        parts.append(profile_mode_prompt)
-    elif base_mode_prompt:
-        parts.append(base_mode_prompt)
+        parts = [
+            profile_prompt,
+            route_prompt,
+            SYSTEM_ORCHESTRATOR_PROMPT.strip(),
+            build_self_context_prompt(persona=persona),
+        ]
 
-    parts.append(orchestrator)
-    parts.append(self_context)
+    return "\n\n".join(part for part in parts if part and part.strip())
+def save_coder_memory(summary: str, max_chars: int = 12000) -> None:
+    CODER_MEMORY_PATH.parent.mkdir(parents=True, exist_ok=True)
 
-    return "\n\n".join(part for part in parts if part.strip())
+    old = ""
+    if CODER_MEMORY_PATH.exists():
+        old = CODER_MEMORY_PATH.read_text(encoding="utf-8", errors="ignore")
 
+    new_text = (old.rstrip() + "\n\n" + summary.strip()).strip()
 
-def normalize_messages(
-    messages: List[Dict[str, Any]],
-    system_prompt: Optional[str] = None,
-) -> List[Dict[str, Any]]:
+    if len(new_text) > max_chars:
+        new_text = new_text[-max_chars:]
+
+    CODER_MEMORY_PATH.write_text(new_text + "\n", encoding="utf-8")
+
+def normalize_messages(messages: List[Dict[str, Any]], system_prompt: Optional[str] = None) -> List[Dict[str, Any]]:
     out: List[Dict[str, Any]] = []
-
     has_system = any(m.get("role") == "system" for m in messages)
     if not has_system:
-        out.append(
-            {
-                "role": "system",
-                "content": system_prompt or SYSTEM_ORCHESTRATOR_PROMPT,
-            }
-        )
-
+        out.append({"role": "system", "content": system_prompt or SYSTEM_ORCHESTRATOR_PROMPT})
     for m in messages:
         role = m.get("role")
         if role not in {"system", "user", "assistant", "tool"}:
             continue
-
         item: Dict[str, Any] = {"role": role}
         if "content" in m:
             item["content"] = m.get("content", "")
@@ -728,17 +1531,12 @@ def normalize_messages(
         if "name" in m:
             item["name"] = m["name"]
         out.append(item)
-
     return out
 
 
-def compact_context(
-    messages: List[Dict[str, Any]],
-    max_messages: int = MAX_CONTEXT_MESSAGES,
-) -> List[Dict[str, Any]]:
+def compact_context(messages: List[Dict[str, Any]], max_messages: int = MAX_CONTEXT_MESSAGES) -> List[Dict[str, Any]]:
     systems = [m for m in messages if m.get("role") == "system"]
     others = [m for m in messages if m.get("role") != "system"]
-
     if len(others) <= max_messages:
         trimmed = others
     else:
@@ -747,7 +1545,6 @@ def compact_context(
         tail_count = max(0, max_messages - extra)
         tail = others[-tail_count:] if tail_count > 0 else []
         trimmed = ([first_user] if first_user and first_user not in tail else []) + tail
-
     return systems[:1] + trimmed
 
 
@@ -761,59 +1558,193 @@ def get_last_user_text(messages: List[Dict[str, Any]]) -> str:
     return ""
 
 
+def should_keep_orpheus_warm(route: str, model: str) -> bool:
+    route = (route or "").strip().lower()
+    model = (model or "").strip().lower()
+    if route in ORPHEUS_WARM_ROUTES:
+        return True
+    if route in ORPHEUS_COLD_ROUTES:
+        return False
+    if "qwen3:8b" in model or "qwen3:14b" in model:
+        return True
+    if "gemma4:31b" in model or "30b" in model:
+        return False
+    return route not in {"code", "deep"}
+
+
+def sync_orpheus_for_route(route: str, model: str) -> None:
+    if not ORPHEUS_ENABLED:
+        return
+    keep_warm = should_keep_orpheus_warm(route, model)
+    emit_event("status", "Syncing Orpheus policy", {"route": route, "model": model, "keep_warm": keep_warm, "orpheus_running": is_orpheus_running()})
+    if keep_warm:
+        start_orpheus_process()
+    else:
+        stop_orpheus_process()
+
+
+def is_coder_model(model: str) -> bool:
+    return "coder" in (model or "").lower()
+
+
+def get_coder_tool() -> Optional[Dict[str, Any]]:
+    return (
+         TOOLS_BY_NAME.get("code_edit")
+    )
+
+
+def guess_coding_paths(user_text: str) -> List[str]:
+    text = user_text or ""
+    lower = text.lower()
+
+    # 1. Explicit filename always wins
+    explicit_file_patterns = [
+        r"(?:save it to|save as|write to|create|make|to)\s+([A-Za-z0-9_.\-/]+\.(?:html|py|js|ts|tsx|jsx|css|json|md|txt))",
+        r"\b([A-Za-z0-9_.\-/]+\.(?:html|py|js|ts|tsx|jsx|css|json|md|txt))\b",
+    ]
+
+    for pattern in explicit_file_patterns:
+        match = re.search(pattern, text, re.IGNORECASE)
+        if match:
+            return [match.group(1).strip()]
+
+    # 2. Known project files
+    known_files = [
+        "skills/news.py",
+        "skills/radio.py",
+        "skills/coding.py",
+        "skills/loader.py",
+        "scripts/react_server.py",
+        "scripts/watcher.py",
+        "config/models-config.json",
+        "config/model_config.json",
+        "config/models.json",
+        "app/page.tsx",
+    ]
+
+    paths: List[str] = []
+
+    for p in known_files:
+        name = p.split("/")[-1].lower()
+        stem = name.rsplit(".", 1)[0]
+        if name in lower or stem in lower:
+            paths.append(p)
+
+    if "news" in lower and "skills/news.py" not in paths:
+        paths.append("skills/news.py")
+
+    if "radio" in lower and "skills/radio.py" not in paths:
+        paths.append("skills/radio.py")
+
+    # 3. Only fallback to skills for actual skill work
+    if "skill" in lower and not paths:
+        paths.append("skills")
+
+    # 4. Default project root, not skills
+    return paths or ["."]
+
+def extract_tool_content(result: Any) -> str:
+    # Already string
+    if isinstance(result, str):
+        try:
+            data = json.loads(result)
+
+            if isinstance(data, dict):
+                ui = data.get("ui")
+
+                if isinstance(ui, dict):
+                    content = ui.get("content")
+                    if isinstance(content, str):
+                        return content
+
+                speech = data.get("speech")
+                if isinstance(speech, str):
+                    return speech
+
+                return json.dumps(
+                    data,
+                    ensure_ascii=False,
+                    indent=2,
+                    default=str,
+                )
+
+            return result
+
+        except Exception:
+            return result
+
+    # Dict/list/object fallback
+    return json.dumps(
+        result,
+        ensure_ascii=False,
+        indent=2,
+        default=str,
+    )
+
 def normalized_route(requested_route: Optional[str], selected_tools: List[Dict[str, Any]]) -> str:
     if requested_route in VALID_ROUTES:
         return requested_route
     return infer_route_from_tools(selected_tools)
 
 
-def call_ollama_once(
-    model: str,
-    messages: List[Dict[str, Any]],
-    route: str,
-    persona: Optional[str] = None,
-    tools: Optional[List[Dict[str, Any]]] = None,
-    stream: bool = False,
-) -> Dict[str, Any]:
+def call_ollama_once(model: str, messages: List[Dict[str, Any]], route: str, persona: Optional[str] = None, tools: Optional[List[Dict[str, Any]]] = None, stream: bool = False) -> Dict[str, Any]:
     payload: Dict[str, Any] = {
         "model": model,
-        "messages": compact_context(
-            normalize_messages(
-                messages,
-                system_prompt=build_system_prompt_for_route(route, persona=persona),
-            )
-        ),
+        "messages": compact_context(normalize_messages(messages, system_prompt=build_system_prompt_for_route(route, persona=persona))),
         "stream": stream,
     }
-
     profile_options = get_profile_options(profile_override=persona)
     if profile_options:
         payload["options"] = profile_options
-
-    if tools and model not in NO_TOOLS_MODELS:
+    if tools and model not in NO_TOOLS_MODELS and not is_coder_model(model):
         payload["tools"] = tools
-
     with request_ollama_chat(payload, timeout=CHAT_TIMEOUT_SEC) as resp:
         return json.loads(resp.read().decode("utf-8"))
-
 
 # -----------------------------------------------------------------------------
 # Tool selection
 # -----------------------------------------------------------------------------
+LAST_TELEGRAM_ACTION_AT = 0.0
 
+def telegram_chat_action(action: str = "typing") -> None:
+    global LAST_TELEGRAM_ACTION_AT
+
+    if not TELEGRAM_NOTIFY_CHAT_ID:
+        return
+
+    now = time.time()
+
+    # Telegram typing indicator lasts a few seconds.
+    # Do not send more often than every 4 seconds.
+    if now - LAST_TELEGRAM_ACTION_AT < 4.0:
+        return
+
+    LAST_TELEGRAM_ACTION_AT = now
+
+    try:
+        TELEGRAM_GATEWAY.send_chat_action(TELEGRAM_NOTIFY_CHAT_ID, action)
+    except Exception as e:
+        debug(f"Telegram chat action failed: {e}")
+
+def parse_plan_command(text: str) -> tuple[str, Optional[str]]:
+    parts = (text or "").strip().split()
+    if not parts:
+        return "", None
+
+    command = parts[0].lower()
+    plan_id = parts[1] if len(parts) > 1 else None
+
+    return command, plan_id
 
 def build_planner_catalog() -> List[Dict[str, Any]]:
     catalog: List[Dict[str, Any]] = []
-
     for tool in TOOLS:
         try:
             name = tool["function"]["name"]
             description = tool["function"].get("description", "")
         except Exception:
             continue
-
         meta = TOOL_SKILL_META.get(name, {})
-
         catalog.append(
             {
                 "name": name,
@@ -824,15 +1755,12 @@ def build_planner_catalog() -> List[Dict[str, Any]]:
                 "route": meta.get("route", "reason"),
             }
         )
-
     return catalog
 
 
 def build_planner_prompt(user_text: str) -> str:
-    catalog = build_planner_catalog()
-
     compact_catalog = []
-    for item in catalog:
+    for item in build_planner_catalog():
         compact_catalog.append(
             {
                 "name": item["name"],
@@ -842,7 +1770,6 @@ def build_planner_prompt(user_text: str) -> str:
                 "keywords": item.get("keywords", [])[:12],
             }
         )
-
     return (
         "/no_think\n"
         "You select the minimum useful tools for a user request.\n"
@@ -861,6 +1788,22 @@ def build_planner_prompt(user_text: str) -> str:
         f"User request:\n{user_text}\n"
     )
 
+def summarize_step_result(content: str, limit: int = 600) -> str:
+    text = strip_thinking_tags(content or "").strip()
+    text = re.sub(r"```.*?```", "", text, flags=re.DOTALL).strip()
+
+    if "APPLY FAILED" in text:
+        return "Patch generation completed, but applying the patch failed."
+
+    if "--- FILE:" in text:
+        files = re.findall(r"--- FILE:\s*(.+)", text)
+        if files:
+            return "Updated: " + ", ".join(f.strip() for f in files[:5])
+
+    if len(text) > limit:
+        text = text[:limit].rstrip() + "..."
+
+    return text or "Step completed."
 
 def parse_planner_response(answer: str) -> List[str]:
     data = parse_json_object_from_text(answer)
@@ -868,11 +1811,9 @@ def parse_planner_response(answer: str) -> List[str]:
         tools = data.get("tools", [])
         if isinstance(tools, list):
             return [item.strip() for item in tools if isinstance(item, str) and item.strip()]
-
     text = strip_thinking_tags(answer or "").strip()
     if not text:
         return []
-
     return [p.strip() for p in text.split(",") if p.strip()]
 
 
@@ -892,56 +1833,41 @@ def dedupe_tools(tools: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
 
 def resolve_intent_or_tool_names(names: List[str]) -> List[Dict[str, Any]]:
     resolved: List[Dict[str, Any]] = []
-
     for raw_name in names:
         name = (raw_name or "").strip().lower()
         if not name:
             continue
-
         if name in TOOLS_BY_NAME:
             resolved.append(TOOLS_BY_NAME[name])
             continue
-
-        candidates = INTENT_TOOL_CANDIDATES.get(name, [])
-        for candidate in candidates:
+        for candidate in INTENT_TOOL_CANDIDATES.get(name, []):
             if candidate in TOOLS_BY_NAME:
                 resolved.append(TOOLS_BY_NAME[candidate])
-
     return dedupe_tools(resolved)
 
 
 def direct_tools_for_text(user_text: str) -> List[Dict[str, Any]]:
     text = (user_text or "").lower()
     matched_tool_names: List[str] = []
-
     for tool_name, phrases in TOOL_DIRECT_MATCH.items():
         if any(phrase in text for phrase in phrases):
             matched_tool_names.append(tool_name)
-
     for intent_alias, tool_names in INTENT_TOOL_CANDIDATES.items():
         if intent_alias in text:
             matched_tool_names.extend(tool_names)
-
-    return dedupe_tools(
-        [TOOLS_BY_NAME[name] for name in matched_tool_names if name in TOOLS_BY_NAME]
-    )
+    return dedupe_tools([TOOLS_BY_NAME[name] for name in matched_tool_names if name in TOOLS_BY_NAME])
 
 
 def select_tools_by_hints(user_text: str) -> List[Dict[str, Any]]:
     text = (user_text or "").lower()
     matched_tool_names: List[str] = []
-
     for tool_name, hints in TOOL_HINTS.items():
         if any(hint in text for hint in hints):
             matched_tool_names.append(tool_name)
-
     for tool_name, keywords in TOOL_KEYWORDS.items():
         if any((kw or "").lower() in text for kw in keywords):
             matched_tool_names.append(tool_name)
-
-    return dedupe_tools(
-        [TOOLS_BY_NAME[name] for name in matched_tool_names if name in TOOLS_BY_NAME]
-    )
+    return dedupe_tools([TOOLS_BY_NAME[name] for name in matched_tool_names if name in TOOLS_BY_NAME])
 
 
 def likely_needs_tools(user_text: str) -> bool:
@@ -952,98 +1878,80 @@ def likely_needs_tools(user_text: str) -> bool:
 def select_tools_keyword(user_text: str, max_tools: int = MAX_TOOL_SELECTION) -> List[Dict[str, Any]]:
     scores: Dict[str, int] = {}
     text = (user_text or "").lower()
-
     for tool_name, keywords in TOOL_KEYWORDS.items():
         score = sum(1 for kw in keywords if (kw or "").lower() in text)
         if score > 0:
             scores[tool_name] = score
-
     top = sorted(scores, key=scores.get, reverse=True)[:max_tools]
     return [TOOLS_BY_NAME[name] for name in top if name in TOOLS_BY_NAME]
 
 
-def get_effective_planner_model(
-    user_text: str,
-    requested_route: Optional[str],
-    requested_model: Optional[str],
-) -> str:
+def get_effective_planner_model(user_text: str, requested_route: Optional[str], requested_model: Optional[str]) -> str:
     text = (user_text or "").strip().lower()
     words = len(text.split())
-
-    simple_patterns = [
-        "weather",
-        "forecast",
-        "news",
-        "volume",
-        "timer",
-        "radio",
-        "open",
-        "play",
-        "pause",
-        "stop",
-        "mute",
-        "unmute",
-    ]
-
+    simple_patterns = ["weather", "forecast", "news", "volume", "timer", "radio", "open", "play", "pause", "stop", "mute", "unmute"]
     if requested_route == "fast" or words <= 12:
         if any(p in text for p in simple_patterns):
             cfg = load_model_config()
             return str((cfg.get("models") or {}).get("fast", "qwen3:8b"))
-
     return get_planner_model()
 
+def get_active_task(task_graph_path: Path) -> Optional[dict]:
+    graph = load_task_graph(task_graph_path)
 
-def select_tools_via_llm(
-    user_text: str,
-    requested_route: Optional[str] = None,
-    requested_model: Optional[str] = None,
-) -> List[Dict[str, Any]]:
-    planner_model = get_effective_planner_model(
-        user_text=user_text,
-        requested_route=requested_route,
-        requested_model=requested_model,
-    )
+    active_id = graph.get("active_task_id")
+    if not active_id:
+        return None
+
+    return graph.get("tasks", {}).get(active_id)
+
+
+def get_task_by_id(task_graph_path: Path, task_id: str) -> Optional[dict]:
+    graph = load_task_graph(task_graph_path)
+    return graph.get("tasks", {}).get(task_id)
+
+def select_tools_via_llm(user_text: str, requested_route: Optional[str] = None, requested_model: Optional[str] = None) -> List[Dict[str, Any]]:
+    planner_model = get_effective_planner_model(user_text=user_text, requested_route=requested_route, requested_model=requested_model)
     prompt = build_planner_prompt(user_text)
-
     payload = {
         "model": planner_model,
         "messages": [{"role": "user", "content": prompt}],
         "stream": False,
-        "options": {
-            "num_predict": 192,
-            "temperature": 0,
-        },
+        "options": {"num_predict": 192, "temperature": 0},
     }
-
     try:
         emit_event("plan", "Selecting tools", {"planner_model": planner_model})
-        debug(f"Planner model: {planner_model}")
-        debug(f"Planner payload: {safe_json_dumps(payload)[:2000]}")
-
         with request_ollama_chat(payload, timeout=PLANNER_TIMEOUT_SEC) as resp:
             data = json.loads(resp.read().decode("utf-8"))
-
+            emit_event(
+                "code_phase",
+                "Coding planner full response",
+                {"route": "code",
+                    "model": planner_model,
+                    "planner_model": planner_model,
+                    "data": data,
+                },
+            )
         answer = strip_thinking_tags(data.get("message", {}).get("content", "")).strip()
-        debug(f"Planner raw: {answer}")
 
         selected_names = parse_planner_response(answer)
         if not selected_names:
-            emit_event("plan", "Planner selected no tools")
+            emit_event("plan", "Planner selected no tools",  {"route": "code",
+                    "model": planner_model,
+                    "planner_model": planner_model,
+                    "data": data,
+                })
             return []
-
         selected: List[Dict[str, Any]] = []
         selected_names_seen = set()
-
         for name in selected_names:
             lowered = name.strip().lower()
             if not lowered or lowered in selected_names_seen:
                 continue
             selected_names_seen.add(lowered)
-
             if lowered in TOOLS_BY_NAME:
                 selected.append(TOOLS_BY_NAME[lowered])
                 continue
-
             for tool in resolve_intent_or_tool_names([lowered]):
                 try:
                     tool_name = tool["function"]["name"]
@@ -1051,150 +1959,119 @@ def select_tools_via_llm(
                     continue
                 if tool_name not in {t["function"]["name"] for t in selected}:
                     selected.append(tool)
-
         if not selected:
-            fallback = select_tools_keyword(user_text)
-            emit_event(
-                "warning",
-                "Planner returned no resolvable tools, using keyword fallback",
-                {"raw_answer": answer},
-            )
-            return fallback
-
+            emit_event("warning", "Planner returned no resolvable tools, using keyword fallback", {"raw_answer": answer})
+            return select_tools_keyword(user_text)
         selected = dedupe_tools(selected)[:MAX_TOOL_SELECTION]
-        emit_event(
-            "plan",
-            "Planner selected tools",
-            {
-                "tools": [t["function"]["name"] for t in selected],
-                "raw_answer": answer,
-                "planner_model": planner_model,
-            },
-        )
+        emit_event("plan", "Planner selected tools", {"tools": [t["function"]["name"] for t in selected], "raw_answer": answer, "planner_model": planner_model})
         return selected
-
     except urllib.error.HTTPError as e:
         try:
             error_body = e.read().decode("utf-8", errors="replace")
         except Exception:
             error_body = "<no error body>"
-
-        debug(f"Planner HTTP error {e.code}: {e.reason} :: {error_body}")
-        emit_event(
-            "warning",
-            "Planner failed, using keyword fallback",
-            {
-                "error": f"HTTP {e.code} {e.reason}",
-                "body": error_body,
-                "planner_model": planner_model,
-            },
-        )
+        emit_event("warning", "Planner failed, using keyword fallback", {"error": f"HTTP {e.code} {e.reason}", "body": error_body, "planner_model": planner_model})
         return select_tools_keyword(user_text)
-
     except Exception as e:
-        debug(f"Planner error: {e}")
-        emit_event(
-            "warning",
-            "Planner failed, using keyword fallback",
-            {"error": str(e), "planner_model": planner_model},
-        )
+        emit_event("warning", "Planner failed, using keyword fallback", {"error": str(e), "planner_model": planner_model})
         return select_tools_keyword(user_text)
 
 
-def choose_tools(
-    user_text: str,
-    requested_route: Optional[str] = None,
-    requested_model: Optional[str] = None,
-) -> List[Dict[str, Any]]:
-    text = user_text or ""
+def choose_tools(user_text: str, requested_route: Optional[str] = None, requested_model: Optional[str] = None) -> List[Dict[str, Any]]:
+    # Code route must be deterministic.
+    # Do not use planner/hints/keywords for coding tasks.
+    if requested_route == "code":
+        coder_tool = get_coder_tool()
+        return [coder_tool] if coder_tool else []
 
+    text = user_text or ""
     direct = direct_tools_for_text(text)
     if direct:
         direct = dedupe_tools(direct)[:MAX_TOOL_SELECTION]
-        emit_event(
-            "plan",
-            "Direct tool selection from metadata",
-            {"tools": [t["function"]["name"] for t in direct]},
-        )
+        emit_event("plan", "Direct tool selection from metadata", {"tools": [t["function"]["name"] for t in direct]})
         return direct
-
-    selected = select_tools_via_llm(
-        text,
-        requested_route=requested_route,
-        requested_model=requested_model,
-    )
+    selected = select_tools_via_llm(text, requested_route=requested_route, requested_model=requested_model)
     if selected:
         selected = dedupe_tools(selected)[:MAX_TOOL_SELECTION]
-        emit_event(
-            "plan",
-            "Planner tool selection used",
-            {"tools": [t["function"]["name"] for t in selected]},
-        )
+        emit_event("plan", "Planner tool selection used", {"tools": [t["function"]["name"] for t in selected]})
         return selected
-
     hinted = select_tools_by_hints(text)
     if hinted:
         hinted = dedupe_tools(hinted)[:MAX_TOOL_SELECTION]
-        emit_event(
-            "plan",
-            "Hint-based tool selection used",
-            {"tools": [t["function"]["name"] for t in hinted]},
-        )
+        emit_event("plan", "Hint-based tool selection used", {"tools": [t["function"]["name"] for t in hinted]})
         return hinted
-
     keyword_tools = select_tools_keyword(text)
     if keyword_tools:
         keyword_tools = dedupe_tools(keyword_tools)[:MAX_TOOL_SELECTION]
-        emit_event(
-            "plan",
-            "Keyword tool selection used",
-            {"tools": [t["function"]["name"] for t in keyword_tools]},
-        )
+        emit_event("plan", "Keyword tool selection used", {"tools": [t["function"]["name"] for t in keyword_tools]})
         return keyword_tools
-
     emit_event("plan", "No tools selected", {"user_text": text[:120]})
     return []
 
 
-def should_select_tools(
-    user_text: str,
-    requested_route: Optional[str],
-    requested_model: Optional[str],
-) -> bool:
+def should_select_tools(user_text: str, requested_route: Optional[str], requested_model: Optional[str]) -> bool:
     text = (user_text or "").strip()
     lower = text.lower()
-
     if not text:
         return False
-
+    # For code route, direct coder-skill switching handles tool choice later.
+    if requested_route == "code" and "coder" in (requested_model or "").lower():
+        return False
     if len(text.split()) <= 12 and not likely_needs_tools(lower):
         return False
-
     if requested_route == "fast" and not likely_needs_tools(lower):
         return False
-
     return likely_needs_tools(lower)
 
+def extract_last_patch_from_anything(value: Any) -> str:
+    text = extract_tool_content(value)
 
-def is_simple_direct_chat(
-    user_text: str,
-    selected_tools: List[Dict[str, Any]],
-    route: str,
-) -> bool:
+    # If full agent JSON contains observations, parse and take last code_edit ui.content
+    try:
+        data = json.loads(text)
+        observations = data.get("observations", [])
+        if isinstance(observations, list):
+            for obs in reversed(observations):
+                raw = obs.get("observation")
+                if not raw:
+                    continue
+                raw_data = json.loads(raw) if isinstance(raw, str) else raw
+                ui = raw_data.get("ui") if isinstance(raw_data, dict) else None
+                patch = ui.get("content") if isinstance(ui, dict) else None
+                if isinstance(patch, str) and "--- FILE:" in patch:
+                    return normalize_patch_text(patch)
+    except Exception:
+        pass
+
+    return normalize_patch_text(text)
+
+def is_simple_direct_chat(user_text: str, selected_tools: List[Dict[str, Any]], route: str) -> bool:
     return not selected_tools and route == "fast" and len((user_text or "").split()) <= 12
-
 
 # -----------------------------------------------------------------------------
 # Route inference and tool execution
 # -----------------------------------------------------------------------------
 
 
+def detect_route(message: str, source: str = "") -> str:
+    text = (message or "").lower()
+    source = (source or "").lower()
+    if source in {"codex", "codex_ui", "code_ui"}:
+        return "code"
+    code_keywords = [
+        "code", "python", "javascript", "typescript", "next.js", "react", "bug", "error",
+        "stack trace", "traceback", "function", "class", "api", "endpoint", "compile", "fix this",
+        "refactor", "implement", "write script", "patch", "diff", "git", "repo", "file", "server", "skill",
+    ]
+    if any(k in text for k in code_keywords):
+        return "code"
+    return "reason"
+
+
 def infer_route_from_tools(selected_tools: List[Dict[str, Any]]) -> str:
     if not selected_tools:
         return "reason"
-
     routes: List[str] = []
-
     for tool in selected_tools:
         try:
             name = tool["function"]["name"]
@@ -1203,7 +2080,6 @@ def infer_route_from_tools(selected_tools: List[Dict[str, Any]]) -> str:
         route = TOOL_ROUTE_HINTS.get(name)
         if route:
             routes.append(route)
-
     if "code" in routes:
         return "code"
     if "deep" in routes:
@@ -1214,7 +2090,6 @@ def infer_route_from_tools(selected_tools: List[Dict[str, Any]]) -> str:
         return "tools"
     if "fast" in routes:
         return "fast"
-
     return "tools"
 
 
@@ -1225,12 +2100,10 @@ def make_tool_message(name: str, result: Any) -> Dict[str, Any]:
 def normalize_tool_calls(assistant_msg: Dict[str, Any]) -> List[Dict[str, Any]]:
     raw_calls = assistant_msg.get("tool_calls") or []
     normalized = []
-
     for idx, call in enumerate(raw_calls):
         fn = call.get("function", {}) if isinstance(call, dict) else {}
         fn_name = fn.get("name", "")
         fn_args = fn.get("arguments", {})
-
         if isinstance(fn_args, str):
             try:
                 fn_args = json.loads(fn_args)
@@ -1238,15 +2111,7 @@ def normalize_tool_calls(assistant_msg: Dict[str, Any]) -> List[Dict[str, Any]]:
                 fn_args = {}
         if not isinstance(fn_args, dict):
             fn_args = {}
-
-        normalized.append(
-            {
-                "id": call.get("id", f"tool_{idx}"),
-                "type": "function",
-                "function": {"name": fn_name, "arguments": fn_args},
-            }
-        )
-
+        normalized.append({"id": call.get("id", f"tool_{idx}"), "type": "function", "function": {"name": fn_name, "arguments": fn_args}})
     return normalized
 
 
@@ -1255,36 +2120,67 @@ def execute_tool(fn_name: str, fn_args: Dict[str, Any]) -> str:
     if not executor:
         emit_event("warning", f"Unknown tool {fn_name}")
         return f"Unknown tool: {fn_name}"
-
     started = time.time()
-    emit_event("tool_start", f"Running tool {fn_name}", {"tool": fn_name, "args": fn_args})
+    tool_payload = {
+        "tool": fn_name,
+        "args": fn_args,
+    }
 
+    # Extra coder visibility
+    if fn_name == "code_edit":
+        tool_payload["coder_task"] = fn_args.get("task")
+        tool_payload["coder_path"] = fn_args.get("path")
+        tool_payload["coder_mode"] = fn_args.get("mode")
+
+    emit_event(
+        "tool_start",
+        f"Running tool {fn_name}",
+        tool_payload,
+    )
     try:
         result = executor(**fn_args)
+        if fn_name == "flux":
+            try:
+                data = result if isinstance(result, dict) else json.loads(result)
+                image_path = (
+                    data.get("image_path")
+                    or data.get("path")
+                    or data.get("file")
+                    or data.get("output")
+                )
+
+                if image_path:
+                    TELEGRAM_GATEWAY.send_photo(
+                        TELEGRAM_NOTIFY_CHAT_ID,
+                        image_path,
+                        caption="🎨 Flux image generated"
+                    )
+            except Exception as e:
+                debug(f"Telegram Flux image send failed: {e}")
+        if fn_name == "code_edit":
+            emit_event(
+                "code_edit_output",
+                "Coder tool returned output",
+                {
+                    "tool": fn_name,
+                    "result_preview": truncate_text(result, 4000),
+                    "path": fn_args.get("path"),
+                    "mode": fn_args.get("mode"),
+                },
+            )
         elapsed = time.time() - started
-        preview = truncate_text(result, 300)
+        preview =  truncate_text(extract_tool_content(result), 3000),
         debug(f"Tool ok: {fn_name} in {elapsed:.2f}s")
-        emit_event(
-            "tool_result",
-            f"Tool {fn_name} completed",
-            {"tool": fn_name, "elapsed_sec": round(elapsed, 3), "result_preview": preview},
-        )
+        emit_event("tool_result", f"Tool {fn_name} completed", {"tool": fn_name, "elapsed_sec": round(elapsed, 3), "result_preview": preview})
+        if isinstance(result, dict):
+            emit_event("skill_result", f"Skill {fn_name} returned structured result", {"tool": fn_name, "result": result})
+            return json.dumps(result, ensure_ascii=False)
         return truncate_text(result)
     except Exception as e:
         elapsed = time.time() - started
         debug(f"Tool failed: {fn_name} in {elapsed:.2f}s :: {e}")
-        emit_event(
-            "warning",
-            f"Tool {fn_name} failed",
-            {"tool": fn_name, "elapsed_sec": round(elapsed, 3), "error": str(e)},
-        )
-        return truncate_text(
-            {
-                "error": str(e),
-                "tool": fn_name,
-                "traceback": traceback.format_exc(limit=3),
-            }
-        )
+        emit_event("warning", f"Tool {fn_name} failed", {"tool": fn_name, "elapsed_sec": round(elapsed, 3), "error": str(e)})
+        return truncate_text({"error": str(e), "tool": fn_name, "traceback": traceback.format_exc(limit=3)})
 
 
 def wait_for_ollama(max_wait_sec: int = 30) -> bool:
@@ -1312,84 +2208,36 @@ class ChatRun:
     def duration_ms(self) -> int:
         return int((time.time() - self.started_at) * 1000)
 
-
 # -----------------------------------------------------------------------------
 # Core chat loop
 # -----------------------------------------------------------------------------
 
 
-def react_chat(
-    model: str,
-    messages: List[Dict[str, Any]],
-    tools: Optional[List[Dict[str, Any]]] = None,
-    route: str = "reason",
-    persona: Optional[str] = None,
-) -> Dict[str, Any]:
+def react_chat(model: str, messages: List[Dict[str, Any]], tools: Optional[List[Dict[str, Any]]] = None, route: str = "reason", persona: Optional[str] = None) -> Dict[str, Any]:
     tools = tools or []
     system_prompt = build_system_prompt_for_route(route, persona=persona)
-    normalized_messages = normalize_messages(messages, system_prompt=system_prompt)
-    normalized_messages = compact_context(normalized_messages)
+    normalized_messages = compact_context(normalize_messages(messages, system_prompt=system_prompt))
 
-    use_tools = model not in NO_TOOLS_MODELS and len(tools) > 0
-    run = ChatRun(
-        request_id=str(uuid.uuid4())[:8],
-        model=model,
-        selected_tools=[t["function"]["name"] for t in tools],
-    )
+    # Critical: qwen coder models do not receive native Ollama tools.
+    use_tools = (not is_coder_model(model)) and model not in NO_TOOLS_MODELS and len(tools) > 0
 
-    debug(
-        f"run={run.request_id} model={model} route={route} "
-        f"persona={persona} selected_tools={run.selected_tools} use_tools={use_tools}"
-    )
-    emit_event(
-        "status",
-        "Chat run started",
-        {
-            "request_id": run.request_id,
-            "model": model,
-            "route": route,
-            "persona": persona,
-            "tools": run.selected_tools,
-            "use_tools": use_tools,
-        },
-    )
+    run = ChatRun(request_id=str(uuid.uuid4())[:8], model=model, selected_tools=[t["function"]["name"] for t in tools])
+    debug(f"run={run.request_id} model={model} route={route} persona={persona} selected_tools={run.selected_tools} use_tools={use_tools}")
+    emit_event("status", "Chat run started", {"request_id": run.request_id, "model": model, "route": route, "persona": persona, "tools": run.selected_tools, "use_tools": use_tools})
 
-    last_data: Dict[str, Any] = {
-        "model": model,
-        "created_at": now_iso(),
-        "message": {"role": "assistant", "content": "No response generated."},
-        "done": True,
-    }
+    last_data: Dict[str, Any] = {"model": model, "created_at": now_iso(), "message": {"role": "assistant", "content": "No response generated."}, "done": True}
 
     for iteration in range(1, MAX_ITERATIONS + 1):
         run.iterations = iteration
-
-        body: Dict[str, Any] = {
-            "model": model,
-            "messages": normalized_messages,
-            "stream": False,
-        }
-
+        body: Dict[str, Any] = {"model": model, "messages": normalized_messages, "stream": False}
         profile_options = get_profile_options(profile_override=persona)
         if profile_options:
             body["options"] = profile_options
-
         if use_tools:
             body["tools"] = tools
 
         try:
-            emit_event(
-                "status",
-                "Calling Ollama",
-                {
-                    "request_id": run.request_id,
-                    "iteration": iteration,
-                    "model": model,
-                    "route": route,
-                    "persona": persona,
-                    "use_tools": use_tools,
-                },
-            )
+            emit_event("status", "Calling Ollama", {"request_id": run.request_id, "iteration": iteration, "model": model, "route": route, "persona": persona, "use_tools": use_tools})
             with request_ollama_chat(body, timeout=CHAT_TIMEOUT_SEC) as resp:
                 data = json.loads(resp.read().decode("utf-8"))
         except urllib.error.HTTPError as e:
@@ -1397,178 +2245,80 @@ def react_chat(
                 error_body = e.read().decode("utf-8", errors="replace")
             except Exception:
                 error_body = "<no error body>"
-
             if e.code == 400 and use_tools:
                 debug(f"{model} rejected tools. Marking as no-tools model. body={error_body}")
-                emit_event(
-                    "warning",
-                    f"{model} rejected tools, retrying without tools",
-                    {
-                        "request_id": run.request_id,
-                        "iteration": iteration,
-                        "body": error_body,
-                    },
-                )
+                emit_event("warning", f"{model} rejected tools, retrying without tools", {"request_id": run.request_id, "iteration": iteration, "body": error_body})
                 NO_TOOLS_MODELS.add(model)
                 use_tools = False
                 continue
-
-            emit_event(
-                "warning",
-                "Ollama HTTP error",
-                {
-                    "request_id": run.request_id,
-                    "code": e.code,
-                    "reason": e.reason,
-                    "body": error_body,
-                },
-            )
-            return {
-                "model": model,
-                "created_at": now_iso(),
-                "message": {"role": "assistant", "content": f"Error calling Ollama: HTTP {e.code} {e.reason}"},
-                "done": True,
-            }
-
+            emit_event("warning", "Ollama HTTP error", {"request_id": run.request_id, "code": e.code, "reason": e.reason, "body": error_body})
+            return {"model": model, "created_at": now_iso(), "message": {"role": "assistant", "content": f"Error calling Ollama: HTTP {e.code} {e.reason}"}, "done": True}
         except Exception as e:
             emit_event("warning", "Ollama request failed", {"request_id": run.request_id, "error": str(e)})
-            return {
-                "model": model,
-                "created_at": now_iso(),
-                "message": {"role": "assistant", "content": f"Error calling Ollama: {e}"},
-                "done": True,
-            }
+            return {"model": model, "created_at": now_iso(), "message": {"role": "assistant", "content": f"Error calling Ollama: {e}"}, "done": True}
 
         last_data = data
         assistant_msg = data.get("message", {}) or {}
-        tool_calls = normalize_tool_calls(assistant_msg)
-
+        tool_calls = normalize_tool_calls(assistant_msg) if use_tools else []
         content_preview = (assistant_msg.get("content") or "")[:120].replace("\n", " ")
         debug(f"run={run.request_id} iter={iteration} tool_calls={len(tool_calls)} preview={content_preview!r}")
-
-        emit_event(
-            "status",
-            "Model replied",
-            {
-                "request_id": run.request_id,
-                "iteration": iteration,
-                "tool_call_count": len(tool_calls),
-                "content_preview": content_preview,
-            },
-        )
+        emit_event("status", "Model replied", {"request_id": run.request_id, "iteration": iteration, "tool_call_count": len(tool_calls), "content_preview": content_preview})
 
         if not tool_calls:
             content = data.get("message", {}).get("content", "")
             if isinstance(content, str):
-                content = content.replace("**", "")
-                data["message"]["content"] = content
-
-            append_log(
-                f"[{datetime.now().strftime('%H:%M:%S')}] run={run.request_id} done "
-                f"model={model} route={route} persona={persona} "
-                f"iterations={run.iterations} duration_ms={run.duration_ms()}"
-            )
-            emit_event("final", "Final response ready", {"request_id": run.request_id, "duration_ms": run.duration_ms()})
+                data["message"]["content"] = content.replace("**", "")
+            append_log(f"[{datetime.now().strftime('%H:%M:%S')}] run={run.request_id} done model={model} route={route} persona={persona} iterations={run.iterations} duration_ms={run.duration_ms()}")
+            emit_event("final", "Final response ready", {"request_id": run.request_id, "duration_ms": run.duration_ms(), "route": route, "model": model})
             return data
 
-        normalized_messages.append(
-            {
-                "role": "assistant",
-                "content": assistant_msg.get("content", ""),
-                "tool_calls": tool_calls,
-            }
-        )
-
+        normalized_messages.append({"role": "assistant", "content": assistant_msg.get("content", ""), "tool_calls": tool_calls})
         run.used_tools = True
-
         for call in tool_calls:
             fn_name = call["function"]["name"]
             fn_args = call["function"]["arguments"]
-
             debug(f"run={run.request_id} tool={fn_name} args={safe_json_dumps(fn_args)[:180]}")
             result = execute_tool(fn_name, fn_args)
             debug(f"run={run.request_id} tool={fn_name} result={result[:180]!r}")
-
             normalized_messages.append(make_tool_message(fn_name, result))
 
-    append_log(
-        f"[{datetime.now().strftime('%H:%M:%S')}] run={run.request_id} max_iterations "
-        f"model={model} route={route} persona={persona} "
-        f"iterations={run.iterations} duration_ms={run.duration_ms()}"
-    )
-    emit_event("warning", "Max iterations reached", {"request_id": run.request_id, "duration_ms": run.duration_ms()})
+    append_log(f"[{datetime.now().strftime('%H:%M:%S')}] run={run.request_id} max_iterations model={model} route={route} persona={persona} iterations={run.iterations} duration_ms={run.duration_ms()}")
+    emit_event("warning", "Max iterations reached", {"request_id": run.request_id, "duration_ms": run.duration_ms(), "route": route, "model": model})
     return last_data
-
 
 # -----------------------------------------------------------------------------
 # Streaming support
 # -----------------------------------------------------------------------------
 
 
-def stream_direct_chat(
-    handler: "ReactHandler",
-    model: str,
-    messages: List[Dict[str, Any]],
-    selected_tools: Optional[List[Dict[str, Any]]] = None,
-    route: str = "reason",
-    persona: Optional[str] = None,
-) -> None:
+def stream_direct_chat(handler: "ReactHandler", model: str, messages: List[Dict[str, Any]], selected_tools: Optional[List[Dict[str, Any]]] = None, route: str = "reason", persona: Optional[str] = None) -> None:
     user_text = get_last_user_text(messages)
-
+    user_text = clean_telegram_prefix(user_text)
     if selected_tools is None:
-        if should_select_tools(user_text, route, model):
-            selected_tools = choose_tools(
-                user_text,
-                requested_route=route,
-                requested_model=model,
-            )
-        else:
-            selected_tools = []
+        selected_tools = choose_tools(user_text, requested_route=route, requested_model=model) if should_select_tools(user_text, route, model) else []
 
     tool_names = [t["function"]["name"] for t in selected_tools]
-
     debug(f"Streaming selected tools: {tool_names}")
-    emit_event(
-        "status",
-        "Streaming chat started",
-        {"model": model, "route": route, "persona": persona, "tools": tool_names},
-    )
+    emit_event("status", "Streaming chat started", {"model": model, "route": route, "persona": persona, "tools": tool_names})
 
-    if selected_tools:
+    if selected_tools and not is_coder_model(model):
         ack = random.choice(ACKS)
         write_bridge_status("thinking", ack)
         speak_ack(ack)
-
         if ENABLE_STREAM_STATUS:
-            handler._write_sse_json(
-                {
-                    "model": model,
-                    "created_at": now_iso(),
-                    "message": {"role": "assistant", "content": ""},
-                    "done": False,
-                    "status": f"Using tools: {', '.join(tool_names)}",
-                }
-            )
-
+            handler._write_sse_json({"model": model, "created_at": now_iso(), "message": {"role": "assistant", "content": ""}, "done": False, "status": f"Using tools: {', '.join(tool_names)}"})
         result = react_chat(model, messages, selected_tools, route=route, persona=persona)
         handler._write_sse_json(result)
         return
 
     body = {
         "model": model,
-        "messages": compact_context(
-            normalize_messages(
-                messages,
-                system_prompt=build_system_prompt_for_route(route, persona=persona),
-            )
-        ),
+        "messages": compact_context(normalize_messages(messages, system_prompt=build_system_prompt_for_route(route, persona=persona))),
         "stream": True,
     }
-
     profile_options = get_profile_options(profile_override=persona)
     if profile_options:
         body["options"] = profile_options
-
     try:
         with request_ollama_chat(body, timeout=CHAT_TIMEOUT_SEC) as resp:
             for raw_line in resp:
@@ -1581,15 +2331,7 @@ def stream_direct_chat(
                 handler.wfile.flush()
     except Exception as e:
         emit_event("warning", "Streaming error", {"error": str(e), "model": model, "route": route, "persona": persona})
-        handler._write_sse_json(
-            {
-                "model": model,
-                "created_at": now_iso(),
-                "message": {"role": "assistant", "content": f"Streaming error: {e}"},
-                "done": True,
-            }
-        )
-
+        handler._write_sse_json({"model": model, "created_at": now_iso(), "message": {"role": "assistant", "content": f"Streaming error: {e}"}, "done": True})
 
 # -----------------------------------------------------------------------------
 # HTTP handler
@@ -1600,6 +2342,18 @@ class ReactHandler(BaseHTTPRequestHandler):
     server_version = "JarvisReact/3.0"
 
     def do_POST(self) -> None:
+        try:
+            self._do_POST_impl()
+        except Exception as e:
+            error_text = traceback.format_exc(limit=20)
+            print("[REACT] UNHANDLED do_POST ERROR:", error_text)
+            emit_event("warning", "Unhandled do_POST error", {"error": str(e), "traceback": error_text})
+            try:
+                self._json_response({"error": "Internal server error", "detail": str(e), "traceback": error_text}, code=500)
+            except Exception:
+                pass
+
+    def _do_POST_impl(self) -> None:
         path = urlparse(self.path).path
         if path != "/api/chat":
             self.send_error(404)
@@ -1615,6 +2369,7 @@ class ReactHandler(BaseHTTPRequestHandler):
 
         requested_model = body.get("model")
         requested_route = body.get("route")
+        source = body.get("source", "")
         messages = body.get("messages", [])
         stream = bool(body.get("stream", False))
 
@@ -1623,33 +2378,628 @@ class ReactHandler(BaseHTTPRequestHandler):
             return
 
         user_text = get_last_user_text(messages)
+        plan_command, plan_command_id = parse_plan_command(user_text)
+
+        if source == "telegram" and plan_command in {"proceed", "continue", "next", "run", "modify", "cancel"}:
+            requested_route = "code"
+            requested_model = None
+
+        if requested_route not in VALID_ROUTES:
+            requested_route = detect_route(user_text, source)
 
         selected_tools: List[Dict[str, Any]] = []
-        if should_select_tools(user_text, requested_route, requested_model):
+
+        plan_command, plan_command_id = parse_plan_command(user_text)
+
+        if plan_command in {"proceed", "continue", "next", "run", "modify", "cancel"}:
+            selected_tools = []
+        elif should_select_tools(user_text, requested_route, requested_model):
             selected_tools = choose_tools(
                 user_text,
                 requested_route=requested_route,
                 requested_model=requested_model,
             )
+        active_task_followups = {
+            "proceed",
+            "continue",
+            "save it",
+            "write it",
+            "create it",
+            "do it",
+            "yes",
+            "yes proceed",
+            "show directory",
+            "save it and show directory",
+        }
 
-        tool_names = [t["function"]["name"] for t in selected_tools]
         resolved_route = normalized_route(requested_route, selected_tools)
+
+        route = resolved_route
         model = resolve_model(requested_model=requested_model, route=resolved_route)
+        if user_text.lower().startswith("agent: continue"):
+            task = get_active_task(TASK_GRAPH_PATH)
+
+            if task:
+                user_text = (
+                    f"Continue this task.\n\n"
+                    f"Original request:\n{task.get('user_request')}\n\n"
+                    f"Steps:\n{json.dumps(task.get('steps', []), indent=2)}\n\n"
+                    f"Recent events:\n{json.dumps(task.get('events', [])[-10:], indent=2)}"
+                )
+
+                body["task_id"] = task.get("id")
+        # Optional agent executor.
+        # Do NOT hijack code route, because direct coder route below has its own planner/apply flow.
+        agent_requested = (
+            route == "deep" 
+            or user_text.lower().startswith(("agent:", "do task:"))
+        )
+         
+        if agent_requested:
+            result = run_agent_loop(
+                user_message=user_text,
+                route=route,
+                model=model,
+                tools_by_name=TOOLS_BY_NAME,
+                tool_map=TOOL_MAP,
+                call_ollama_once=call_ollama_once,
+                execute_tool=execute_tool,
+                emit_event=emit_event,
+                truncate_text=truncate_text,
+                strip_thinking_tags=strip_thinking_tags,
+                now_iso=now_iso,
+                task_graph_path=TASK_GRAPH_PATH,
+                task_id=body.get("task_id"),
+                max_steps=8,
+            )
+
+            self._json_response({
+                "model": model,
+                "created_at": now_iso(),
+                "message": {
+                    "role": "assistant",
+                    "content": result.get("answer", ""),
+                },
+                "done": True,
+                "route": route,
+                "format": "agent",
+                "task_id": result.get("task_id"),
+                "agent": {
+                    "trace": result.get("trace", []),
+                    "observations": result.get("observations", []),
+                },
+            })
+            return
+        # ------------------------------------------------------------------
+        # Direct coder route
+        # ------------------------------------------------------------------
+        if resolved_route == "code" and is_coder_model(model):
+            coder_tool = get_coder_tool()
+
+            if coder_tool:
+                selected_tools = [coder_tool]
+
+            tool_names = [
+                t["function"]["name"]
+                for t in selected_tools
+                if isinstance(t, dict) and isinstance(t.get("function"), dict)
+            ]
+
+            runtime_mode = write_runtime_mode(resolved_route, model, selected_tools)
+            persona = runtime_mode.get("persona")
+
+            try:
+                sync_orpheus_for_route(resolved_route, model)
+            except Exception as e:
+                emit_event(
+                    "warning",
+                    "Orpheus sync failed",
+                    {"route": resolved_route, "model": model, "error": str(e)},
+                )
+
+            emit_event(
+                "status",
+                "Incoming coder skill request",
+                {
+                    "requested_model": requested_model,
+                    "requested_route": requested_route,
+                    "source": source,
+                    "resolved_route": resolved_route,
+                    "resolved_model": model,
+                    "tools": tool_names,
+                    "user_preview": user_text[:140],
+                    "runtime_mode": runtime_mode,
+                },
+            )
+
+            if not selected_tools:
+                self._json_response(
+                    {
+                        "model": model,
+                        "created_at": now_iso(),
+                        "message": {
+                            "role": "assistant",
+                            "content": f"Code route selected, but no coder skill was loaded. Expected tool: code_edit. Found: {tool_names}",
+                        },
+                        "done": True,
+                    }
+                )
+                return
+
+            ack = random.choice(ACKS)
+            write_bridge_status("thinking", ack)
+            append_log(f"[{datetime.now().strftime('%H:%M:%S')}] ACK: {ack}")
+            speak_ack(ack)
+
+            tool_name = selected_tools[0]["function"]["name"]
+
+            paths = body.get("paths")
+            if not isinstance(paths, list) or not paths:
+                paths = guess_coding_paths(user_text)
+
+            command, requested_plan_id = parse_plan_command(user_text)
+
+            if requested_plan_id:
+                active_plan = load_plan_by_id(requested_plan_id)
+            else:
+                active_plan = load_active_plan()
+            if requested_plan_id and active_plan:
+                save_active_plan(active_plan)
+           
+            emit_event(
+                "code_phase",
+                "Guessed coding paths",
+                {
+                    "paths": paths,
+                },
+            )
+
+           
+            if command == "cancel":
+
+                if not requested_plan_id:
+                    self._json_response({
+                        "model": model,
+                        "created_at": now_iso(),
+                        "message": {"role": "assistant", "content": "Cancel failed: missing plan id."},
+                        "done": True,
+                    })
+                    return
+
+                plan = load_plan_by_id(requested_plan_id)
+                if not plan:
+                    self._json_response({
+                        "model": model,
+                        "created_at": now_iso(),
+                        "message": {"role": "assistant", "content": f"Plan not found: {requested_plan_id}"},
+                        "done": True,
+                    })
+                    return
+
+                plan["status"] = "cancelled"
+                plan["cancelled_at"] = now_iso()
+                save_json(requested_plan_id, "status.json", plan)
+
+                self._json_response({
+                    "model": model,
+                    "created_at": now_iso(),
+                    "message": {"role": "assistant", "content": f"Cancelled plan {requested_plan_id}."},
+                    "done": True,
+                })
+                return
+            # Modify current plan / create new modified plan
+            if command == "modify" or user_text.strip().lower().startswith("modify this plan:"):
+                active_plan = build_simple_code_plan(user_text, paths)
+                
+                emit_event(
+                    "code_phase",
+                    "Plan modified",
+                    {
+                        "phase": "plan_modified",
+                        "plan_id": active_plan.get("plan_id"),
+                        "steps": active_plan.get("steps", []),
+                    },
+                )
+                save_json(active_plan["plan_id"], "plan.json", active_plan)
+
+                append_event(
+                    "plan.modified",
+                    "Coding plan modified",
+                    plan_id=active_plan.get("plan_id"),
+                    route="code",
+                    model=active_plan.get("planner_model"),
+                    payload={"steps": active_plan.get("steps", [])},
+                )
+                save_active_plan(active_plan)
+                self._json_response(
+                    {
+                        "model": model,
+                        "created_at": now_iso(),
+                        "message": {"role": "assistant", "content": render_plan(active_plan)},
+                        "done": True,
+                    }
+                )
+                return
+
+            # New request creates plan first
+            if command not in {"proceed", "continue", "next", "run", "yes"}:
+                active_plan = build_simple_code_plan(user_text, paths)
+    # ADD HERE
+                if needs_output_path(user_text, paths):
+                    plan_id = active_plan["plan_id"]
+
+                    active_plan["state"] = "waiting_input"
+                    active_plan["waiting_for"] = "output_path"
+
+                    save_active_plan(active_plan)
+
+                    return {
+                        "message": {
+                            "role": "assistant",
+                            "content": (
+                                f"PLAN_ID: {plan_id}\n\n"
+                                "Where should I save the generated file?\n\n"
+                                "Examples:\n"
+                                "- love.html\n"
+                                "- app/page.tsx\n"
+                                "- scripts/test.py"
+                            ),
+                        }
+                    }
+
+                # continue normal planner/coder flow
+                emit_event(
+                    "code_phase",
+                    "Plan created",
+                    {
+                        "phase": "plan_created",
+                        "plan_id": active_plan.get("plan_id"),
+                        "steps": active_plan.get("steps", []),
+                    },
+                )
+                append_event(
+                    "planner.done",
+                    "Planner returned coding plan",
+                    plan_id=active_plan.get("plan_id"),
+                    route="code",
+                    model=active_plan.get("planner_model"),
+                    payload={
+                        "steps": active_plan.get("steps", []),
+                        "paths": active_plan.get("paths", []),
+                    },
+                )
+                save_active_plan(active_plan)
+                self._json_response(
+                    {
+                        "model": model,
+                        "created_at": now_iso(),
+                        "message": {"role": "assistant", "content": render_plan(active_plan)},
+                        "done": True,
+                    }
+                )
+                return
+
+            # Proceed / continue requires active plan
+            if not active_plan:
+                self._json_response(
+                    {
+                        "model": model,
+                        "created_at": now_iso(),
+                        "message": {
+                            "role": "assistant",
+                            "content": "No active coding plan found. Send the coding request first.",
+                        },
+                        "done": True,
+                    }
+                )
+                return
+
+            current_step = int(active_plan.get("current_step", 0))
+            steps = active_plan.get("steps", [])
+
+            if current_step >= len(steps):
+                self._json_response(
+                    {
+                        "model": model,
+                        "created_at": now_iso(),
+                        "message": {"role": "assistant", "content": "Coding plan is already complete."},
+                        "done": True,
+                    }
+                )
+                return
+
+            step = steps[current_step]
+
+            emit_event(
+                "code_phase",
+                f"Running step {step.get('id')}: {step.get('goal')}",
+                {
+                    "phase": "running_step",
+                    "plan_id": active_plan.get("plan_id"),
+                    "step": step,
+                    "paths": paths,
+                },
+            )
+
+            fn_args = {
+                "task": (
+                    active_plan.get("user_request", user_text)
+                    + "\n\nCurrent approved planner step:\n"
+                    + str(step.get("goal", "Make a minimal patch."))
+                    + "\n\nOUTPUT FORMAT STRICT:\n"
+                    + "--- FILE: path/to/file.py\n"
+                    + "@@\n"
+                    + "<only changed function/helper blocks>\n\n"
+                    + "Rules:\n"
+                    + "- Must include --- FILE\n"
+                    + "- Must include @@\n"
+                    + "- No full files unless creating a new file\n"
+                    + "- Minimal patch only\n"
+                    + "- No shell commands\n"
+                ),
+                "path": paths[0] if paths else str(PROJECT_ROOT),
+                "model": model,
+                "mode": "patch",
+            }
+
+            emit_event(
+                "status",
+                "Executing coder skill directly",
+                {
+                    "route": resolved_route,
+                    "model": model,
+                    "tool": tool_name,
+                    "args": fn_args,
+                },
+            )
+            append_event(
+                "coder.start",
+                f"Coder started step {step.get('id')}",
+                plan_id=active_plan.get("plan_id"),
+                task_id=str(step.get("id")),
+                route=resolved_route,
+                model=model,
+                payload={
+                    "tool": tool_name,
+                    "step": step,
+                    "paths": paths,
+                },
+            )
+            result = run_agent_loop(
+                user_message=(
+                    "Execute this approved plan only.\n\n"
+                    f"Plan:\n{json.dumps(active_plan, indent=2)}\n\n"
+                    "Rules:\n"
+                    "- Follow the plan step by step.\n"
+                    "- Do not add new goals.\n"
+                    "- Use code_edit only for file changes.\n"
+                    "- Do not use flux for HTML/CSS animation.\n"
+                    "- Stop when the plan is complete.\n"
+                ),
+                route="code",
+                model=model,
+                tools_by_name={"code_edit": TOOLS_BY_NAME["code_edit"]},
+                tool_map={"code_edit": TOOL_MAP["code_edit"]},
+                call_ollama_once=call_ollama_once,
+                execute_tool=execute_tool,
+                emit_event=emit_event,
+                truncate_text=truncate_text,
+                strip_thinking_tags=strip_thinking_tags,
+                now_iso=now_iso,
+                task_graph_path=TASK_GRAPH_PATH,
+                task_id=active_plan.get("plan_id"),
+                max_steps=len(active_plan.get("steps", [])) + 2,
+            )
+            ##result = execute_tool(tool_name, fn_args)
+            content = extract_last_patch_from_anything(result)
+            content = normalize_patch_text(content)
+            if "--- FILE:" not in content or "@@" not in content:
+                emit_event(
+                    "warning",
+                    "Coder returned non-patch output",
+                    {
+                        "plan_id": active_plan.get("plan_id"),
+                        "step": step,
+                        "preview": content[:1000],
+                    },
+                )
+
+                content = (
+                    "Coder returned analysis instead of a patch.\n\n"
+                    "This output was rejected.\n\n"
+                    f"Preview:\n{content[:1500]}"
+                )
+            patch_file = f"patches/step_{step.get('id')}.patch"
+            (plan_dir(active_plan["plan_id"]) / patch_file).write_text(content, encoding="utf-8")
+
+            append_event(
+                "coder.done",
+                f"Coder finished step {step.get('id')}",
+                plan_id=active_plan.get("plan_id"),
+                task_id=str(step.get("id")),
+                route=resolved_route,
+                model=model,
+                payload={
+                    "patch_file": patch_file,
+                    "chars": len(content),
+                },
+            )
+            if "### PATCH" in content:
+                patch_part = content.split("### PATCH", 1)[1].strip()
+            else:
+                patch_part = content
+
+            validation = validate_coder_output(patch_part)
+
+            emit_event(
+                "code_phase",
+                "Patch returned, validating",
+                {
+                    "phase": "validating_patch",
+                    "plan_id": active_plan.get("plan_id"),
+                    "preview": patch_part[:500],
+                },
+            )
+
+            emit_event(
+                "status",
+                "Coder output validation completed",
+                {
+                    "route": resolved_route,
+                    "model": model,
+                    "tool": tool_name,
+                    "validation": validation,
+                },
+            )
+            append_event(
+                "patch.validated",
+                "Coder output validation completed",
+                plan_id=active_plan.get("plan_id"),
+                task_id=str(step.get("id")),
+                route=resolved_route,
+                model=model,
+                payload={"validation": validation},
+            )
+            if not validation["ok"]:
+                retry_instruction = (
+                    active_plan.get("user_request", user_text)
+                    + "\n\nYour previous answer was rejected by validation.\n"
+                    + "Problems:\n"
+                    + "\n".join(f"- {p}" for p in validation.get("problems", []))
+                    + "\n\nReturn ONLY this format, no explanation, no markdown fences:\n"
+                    + "--- FILE: path/to/file.py\n"
+                    + "@@\n"
+                    + "<minimal changed function/helper blocks only>\n"
+                )
+
+                retry_args = {
+                    "task": retry_instruction,
+                    "path": paths[0] if paths else str(PROJECT_ROOT),
+                    "model": model,
+                    "mode": "patch",
+                }
+
+                emit_event(
+                    "code_phase",
+                    "Patch failed validation, repairing",
+                    {
+                        "phase": "repairing_patch",
+                        "plan_id": active_plan.get("plan_id"),
+                        "problems": validation.get("problems", []),
+                    },
+                )
+
+                retry_result = execute_tool(tool_name, retry_args)
+                retry_content = extract_tool_content(retry_result)
+                retry_validation = validate_coder_output(retry_content)
+
+                if retry_validation["ok"]:
+                    content = retry_content
+                    validation = retry_validation
+                else:
+                    content = wrap_invalid_coder_output(retry_content, retry_validation)
+                    validation = retry_validation
+
+            emit_event(
+                "final",
+                "Coder skill response ready",
+                {
+                    "route": resolved_route,
+                    "model": model,
+                    "tool": tool_name,
+                    "validated": validation["ok"],
+                },
+            )
+
+            if validation["ok"]:
+                apply_result = apply_file_patch(content)
+
+                emit_event(
+                    "code_phase",
+                    "Patch applied" if apply_result.get("ok") else "Patch apply failed",
+                    {
+                        "phase": "patch_applied" if apply_result.get("ok") else "patch_apply_failed",
+                        "plan_id": active_plan.get("plan_id"),
+                        "result": apply_result,
+                    },
+                )
+                append_event(
+                    "patch.applied" if apply_result.get("ok") else "patch.apply_failed",
+                    "Patch applied" if apply_result.get("ok") else "Patch apply failed",
+                    plan_id=active_plan.get("plan_id"),
+                    task_id=str(step.get("id")),
+                    route=resolved_route,
+                    model=model,
+                    payload={"result": apply_result},
+                )
+                if apply_result.get("ok"):
+                    step["status"] = "done"
+                    step["summary"] = summarize_step_result(content)
+                    active_plan["current_step"] = current_step + 1
+                    save_active_plan(active_plan)
+                    save_json(active_plan["plan_id"], "status.json", active_plan)
+
+                    append_event(
+                        "step.done",
+                        f"Step {step.get('id')} completed",
+                        plan_id=active_plan.get("plan_id"),
+                        task_id=str(step.get("id")),
+                        route=resolved_route,
+                        model=model,
+                        payload={
+                            "step": step,
+                            "current_step": active_plan["current_step"],
+                            "remaining": len(steps) - active_plan["current_step"],
+                        },
+                    )
+                    
+                    emit_event(
+                        "code_step_ready",
+                        f"Step {step.get('id')} complete. Ready for next step.",
+                        {
+                            "plan_id": active_plan.get("plan_id"),
+                            "step": step,
+                            "current_step": active_plan["current_step"],
+                            "remaining": len(steps) - active_plan["current_step"],
+                            "next_step": steps[active_plan["current_step"]] if active_plan["current_step"] < len(steps) else None,
+                        },
+                    )
+                else:
+                    content = content + "\n\nAPPLY FAILED:\n" + json.dumps(apply_result, indent=2)
+
+            self._json_response(
+                {
+                    "model": model,
+                    "created_at": now_iso(),
+                    "message": {"role": "assistant", "content": content},
+                    "done": True,
+                    "validation": validation,
+                }
+            )
+            return
+
+        # ------------------------------------------------------------------
+        # Normal non-direct route
+        # ------------------------------------------------------------------
+        tool_names = [t["function"]["name"] for t in selected_tools]
 
         runtime_mode = write_runtime_mode(resolved_route, model, selected_tools)
         persona = runtime_mode.get("persona")
 
+        try:
+            sync_orpheus_for_route(resolved_route, model)
+        except Exception as e:
+            emit_event(
+                "warning",
+                "Orpheus sync failed",
+                {"route": resolved_route, "model": model, "error": str(e)},
+            )
+
         debug(f"Runtime mode: {runtime_mode}")
         debug(
-            f"POST /api/chat "
-            f"requested_model={requested_model!r} "
-            f"requested_route={requested_route!r} "
-            f"resolved_route={resolved_route!r} "
-            f"resolved_model={model!r} "
-            f"persona={persona!r} "
-            f"stream={stream} "
-            f"tool_count={len(selected_tools)} "
-            f"user={user_text[:140]!r}"
+            f"POST /api/chat requested_model={requested_model!r} requested_route={requested_route!r} source={source!r} "
+            f"resolved_route={resolved_route!r} resolved_model={model!r} persona={persona!r} stream={stream} "
+            f"tool_count={len(selected_tools)} user={user_text[:140]!r}"
         )
         debug(f"Selected {len(selected_tools)} tools: {tool_names}")
 
@@ -1659,6 +3009,7 @@ class ReactHandler(BaseHTTPRequestHandler):
             {
                 "requested_model": requested_model,
                 "requested_route": requested_route,
+                "source": source,
                 "resolved_route": resolved_route,
                 "resolved_model": model,
                 "stream": stream,
@@ -1676,7 +3027,6 @@ class ReactHandler(BaseHTTPRequestHandler):
             self.send_header("Connection", "keep-alive")
             self.send_header("Access-Control-Allow-Origin", "*")
             self.end_headers()
-
             stream_direct_chat(
                 self,
                 model,
@@ -1716,17 +3066,124 @@ class ReactHandler(BaseHTTPRequestHandler):
             append_log(f"[{datetime.now().strftime('%H:%M:%S')}] ACK: {ack}")
             speak_ack(ack)
 
-        result = react_chat(
-            model,
-            messages,
-            selected_tools,
-            route=resolved_route,
-            persona=persona,
-        )
-        self._json_response(result)
+            result = react_chat(model, messages, selected_tools, route=resolved_route, persona=persona)
+            self._json_response(result)
+
+            tool_names = [t["function"]["name"] for t in selected_tools]
+            runtime_mode = write_runtime_mode(resolved_route, model, selected_tools)
+            persona = runtime_mode.get("persona")
+
+            try:
+                sync_orpheus_for_route(resolved_route, model)
+            except Exception as e:
+                emit_event("warning", "Orpheus sync failed", {"route": resolved_route, "model": model, "error": str(e)})
+
+            debug(f"Runtime mode: {runtime_mode}")
+            debug(
+                f"POST /api/chat requested_model={requested_model!r} requested_route={requested_route!r} source={source!r} "
+                f"resolved_route={resolved_route!r} resolved_model={model!r} persona={persona!r} stream={stream} "
+                f"tool_count={len(selected_tools)} user={user_text[:140]!r}"
+            )
+            debug(f"Selected {len(selected_tools)} tools: {tool_names}")
+
+            emit_event(
+                "status",
+                "Incoming chat request",
+                {
+                    "requested_model": requested_model,
+                    "requested_route": requested_route,
+                    "source": source,
+                    "resolved_route": resolved_route,
+                    "resolved_model": model,
+                    "stream": stream,
+                    "tool_count": len(selected_tools),
+                    "tools": tool_names,
+                    "user_preview": user_text[:140],
+                    "runtime_mode": runtime_mode,
+                },
+            )
+
+            if stream:
+                self.send_response(200)
+                self.send_header("Content-Type", "application/x-ndjson")
+                self.send_header("Cache-Control", "no-cache")
+                self.send_header("Connection", "keep-alive")
+                self.send_header("Access-Control-Allow-Origin", "*")
+                self.end_headers()
+                stream_direct_chat(self, model, messages, selected_tools=selected_tools, route=resolved_route, persona=persona)
+                return
+
+            if is_simple_direct_chat(user_text, selected_tools, resolved_route):
+                try:
+                    data = call_ollama_once(model=model, messages=messages, route=resolved_route, persona=persona, tools=None, stream=False)
+                    self._json_response(data)
+                    return
+                except Exception as e:
+                    self._json_response({"model": model, "created_at": now_iso(), "message": {"role": "assistant", "content": f"Error calling Ollama: {e}"}, "done": True})
+                    return
+
+            result = react_chat(model, messages, selected_tools, route=resolved_route, persona=persona)
+            self._json_response(result)
+            return
 
     def do_GET(self) -> None:
         path = urlparse(self.path).path
+        if path == "/api/history/plans":
+            plans_root = VAULT_DIR / ".jarvis" / "history" / "plans"
+            plans = []
+            if plans_root.exists():
+                for p in sorted(plans_root.iterdir(), reverse=True):
+                    if p.is_dir():
+                        plan_file = p / "plan.json"
+                        status_file = p / "status.json"
+                        item = {"plan_id": p.name}
+                        try:
+                            if status_file.exists():
+                                item.update(json.loads(status_file.read_text(encoding="utf-8")))
+                            elif plan_file.exists():
+                                item.update(json.loads(plan_file.read_text(encoding="utf-8")))
+                        except Exception as e:
+                            item["error"] = str(e)
+                        plans.append(item)
+            self._json_response({"plans": plans[:50]})
+            return
+
+        if path.startswith("/api/history/plan/"):
+            plan_id = path.rsplit("/", 1)[-1]
+            d = VAULT_DIR / ".jarvis" / "history" / "plans" / plan_id
+
+            if not d.exists():
+                self._json_response({"error": "Plan not found", "plan_id": plan_id}, code=404)
+                return
+
+            def read_json(name: str):
+                f = d / name
+                if not f.exists():
+                    return None
+                return json.loads(f.read_text(encoding="utf-8"))
+
+            events = []
+            events_file = d / "events.jsonl"
+            if events_file.exists():
+                for line in events_file.read_text(encoding="utf-8", errors="ignore").splitlines():
+                    if line.strip():
+                        try:
+                            events.append(json.loads(line))
+                        except Exception:
+                            pass
+
+            self._json_response(
+                {
+                    "plan_id": plan_id,
+                    "plan": read_json("plan.json"),
+                    "status": read_json("status.json"),
+                    "events": events,
+                }
+            )
+            return
+        if path == "/api/coding-log":
+            self._json_response({"events": recent_coding_events(120)})
+            return
 
         if path == "/api/health":
             try:
@@ -1736,9 +3193,7 @@ class ReactHandler(BaseHTTPRequestHandler):
             except Exception:
                 ollama_ready = False
                 ollama_models = 0
-
             profile = load_active_profile()
-
             self._json_response(
                 {
                     "status": "ok",
@@ -1749,10 +3204,7 @@ class ReactHandler(BaseHTTPRequestHandler):
                     "ollama_model_count": ollama_models,
                     "loaded_skills": len(get_loaded_skills()),
                     "tool_count": len(TOOL_MAP),
-                    "active_profile": {
-                        "id": profile.get("id"),
-                        "label": profile.get("label"),
-                    },
+                    "active_profile": {"id": profile.get("id"), "label": profile.get("label")},
                     "models": load_model_config().get("models", {}),
                     "planner_model": get_planner_model(),
                 }
@@ -1775,12 +3227,7 @@ class ReactHandler(BaseHTTPRequestHandler):
 
         if path == "/api/models":
             cfg = load_model_config()
-            self._json_response(
-                {
-                    "models": cfg.get("models", {}),
-                    "planner_model": get_planner_model(),
-                }
-            )
+            self._json_response({"models": cfg.get("models", {}), "planner_model": get_planner_model()})
             return
 
         if path == "/api/events":
@@ -1790,7 +3237,6 @@ class ReactHandler(BaseHTTPRequestHandler):
         if path == "/api/timers":
             try:
                 from skills.timer import get_active_timers  # type: ignore
-
                 self._json_response({"timers": get_active_timers()})
             except ImportError:
                 self._json_response({"timers": []})
@@ -1799,14 +3245,7 @@ class ReactHandler(BaseHTTPRequestHandler):
         if path == "/api/radio":
             try:
                 from skills.radio import get_now_playing, get_radio_state, get_stations  # type: ignore
-
-                self._json_response(
-                    {
-                        **get_radio_state(),
-                        "stations": get_stations(),
-                        "now_playing": get_now_playing(),
-                    }
-                )
+                self._json_response({**get_radio_state(), "stations": get_stations(), "now_playing": get_now_playing()})
             except ImportError:
                 self._json_response({"playing": False, "stations": {}})
             return
@@ -1822,7 +3261,6 @@ class ReactHandler(BaseHTTPRequestHandler):
         if path == "/api/network":
             try:
                 from skills.network import get_topology  # type: ignore
-
                 self._json_response(get_topology())
             except ImportError:
                 self._json_response({"devices": [], "gateway": "192.168.0.1"})
@@ -1832,9 +3270,7 @@ class ReactHandler(BaseHTTPRequestHandler):
             try:
                 runtime_persona = None
                 if RUNTIME_MODE_PATH.exists():
-                    runtime_persona = json.loads(
-                        RUNTIME_MODE_PATH.read_text(encoding="utf-8")
-                    ).get("persona")
+                    runtime_persona = json.loads(RUNTIME_MODE_PATH.read_text(encoding="utf-8")).get("persona")
             except Exception:
                 runtime_persona = None
             self._json_response(build_self_context(persona=runtime_persona))
@@ -1887,6 +3323,11 @@ if __name__ == "__main__":
     ensure_dirs()
     emit_event("status", "React server starting", {"port": PORT, "ollama_host": OLLAMA_HOST})
     wait_for_ollama()
+    if ORPHEUS_ENABLED:
+        try:
+            sync_orpheus_for_route("fast", resolve_model(requested_model=None, route="fast"))
+        except Exception as e:
+            emit_event("warning", "Initial Orpheus warm start failed", {"error": str(e)})
 
     server = ThreadingHTTPServer(("127.0.0.1", PORT), ReactHandler)
     print(f"[REACT] ReAct server v3 on http://127.0.0.1:{PORT}")
