@@ -123,7 +123,7 @@ ORPHEUS_WARM_ROUTES = {"fast", "reason", "tools"}
 ORPHEUS_COLD_ROUTES = {"code", "deep"}
 ORPHEUS_BOOT_TIMEOUT_SEC = int(os.environ.get("JARVIS_ORPHEUS_BOOT_TIMEOUT_SEC", "25"))
 ORPHEUS_POLL_INTERVAL_SEC = float(os.environ.get("JARVIS_ORPHEUS_POLL_INTERVAL_SEC", "0.5"))
-
+WORKFLOW_STATE_PATH = VAULT_DIR / ".jarvis" / "workflow_state.json"
 NO_TOOLS_MODELS: set[str] = set()
 stage_start_events = {"plan", "code_phase", "tool_start", "agent_start", "agent_step"}
 stage_end_events = {"tool_result", "code_step_ready", "agent_final", "final", "warning"}
@@ -461,7 +461,7 @@ def build_simple_code_plan(user_text: str, paths: List[str]) -> Dict[str, Any]:
         "stream": False,
         "options": {"temperature": 0, "num_predict": 600},
     }
-    plan_files = data.get("files", []) if isinstance(data, dict) else []
+    plan_files: List[str] = []
     try:
         answer = ""
         raw_steps = []
@@ -479,6 +479,8 @@ def build_simple_code_plan(user_text: str, paths: List[str]) -> Dict[str, Any]:
             )
 
             raw_content = data.get("message", {}).get("content", "")
+            
+            plan_files = data.get("files", []) if isinstance(data, dict) else []
 
             answer = strip_thinking_tags(raw_content).strip()
 
@@ -628,10 +630,220 @@ def reload_all_skills() -> Dict[str, Any]:
 
 print(f"[REACT] Loading skills from {PROJECT_ROOT / 'skills'}...")
 reload_all_skills()
+def match_markdown_skill(user_text: str) -> Optional[Dict[str, Any]]:
+    text = (user_text or "").lower()
 
+    for skill in load_markdown_skills():
+        haystack = (
+            str(skill.get("name", "")) + "\n" +
+            str(skill.get("description", ""))
+        ).lower()
+
+        if "list" in text and "skill" in text:
+            continue
+
+        trigger_words = [
+            "new app",
+            "start a project",
+            "build me an app",
+            "set up a new service",
+            "create a new project",
+            "scaffold",
+        ]
+
+        if any(t in text for t in trigger_words):
+            if "scaffold" in haystack or "project" in haystack:
+                return skill
+
+    return None
 # -----------------------------------------------------------------------------
 # Utilities
 # -----------------------------------------------------------------------------
+def parse_workflow_questions(md_skill: Dict[str, Any]) -> List[Dict[str, str]]:
+    content = md_skill.get("content", "")
+
+    questions = []
+
+    current_category = "general"
+
+    for raw in content.splitlines():
+        line = raw.strip()
+
+        if line.startswith("# CATEGORY:"):
+            current_category = line.split(":", 1)[1].strip()
+            continue
+
+        if line.startswith("Q:"):
+            qid = line.split(":", 1)[1].strip()
+
+            questions.append({
+                "id": qid,
+                "category": current_category,
+                "prompt": "",
+            })
+
+            continue
+
+        if line.startswith("Prompt:") and questions:
+            questions[-1]["prompt"] = line.split(":", 1)[1].strip()
+
+    return questions
+def get_next_workflow_question(state: Dict[str, Any]) -> Optional[str]:
+    md_skill = load_markdown_skill_by_name(state["skill"])
+
+    questions = parse_workflow_questions(md_skill)
+
+    answers = state.setdefault("answers", {})
+
+    for q in questions:
+        if q["id"] not in answers:
+            state["last_question"] = q["id"]
+            save_workflow_state(state)
+            return q["prompt"]
+
+    return None
+def continue_markdown_workflow(user_text: str, state: Dict[str, Any]) -> str:
+    answers = state.setdefault("answers", {})
+    category = int(state.get("category", 1))
+
+    # Save previous answer
+    last_question = state.get("last_question")
+
+    if last_question:
+        answers[last_question] = user_text.strip()
+
+    # ------------------------------------------------------------------
+    # CATEGORY 1
+    # ------------------------------------------------------------------
+    if category == 1:
+        questions = [
+            "project_name",
+            "project_description",
+            "target_users",
+        ]
+
+        for q in questions:
+            if q not in answers:
+                state["last_question"] = q
+                save_workflow_state(state)
+
+                prompts = {
+                    "project_name": "What is the project name?",
+                    "project_description": "Describe the project in 1-3 sentences.",
+                    "target_users": "Who are the target users?",
+                }
+
+                return prompts[q]
+
+        state["category"] = 2
+
+    # ------------------------------------------------------------------
+    # CATEGORY 2
+    # ------------------------------------------------------------------
+    if state["category"] == 2:
+        questions = [
+            "frontend",
+            "backend",
+            "database",
+        ]
+
+        for q in questions:
+            if q not in answers:
+                state["last_question"] = q
+                save_workflow_state(state)
+
+                prompts = {
+                    "frontend": "Frontend stack? (Next.js, React, Vue, etc.)",
+                    "backend": "Backend stack?",
+                    "database": "Database?",
+                }
+
+                return prompts[q]
+
+        state["category"] = 3
+
+    # ------------------------------------------------------------------
+    # CATEGORY 3
+    # ------------------------------------------------------------------
+    if state["category"] == 3:
+        questions = [
+            "authentication",
+            "payments",
+            "deployment",
+        ]
+
+        for q in questions:
+            if q not in answers:
+                state["last_question"] = q
+                save_workflow_state(state)
+
+                prompts = {
+                    "authentication": "Need authentication/login?",
+                    "payments": "Need payment support?",
+                    "deployment": "Where will this run? (local/cloud/docker/etc.)",
+                }
+
+                return prompts[q]
+
+    # ------------------------------------------------------------------
+    # COMPLETE
+    # ------------------------------------------------------------------
+    state["phase"] = "complete"
+    save_workflow_state(state)
+
+    summary = json.dumps(answers, indent=2, ensure_ascii=False)
+
+    return (
+        "Interview complete.\n\n"
+        "Project summary:\n\n"
+        f"{summary}\n\n"
+        "Reply with:\n"
+        "- proceed\n"
+        "- modify\n"
+        "- cancel"
+    )
+def load_workflow_state() -> Dict[str, Any]:
+    if not WORKFLOW_STATE_PATH.exists():
+        return {}
+    try:
+        return json.loads(WORKFLOW_STATE_PATH.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+
+def save_workflow_state(state: Dict[str, Any]) -> None:
+    WORKFLOW_STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
+    WORKFLOW_STATE_PATH.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
+
+def clear_workflow_state() -> None:
+    if WORKFLOW_STATE_PATH.exists():
+        WORKFLOW_STATE_PATH.unlink()
+
+def load_markdown_skills() -> list[dict]:
+    root = VAULT_DIR / ".jarvis" / "markdown_skills"
+    skills = []
+
+    for path in root.glob("*.md"):
+        text = path.read_text(encoding="utf-8", errors="ignore")
+
+        meta = {}
+        body = text
+
+        if text.startswith("---"):
+            _, frontmatter, body = text.split("---", 2)
+            for line in frontmatter.splitlines():
+                if ":" in line:
+                    k, v = line.split(":", 1)
+                    meta[k.strip()] = v.strip()
+
+        skills.append({
+            "path": str(path),
+            "name": meta.get("name", path.stem),
+            "description": meta.get("description", ""),
+            "content": body.strip(),
+        })
+
+    return skills
+
 def needs_output_path(task: str, paths: list[str]) -> bool:
     lower = (task or "").lower()
 
@@ -2378,8 +2590,51 @@ class ReactHandler(BaseHTTPRequestHandler):
             return
 
         user_text = get_last_user_text(messages)
-        plan_command, plan_command_id = parse_plan_command(user_text)
+        user_text = clean_telegram_prefix(user_text)
 
+        workflow_state = load_workflow_state()
+
+        if workflow_state:
+            reply = continue_markdown_workflow(user_text, workflow_state)
+
+            self._json_response({
+                "model": "workflow",
+                "created_at": now_iso(),
+                "message": {"role": "assistant", "content": reply},
+                "done": True,
+            })
+            return
+
+        md_skill = match_markdown_skill(user_text)
+
+        if md_skill:
+            body["markdown_skill"] = md_skill
+            requested_route = md_skill.get("route", requested_route or "reason")
+
+            if md_skill.get("type") == "interview_workflow":
+                state = {
+                    "skill": md_skill.get("name"),
+                    "skill_path": md_skill.get("path"),
+                    "phase": "interview",
+                    "answers": {},
+                }
+
+                save_workflow_state(state)
+
+                question = get_next_workflow_question(state)
+
+                self._json_response({
+                    "model": "workflow",
+                    "created_at": now_iso(),
+                    "message": {
+                        "role": "assistant",
+                        "content": question or "Workflow started.",
+                    },
+                    "done": True,
+                })
+                return
+        plan_command, plan_command_id = parse_plan_command(user_text)
+##### planner
         if source == "telegram" and plan_command in {"proceed", "continue", "next", "run", "modify", "cancel"}:
             requested_route = "code"
             requested_model = None
