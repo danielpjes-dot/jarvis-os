@@ -20,15 +20,67 @@ BROWSER_HOST="http://127.0.0.1:4000"
 
 export OLLAMA_MODELS
 export OLLAMA_HOST
-export JARVIS_ORPHEUS_ENABLED=0
-export JARVIS_ORPHEUS_HOST=http://127.0.0.1:5100
-export JARVIS_ORPHEUS_START_CMD="python /mnt/e/coding/jarvis-os/scripts/orpheus_server.py"
-export JARVIS_ORPHEUS_STOP_MATCH="orpheus_server.py"
+
 mkdir -p "$VAULT_DIR" "$VAULT_DIR/tts" "$BRIDGE_DIR"
 touch "$LOG"
 
 log() {
   echo "[$(date '+%H:%M:%S')] $1" | tee -a "$LOG"
+}
+LLAMA_SERVER_CMD="$PROJECT_DIR/../llama.cpp/build/bin/llama-server"
+LLAMA_MODEL="/mnt/e/models/gemma4-e4b/gemma-4-E4B-it-UD-Q4_K_XL.gguf"
+LLAMA_MMPROJ="/mnt/e/models/gemma4-e4b/mmproj-BF16.gguf"
+LLAMA_PORT="8081"
+
+FAST_SERVER_CMD="python3 ./scripts/fast_server.py"
+
+start_llama_server() {
+  echo "[JARVIS] Starting llama-server on port ${LLAMA_PORT}..."
+
+  pkill -f "llama-server.*--port ${LLAMA_PORT}" 2>/dev/null || true
+
+  nohup ${LLAMA_SERVER_CMD} \
+    --model "${LLAMA_MODEL}" \
+    --mmproj "${LLAMA_MMPROJ}" \
+    --n-gpu-layers 99 \
+    --ctx-size 8192 \
+    --port "${LLAMA_PORT}" \
+    > /tmp/jarvis_llama_server.log 2>&1 &
+
+  echo $! > /tmp/jarvis_llama_server.pid
+}
+
+stop_llama_server() {
+  echo "[JARVIS] Stopping llama-server..."
+
+  if [ -f /tmp/jarvis_llama_server.pid ]; then
+    kill "$(cat /tmp/jarvis_llama_server.pid)" 2>/dev/null || true
+    rm -f /tmp/jarvis_llama_server.pid
+  fi
+
+  pkill -f "llama-server.*--port ${LLAMA_PORT}" 2>/dev/null || true
+}
+
+start_fast_server() {
+  echo "[JARVIS] Starting Kokoro/fast server..."
+
+  pkill -f "scripts/fast_server.py" 2>/dev/null || true
+
+  nohup ${FAST_SERVER_CMD} \
+    > /tmp/jarvis_fast_server.log 2>&1 &
+
+  echo $! > /tmp/jarvis_fast_server.pid
+}
+
+stop_fast_server() {
+  echo "[JARVIS] Stopping Kokoro/fast server..."
+
+  if [ -f /tmp/jarvis_fast_server.pid ]; then
+    kill "$(cat /tmp/jarvis_fast_server.pid)" 2>/dev/null || true
+    rm -f /tmp/jarvis_fast_server.pid
+  fi
+
+  pkill -f "scripts/fast_server.py" 2>/dev/null || true
 }
 
 load_models_from_config() {
@@ -107,6 +159,9 @@ stop_pidfile_processes() {
 }
 
 stop_named_processes() {
+  log "Stopping named processes..."
+  stop_llama_server
+  stop_fast_server
   pkill -f "watcher.sh" 2>/dev/null || true
   pkill -f "react_server.py" 2>/dev/null || true
   pkill -f "scripts/server.py" 2>/dev/null || true
@@ -246,9 +301,13 @@ do_start() {
   mkdir -p "$BRIDGE_DIR" "$VAULT_DIR/tts"
   reset_bridge_state
   : > "$PIDFILE"
+  log "Starting llama server"
+  start_llama_server
+  log "Starting fast server"
+  start_fast_server
 
   ensure_ollama || true
-  preload_model "$OLLAMA_FAST"
+  preload_model "$OLLAMA_TOOLS"
 
   log "Starting ReAct tool server on :7900"
   python3 -u "$PROJECT_DIR/scripts/react_server.py" > /tmp/react.log 2>&1 &
@@ -268,9 +327,7 @@ do_start() {
   python3 "$PROJECT_DIR/scripts/server.py" > /tmp/jarvis-browser.log 2>&1 &
   echo "$! bridge-server" >> "$PIDFILE"
 
-  log "Starting Orpheus TTS on :5100"
-  python3 "$PROJECT_DIR/scripts/orpheus_server.py" > /tmp/jarvis-orpheus.log 2>&1 &
-  echo "$! orpheus-server" >> "$PIDFILE"
+
   log "Starting PTY terminal server on :4010"
   python3 "$PROJECT_DIR/scripts/pty_server.py" > /tmp/jarvis-pty.log 2>&1 &
   echo "$! pty-server" >> "$PIDFILE"
@@ -324,11 +381,20 @@ do_status() {
   else
     echo "  ✗ Browser bridge (:4000)"
   fi
+  if curl -sf --max-time 1 "$LLAMA_CPP_HOST/health" > /dev/null 2>&1; then
+    LLAMA_MODEL_NAME=$(curl -s "$LLAMA_CPP_HOST/props" 2>/dev/null | \
+      python3 -c 'import sys,json; d=json.load(sys.stdin); print(d.get("model_path","unknown").split("/")[-1])' \
+      2>/dev/null)
 
-  if curl -sf --max-time 1 http://localhost:5100/health > /dev/null 2>&1; then
-    echo "  ✓ Orpheus TTS (:5100)"
+    echo "  ✓ llama.cpp (:8081) [$LLAMA_MODEL_NAME]"
   else
-    echo "  ○ Orpheus TTS (offline)"
+    echo "  ○ llama.cpp server (offline)"
+  fi
+  
+  if curl -sf --max-time 1 http://localhost:5100/health > /dev/null 2>&1; then
+    echo "  ✓ Kokoro TTS (:5100)"
+  else
+    echo "  ○ Kokoro TTS (offline)"
   fi
 
   echo ""

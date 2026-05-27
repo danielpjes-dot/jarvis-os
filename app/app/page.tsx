@@ -14,6 +14,9 @@ import { RadioPlayer } from "./components/radio-player";
 import { NetworkMap } from "./components/network-map";
 import { ImageGenerator } from "./components/image-generator";
 import { CodingWorkspace } from "./components/coding-workspace";
+import { MicVAD } from "@ricky0123/vad-web";
+
+
 
 type JarvisState = "standby" | "listening" | "thinking" | "speaking" | "asking";
 
@@ -57,6 +60,8 @@ interface SkillUiResult {
   ttl_seconds?: number;
   createdAt: number;
 }
+
+
 
 function stableSkillId(tool: string, placement: UiPlacement) {
   if (tool === "coding_review") return "coding_review";
@@ -517,7 +522,6 @@ export default function JarvisPage() {
   const [emotion, setEmotion] = useState("neutral");
   const [output, setOutput] = useState("Systems online. Ready for input.");
   const [history, setHistory] = useState<HistoryEntry[]>([]);
-  const [ttsAvailable, setTtsAvailable] = useState(false);
   const [reactServerReady, setReactServerReady] = useState(false);
   const [reactServerHealth, setReactServerHealth] = useState<any>(null);
   const [pendingApprovals, setPendingApprovals] = useState(0);
@@ -526,8 +530,10 @@ export default function JarvisPage() {
   const [liveModel, setLiveModel] = useState<string | null>(null);
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [chatOpen, setChatOpen] = useState(false);
-  const [activeTab, setActiveTab] = useState("jarvis");
+  const [activeTab, setActiveTab] = useState<string>("jarvis");
   const [openTabs, setOpenTabs] = useState<{ id: string; label: string }[]>([]);
+  const [kokoroReady, setKokoroReady] = useState(false);
+  const [llamaCppReady, setLlamaCppReady] = useState(false);
 
   const [rightHudItems, setRightHudItems] = useState<SkillUiResult[]>([]);
   const [leftHudItems, setLeftHudItems] = useState<SkillUiResult[]>([]);
@@ -541,8 +547,25 @@ export default function JarvisPage() {
   const lastEventTsRef = useRef(0);
   const lastNetworkScanRef = useRef(0);
   const awakeUntilRef = useRef(0);
+  
   const alwaysOnRef = useRef(false);
-
+  const videoRef = useRef<HTMLVideoElement>(null);
+  const waveformCanvasRef = useRef<HTMLCanvasElement>(null);
+  const waveformRafRef = useRef<number>(0);
+  const audioCtxRef = useRef<AudioContext | null>(null);
+  const analyserRef = useRef<AnalyserNode | null>(null);
+  const micSourceRef = useRef<MediaStreamAudioSourceNode | null>(null);
+  const streamSourcesRef = useRef<AudioBufferSourceNode[]>([]);
+  const streamNextTimeRef = useRef(0);
+  const speakingStartedAtRef = useRef(0);
+  const ignoreIncomingAudioRef = useRef(false);
+  const parlourWsRef = useRef<WebSocket | null>(null);
+  const vadRef = useRef<any>(null);
+  const [cameraEnabled, setCameraEnabled] = useState(true);
+  const [parlourConnected, setParlourConnected] = useState(false);
+  const ambientPhaseRef = useRef(0);
+  const BAR_COUNT = 40;
+  const BAR_GAP = 3;
   const [micActive, setMicActive] = useState(false);
 
   useEffect(() => {
@@ -609,12 +632,7 @@ export default function JarvisPage() {
     [openTab]
   );
 
-  useEffect(() => {
-    fetch("/api/tts")
-      .then((r) => r.json())
-      .then((d) => setTtsAvailable(Boolean(d.available)))
-      .catch(() => {});
-  }, []);
+
 useEffect(() => {
   let active = true;
 
@@ -642,6 +660,37 @@ useEffect(() => {
     clearInterval(id);
   };
 }, []);
+  useEffect(() => {
+    let active = true;
+
+    async function checkLocalAiServices() {
+      try {
+        const kokoro = await fetch("http://127.0.0.1:5100/health", {
+          cache: "no-store",
+        });
+        if (active) setKokoroReady(kokoro.ok);
+      } catch {
+        if (active) setKokoroReady(false);
+      }
+
+      try {
+        const llama = await fetch("http://127.0.0.1:8081/health", {
+          cache: "no-store",
+        });
+        if (active) setLlamaCppReady(llama.ok);
+      } catch {
+        if (active) setLlamaCppReady(false);
+      }
+    }
+
+    checkLocalAiServices();
+    const id = setInterval(checkLocalAiServices, 5000);
+
+    return () => {
+      active = false;
+      clearInterval(id);
+    };
+  }, []);
   useEffect(() => {
   let active = true;
 
@@ -883,11 +932,14 @@ useEffect(() => {
       recorder.start();
 
       let silentFrames = 0;
-      const dataArray = new Uint8Array(analyser.frequencyBinCount);
-
+      const dataArray = new Uint8Array(
+      new ArrayBuffer(analyser.frequencyBinCount)
+      );
       const check = () => {
         if (recorder.state === "inactive") return;
-
+        const dataArray = new Uint8Array(
+          new ArrayBuffer(analyser.frequencyBinCount)
+        );
         analyser.getByteFrequencyData(dataArray);
 
         const avg = dataArray.reduce((a, b) => a + b, 0) / dataArray.length;
@@ -949,74 +1001,351 @@ useEffect(() => {
     });
   }
 
-  const startAlwaysOn = useCallback(async () => {
-    if (alwaysOnRef.current) return;
+// 2. Replace the entire startAlwaysOn / stopAlwaysOn / handleVoiceToggle block
+// and add all new functions. Insert after the stopAlwaysOn definition:
 
-    alwaysOnRef.current = true;
-    setMicActive(true);
+  // ── Audio context ──
+const ensureAudioCtx = useCallback(() => {
+  if (!audioCtxRef.current) {
+    audioCtxRef.current = new AudioContext();
+    const analyser = audioCtxRef.current.createAnalyser();
+    analyser.fftSize = 256;
+    analyser.smoothingTimeConstant = 0.75;
+    analyserRef.current = analyser;
+  }
+}, []);
 
-    try {
-      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-      streamRef.current = stream;
 
-      const audioCtx = new AudioContext();
-      const source = audioCtx.createMediaStreamSource(stream);
-      const analyser = audioCtx.createAnalyser();
 
-      analyser.fftSize = 512;
-      source.connect(analyser);
-
-      while (alwaysOnRef.current) {
-        if (
-          stateRef.current === "thinking" ||
-          stateRef.current === "speaking"
-        ) {
-          await new Promise((r) => setTimeout(r, 500));
-          continue;
-        }
-
-        const hasSpeech = await waitForSpeech(analyser);
-        if (!hasSpeech) break;
-
-        const text = await captureUtterance(stream, analyser);
-        if (!text || text.length < 3) continue;
-
-        const now = Date.now();
-        const isAwake = now < awakeUntilRef.current;
-
-        if (hasWakeWord(text)) {
-          awakeUntilRef.current = now + AWAKE_TIMEOUT;
-          const command = stripWakeWord(text);
-
-          if (command && command.length > 2) handleSend(command);
-        } else if (isAwake) {
-          handleSend(text);
-          awakeUntilRef.current = now + AWAKE_TIMEOUT;
-        }
-
-        await new Promise((r) => setTimeout(r, 500));
-      }
-
-      stream.getTracks().forEach((t) => t.stop());
-      audioCtx.close();
-    } catch {}
-
-    alwaysOnRef.current = false;
-    setMicActive(false);
-    setState("standby");
-  }, [handleSend]);
-
-  const stopAlwaysOn = useCallback(() => {
-    alwaysOnRef.current = false;
+  // ── Waveform ──
+  const getStateColor = useCallback(() => {
+    const colors: Record<string, string> = {
+      listening: "#4ade80",
+      thinking: "#f59e0b",
+      speaking: "#818cf8",
+      standby: "#3a3d46",
+      asking: "#f0c040",
+    };
+    return colors[stateRef.current] || "#3a3d46";
   }, []);
 
+  const drawWaveform = useCallback(() => {
+    const canvas = waveformCanvasRef.current;
+    if (!canvas) return;
+
+    const ctx = canvas.getContext("2d");
+    if (!ctx) return;
+
+    const rect = canvas.getBoundingClientRect();
+    const w = rect.width;
+    const h = rect.height;
+    const dpr = window.devicePixelRatio || 1;
+
+    if (canvas.width !== Math.floor(w * dpr) || canvas.height !== Math.floor(h * dpr)) {
+      canvas.width = Math.floor(w * dpr);
+      canvas.height = Math.floor(h * dpr);
+    }
+
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    ctx.clearRect(0, 0, w, h);
+
+    const barWidth = (w - (BAR_COUNT - 1) * BAR_GAP) / BAR_COUNT;
+    ctx.fillStyle = getStateColor();
+
+    let dataArray: Uint8Array<ArrayBuffer> | null = null;
+
+    if (analyserRef.current) {
+      dataArray = new Uint8Array(new ArrayBuffer(analyserRef.current.frequencyBinCount));
+      analyserRef.current.getByteFrequencyData(dataArray);
+    }
+
+    for (let i = 0; i < BAR_COUNT; i++) {
+      let amplitude = 0;
+
+      if (dataArray) {
+        const binIndex = Math.floor((i / BAR_COUNT) * dataArray.length * 0.6);
+        amplitude = dataArray[binIndex] / 255;
+      }
+
+      if (!dataArray || amplitude < 0.02) {
+        ambientPhaseRef.current += 0.0001;
+        const drift = Math.sin(ambientPhaseRef.current * 3 + i * 0.4) * 0.5 + 0.5;
+        amplitude = 0.03 + drift * 0.04;
+      }
+
+      const barH = Math.max(2, amplitude * (h - 4));
+      const x = i * (barWidth + BAR_GAP);
+      const y = (h - barH) / 2;
+      const r = Math.min(barWidth / 2, barH / 2, 3);
+
+      ctx.globalAlpha = 0.3 + amplitude * 0.7;
+      ctx.beginPath();
+
+      if (typeof ctx.roundRect === "function") {
+        ctx.roundRect(x, y, barWidth, barH, r);
+      } else {
+        ctx.rect(x, y, barWidth, barH);
+      }
+
+      ctx.fill();
+    }
+
+    ctx.globalAlpha = 1;
+    waveformRafRef.current = requestAnimationFrame(drawWaveform);
+  }, [getStateColor]);
+
   useEffect(() => {
-    historyEndRef.current?.scrollIntoView({ behavior: "smooth" });
-  }, [history]);
+    waveformRafRef.current = requestAnimationFrame(drawWaveform);
+    return () => cancelAnimationFrame(waveformRafRef.current);
+  }, [drawWaveform]);
+
+  // ── Streaming TTS playback ──
+  const stopPlayback = useCallback(() => {
+    for (const src of streamSourcesRef.current) {
+      try { src.stop(); } catch {}
+    }
+    streamSourcesRef.current = [];
+    streamNextTimeRef.current = 0;
+  }, []);
+
+  const startStreamPlayback = useCallback((_sampleRate = 24000) => {
+    stopPlayback();
+    ensureAudioCtx();
+    streamNextTimeRef.current = audioCtxRef.current!.currentTime + 0.05;
+    speakingStartedAtRef.current = Date.now();
+    setState("speaking");
+  }, [stopPlayback, ensureAudioCtx]);
+
+  const queueAudioChunk = useCallback((base64Pcm: string) => {
+    ensureAudioCtx();
+    const ctx = audioCtxRef.current!;
+    const analyser = analyserRef.current!;
+
+    const bin = atob(base64Pcm);
+    const bytes = new Uint8Array(bin.length);
+    for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+    const safeBuffer = bytes.buffer.slice(
+      bytes.byteOffset,
+      bytes.byteOffset + bytes.byteLength
+    ) as ArrayBuffer;
+
+    const int16 = new Int16Array(safeBuffer);
+    const float32 = new Float32Array(int16.length);
+    for (let i = 0; i < int16.length; i++) float32[i] = int16[i] / 32768;
+
+    const audioBuffer = ctx.createBuffer(1, float32.length, 24000);
+    audioBuffer.getChannelData(0).set(float32);
+
+    const source = ctx.createBufferSource();
+    source.buffer = audioBuffer;
+    source.connect(ctx.destination);
+    source.connect(analyser);
+
+    const startAt = Math.max(streamNextTimeRef.current, ctx.currentTime);
+    source.start(startAt);
+    streamNextTimeRef.current = startAt + audioBuffer.duration;
+    streamSourcesRef.current.push(source);
+
+    source.onended = () => {
+      const idx = streamSourcesRef.current.indexOf(source);
+      if (idx !== -1) streamSourcesRef.current.splice(idx, 1);
+      if (streamSourcesRef.current.length === 0 && stateRef.current === "speaking") {
+        setState("listening");
+      }
+    };
+  }, [ensureAudioCtx]);
+
+  // ── Camera ──
+  const captureFrame = useCallback(() => {
+    if (!cameraEnabled || !videoRef.current?.videoWidth) return null;
+    const canvas = document.createElement("canvas");
+    const scale = 320 / videoRef.current.videoWidth;
+    canvas.width = 320;
+    canvas.height = videoRef.current.videoHeight * scale;
+    canvas.getContext("2d")!.drawImage(videoRef.current, 0, 0, canvas.width, canvas.height);
+    return canvas.toDataURL("image/jpeg", 0.7).split(",")[1];
+  }, [cameraEnabled]);
+
+  // ── float32 WAV encoder ──
+  const float32ToWavBase64 = useCallback((samples: Float32Array): string => {
+    const buf = new ArrayBuffer(44 + samples.length * 2);
+    const v = new DataView(buf);
+    const w = (o: number, s: string) => { for (let i = 0; i < s.length; i++) v.setUint8(o + i, s.charCodeAt(i)); };
+    w(0,"RIFF"); v.setUint32(4, 36 + samples.length * 2, true); w(8,"WAVE"); w(12,"fmt ");
+    v.setUint32(16, 16, true); v.setUint16(20, 1, true); v.setUint16(22, 1, true);
+    v.setUint32(24, 16000, true); v.setUint32(28, 32000, true); v.setUint16(32, 2, true);
+    v.setUint16(34, 16, true); w(36,"data"); v.setUint32(40, samples.length * 2, true);
+    for (let i = 0; i < samples.length; i++) {
+      const s = Math.max(-1, Math.min(1, samples[i]));
+      v.setInt16(44 + i * 2, s < 0 ? s * 0x8000 : s * 0x7FFF, true);
+    }
+    const bytes = new Uint8Array(buf);
+    let bin = ""; for (let i = 0; i < bytes.length; i++) bin += String.fromCharCode(bytes[i]);
+    return btoa(bin);
+  }, []);
+
+  // ── Parlour WebSocket ──
+  const connectParlour = useCallback(() => {
+    const ws = new WebSocket("ws://127.0.0.1:8000/ws");
+    parlourWsRef.current = ws;
+
+    ws.onopen = () => setParlourConnected(true);
+    ws.onclose = () => {
+      setParlourConnected(false);
+      setTimeout(connectParlour, 3000);
+    };
+    ws.onmessage = ({ data }) => {
+      const msg = JSON.parse(data);
+
+      if (msg.type === "text") {
+        const text = msg.text || "";
+        setOutput(text);
+        setHistory(h => [...h, { role: "jarvis", text, timestamp: Date.now() }]);
+        if (msg.transcription) {
+          setHistory(h => {
+            const copy = [...h];
+            // update last user message with real transcription
+            for (let i = copy.length - 1; i >= 0; i--) {
+              if (copy[i].role === "user") {
+                copy[i] = { ...copy[i], text: msg.transcription };
+                break;
+              }
+            }
+            return copy;
+          });
+        }
+      } else if (msg.type === "audio_start") {
+        if (ignoreIncomingAudioRef.current) return;
+        startStreamPlayback(msg.sample_rate || 24000);
+      } else if (msg.type === "audio_chunk") {
+        if (ignoreIncomingAudioRef.current) return;
+        queueAudioChunk(msg.audio);
+      } else if (msg.type === "audio_end") {
+        if (ignoreIncomingAudioRef.current) {
+          ignoreIncomingAudioRef.current = false;
+          stopPlayback();
+          setState("listening");
+        }
+      }
+    };
+  }, [startStreamPlayback, queueAudioChunk, stopPlayback]);
+
+  // ── VAD init ──
+  useEffect(() => {
+    let mediaStream: MediaStream | null = null;
+
+    async function initVAD() {
+     if (vadRef.current) return;
+      try {
+        mediaStream = await navigator.mediaDevices.getUserMedia({
+          video: { width: 640, height: 480, facingMode: "user" },
+          audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true },
+        });
+        if (videoRef.current) videoRef.current.srcObject = mediaStream;
+        alwaysOnRef.current = true;
+        setMicActive(true);
+        setState("listening");
+        connectParlour();
+        for (let i = 0; i < 50; i++) {
+          // @ts-ignore
+          if (MicVAD) break;
+          await new Promise((r) => setTimeout(r, 100));
+        }
+        // @ts-ignore — vad loaded via CDN script tag
+        const myvad = await MicVAD.new({
+          getStream: async () => new MediaStream(mediaStream!.getAudioTracks()),
+          positiveSpeechThreshold: 0.5,
+          negativeSpeechThreshold: 0.25,
+          redemptionMs: 600,
+          minSpeechMs: 300,
+          preSpeechPadMs: 300,
+          onnxWASMBasePath: "/vad/",
+          baseAssetPath: "/vad/",
+          onSpeechStart: () => {
+            const BARGE_IN_GRACE_MS = 800;
+            if (stateRef.current === "speaking") {
+              if (Date.now() - speakingStartedAtRef.current < BARGE_IN_GRACE_MS) return;
+              stopPlayback();
+              ignoreIncomingAudioRef.current = true;
+              parlourWsRef.current?.send(JSON.stringify({ type: "interrupt" }));
+              setState("listening");
+            }
+          },
+          onSpeechEnd: (audio: Float32Array) => {
+            if (stateRef.current !== "listening") return;
+            if (!parlourWsRef.current || parlourWsRef.current.readyState !== WebSocket.OPEN) {
+              // fallback to react_server text path
+              return;
+            }
+            const wavBase64 = float32ToWavBase64(audio);
+            const imageBase64 = captureFrame();
+            setState("thinking");
+            setHistory(h => [...h, { role: "user", text: "…", timestamp: Date.now() }]);
+            const payload: any = { audio: wavBase64 };
+            if (imageBase64) payload.image = imageBase64;
+            parlourWsRef.current.send(JSON.stringify(payload));
+
+            // Connect mic to analyser for waveform during processing
+            ensureAudioCtx();
+            if (mediaStream && audioCtxRef.current && analyserRef.current && !micSourceRef.current) {
+              micSourceRef.current = audioCtxRef.current.createMediaStreamSource(mediaStream);
+            }
+            try { micSourceRef.current?.connect(analyserRef.current!); } catch {}
+          },
+        });
+
+        vadRef.current = myvad;
+        myvad.start();
+
+        // Sync VAD threshold with speaking state
+        const syncVad = () => {
+          if (vadRef.current) {
+            vadRef.current.setOptions?.({
+              positiveSpeechThreshold: stateRef.current === "speaking" ? 0.92 : 0.5
+            });
+          }
+          setTimeout(syncVad, 1000);
+        };
+        syncVad();
+
+      } catch (e) {
+        console.warn("VAD/camera init failed:", e);
+      }
+    }
+
+    initVAD();
+
+    return () => {
+      const vad = vadRef.current;
+      vadRef.current = null;
+
+      try {
+        vad?.pause?.();
+      } catch {}
+
+      // Do NOT call destroy() in React dev/StrictMode.
+      // It can throw: cannot release session. invalid session id
+      // vad?.destroy?.();
+
+      mediaStream?.getTracks().forEach((t) => t.stop());
+      parlourWsRef.current?.close();
+      parlourWsRef.current = null;
+      stopPlayback();
+      alwaysOnRef.current = false;
+      setMicActive(false);
+    };
+  }, [connectParlour, float32ToWavBase64, captureFrame, stopPlayback, ensureAudioCtx]);
+
+  // Disconnect mic from analyser when not listening
+  useEffect(() => {
+    if (state !== "listening" && micSourceRef.current && analyserRef.current) {
+      try { micSourceRef.current.disconnect(analyserRef.current); } catch {}
+    }
+  }, [state]);
 
   function handleVoiceToggle() {
-    if (alwaysOnRef.current) stopAlwaysOn();
-    else startAlwaysOn();
+    // VAD is always-on now — toggle camera instead
+    setCameraEnabled(c => !c);
   }
 
   const isProcessing = state === "thinking" || state === "speaking";
@@ -1047,8 +1376,7 @@ const activeModel =
             J.A.R.V.I.S
           </h1>
           <div className="text-[7px] tracking-[3px] uppercase opacity-25 mt-0.5">
-            {ttsAvailable ? "ORPHEUS TTS ACTIVE" : "TEXT MODE"} &middot; LOCAL
-            AI ASSISTANT
+            {kokoroReady ? "KOKORO TTS ACTIVE" : "TEXT MODE"} &middot; {llamaCppReady ? "LLAMA.CPP LIVE" : "OLLAMA FALLBACK"} &middot; LOCAL AI ASSISTANT
           </div>
         </div>
 
@@ -1133,18 +1461,18 @@ const activeModel =
               <div className="flex items-center gap-2 mb-2">
                 <span
                   className={`w-1.5 h-1.5 rounded-full ${
-                    ttsAvailable ? "bg-green-400" : "bg-red-400/50"
+                    kokoroReady ? "bg-green-400" : "bg-red-400/50"
                   }`}
                 />
                 <span className="text-[9px] tracking-[2px] uppercase opacity-50">
-                  {ttsAvailable ? "ORPHEUS TTS ONLINE" : "TTS OFFLINE"}
+                  {kokoroReady ? "KOKORO TTS ONLINE" : "TTS OFFLINE"}
                 </span>
               </div>
 
               <div className="flex items-center gap-2">
                 <span className="w-1.5 h-1.5 rounded-full bg-green-400" />
                 <span className="text-[9px] tracking-[2px] uppercase opacity-50">
-                  WHISPER STT
+                  VAD + PARLOR WS
                 </span>
               </div>
             </div>
@@ -1206,11 +1534,41 @@ const activeModel =
                   thinking={state === "thinking"}
                 />
 
+                <div className="absolute bottom-16 left-1/2 -translate-x-1/2 w-64 h-10 z-10 pointer-events-none">
+                  <canvas
+                    ref={waveformCanvasRef}
+                    className="w-full h-full"
+                    style={{
+                      opacity: state === "standby" ? 0.3 : 0.85,
+                      transition: "opacity 0.5s",
+                    }}
+                  />
+                </div>
+
+                <button
+                  type="button"
+                  className="absolute bottom-3 left-3 z-10 rounded-lg overflow-hidden border border-white/10 bg-black/40"
+                  style={{ width: 120, height: 90, opacity: cameraEnabled ? 0.85 : 0.2 }}
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    setCameraEnabled((c) => !c);
+                  }}
+                  title={cameraEnabled ? "Disable camera frame" : "Enable camera frame"}
+                >
+                  <video
+                    ref={videoRef}
+                    autoPlay
+                    muted
+                    playsInline
+                    className="w-full h-full object-cover scale-x-[-1]"
+                  />
+                </button>
+
                 {state === "listening" && (
                   <div className="absolute bottom-8 left-1/2 -translate-x-1/2 z-10">
                     <div className="text-red-400 text-[10px] tracking-[4px] uppercase state-listening flex items-center gap-2">
                       <span className="w-2 h-2 rounded-full bg-red-400 animate-ping" />
-                      LISTENING &mdash; CLICK TO STOP
+                      LISTENING &mdash; VAD ACTIVE
                     </div>
                   </div>
                 )}
@@ -1250,7 +1608,7 @@ const activeModel =
                 <p className="text-[8px] text-white/15 tracking-[2px] text-center mb-2 uppercase">
                   {micActive
                     ? 'Listening… say "Hey JARVIS"'
-                    : "Click face to start voice"}{" "}
+                    : "VAD/parlor offline or camera muted"}{" "}
                   &middot; Type below for text
                 </p>
 
@@ -1410,7 +1768,9 @@ const activeModel =
                 { name: "BRIDGE (4000)", status: true },
                 { name: "REACT SERVER (7900)", status: reactServerReady },
                 { name: "OLLAMA", status: Boolean(reactServerHealth?.ollama_ready) },
-                { name: "TTS ENGINE", status: ttsAvailable },
+                { name: "LLAMA.CPP (8081)", status: llamaCppReady },
+                { name: "KOKORO TTS (5100)", status: kokoroReady },
+                { name: "PARLOR WS (8000)", status: parlourConnected },
               ].map((conn) => (
                 <div key={conn.name} className="flex items-center gap-2">
                   <span
