@@ -10,7 +10,8 @@ MODEL_CONFIG_PATH = PROJECT_ROOT / "config/models-config.json"
 VAULT_DIR = Path("D:/Jarvis_vault")
 
 DEFAULT_MODELS = {
-    "fast": "qwen3:8b",
+    "live": "gemma4:e4b",
+    "fast": "gemma4:e4b",
     "tools": "qwen3:14b",
     "reason": "qwen3:14b",
     "code": "qwen3-coder:14b",

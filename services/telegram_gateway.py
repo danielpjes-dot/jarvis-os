@@ -9,16 +9,30 @@ import urllib.request
 from pathlib import Path
 from typing import Any, Callable, Dict, Optional
 
-
+def _load_env(env_path: Path) -> None:
+        if not env_path.exists():
+            return
+        for line in env_path.read_text(encoding="utf-8").splitlines():
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, _, value = line.partition("=")
+            key = key.strip()
+            value = value.strip().strip('"').strip("'")
+            if key and key not in os.environ:
+                os.environ[key] = value
 class TelegramGateway:
+
+
     def __init__(
         self,
         vault_dir: Path,
         token: Optional[str] = None,
         allowed_chat_ids: Optional[set[str]] = None,
     ):
+        _load_env(Path(__file__).parent.parent / ".env")
         self.vault_dir = Path(vault_dir)
-        self.token = token or os.environ.get("JARVIS_TELEGRAM_BOT_TOKEN", "")
+        self.token = token or os.environ.get("JARVIS_TELEGRAM_BOT_TOKEN", "").strip()
         self.allowed_chat_ids = allowed_chat_ids or set(
             x.strip() for x in os.environ.get("JARVIS_TELEGRAM_ALLOWED_CHAT_IDS", "").split(",") if x.strip()
         )

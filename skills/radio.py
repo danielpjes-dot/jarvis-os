@@ -14,6 +14,8 @@ import uuid
 import urllib.request
 from pathlib import Path
 from typing import Dict, Optional, Tuple
+import re
+from difflib import get_close_matches
 
 
 SKILL_NAME = "radio"
@@ -90,7 +92,44 @@ _radio_state = {
         "last_meta_update": None,
     },
 }
+def _station_search_text(value: str) -> str:
+    value = (value or "").lower().strip()
+    value = re.sub(r"\b(play|start|put on|stream|listen to|radio|station|music)\b", " ", value)
+    value = re.sub(r"[^a-z0-9åäöüõšž]+", " ", value)
+    return re.sub(r"\s+", " ", value).strip()
 
+
+def _normalize_station_key(station: str) -> str:
+    raw = (station or "").strip()
+    stations = _load_stations()
+
+    if not raw:
+        return ""
+
+    raw_key = raw.lower().strip()
+    if raw_key in stations:
+        return raw_key
+
+    wanted = _station_search_text(raw)
+
+    candidates = {}
+    for key, cfg in stations.items():
+        label = str(cfg.get("label", key))
+        candidates[_station_search_text(key)] = key
+        candidates[_station_search_text(label)] = key
+
+        # Also allow label without leading "Radio"
+        label_without_radio = re.sub(r"^\s*radio\s+", "", label, flags=re.I)
+        candidates[_station_search_text(label_without_radio)] = key
+
+    if wanted in candidates:
+        return candidates[wanted]
+
+    close = get_close_matches(wanted, candidates.keys(), n=1, cutoff=0.72)
+    if close:
+        return candidates[close[0]]
+
+    return raw_key
 
 def _now() -> float:
     return time.time()
@@ -209,7 +248,7 @@ def resolve_stream_url(station_key: str) -> Tuple[Optional[str], Optional[str], 
       (stream_url, label, fallback, station_type)
     Returns (None, None, None, None) if unknown.
     """
-    key = (station_key or "").lower().strip()
+    key = _normalize_station_key(station_key)
     stations = _load_stations()
     cfg = stations.get(key)
 

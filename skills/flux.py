@@ -12,6 +12,7 @@ import subprocess
 import time
 from datetime import datetime
 from pathlib import Path
+import threading
 
 SKILL_NAME = "flux"
 SKILL_DESCRIPTION = "FLUX AI image generation via ComfyUI — text to image with prompt enhancement"
@@ -22,7 +23,25 @@ FLUX_DIR = Path("/mnt/e/coding/flux") if os.name != "nt" else Path("E:/coding/fl
 OLLAMA_HOST = "http://localhost:11434"
 
 CONFIG_FILE = Path(__file__).parent.parent / "config" / "flux.json"
+MODEL_CONFIG_FILE = Path(__file__).parent.parent / "config" / "models-config.json"
 
+
+def _load_model_config() -> dict:
+    try:
+        return json.loads(MODEL_CONFIG_FILE.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+
+
+def _get_small_runtime_model() -> str:
+    cfg = _load_model_config()
+    models = cfg.get("models", {}) if isinstance(cfg, dict) else {}
+
+    return (
+        models.get("live")
+        or models.get("fast")
+        or "gemma4:e4b"
+    )
 
 def _load_config() -> dict:
     try:
@@ -97,12 +116,25 @@ def _ollama_model(model: str, keep_alive: int = -1):
 
 
 def _swap_to_mini():
-    """Swap big model for small one — keeps JARVIS responsive during generation."""
-    print("[FLUX] Swapping to mini model...")
-    _ollama_model("qwen3:30b-a3b", keep_alive=0)
+    """Unload big models and keep the configured fast/live model available during FLUX."""
+    small_model = _get_small_runtime_model()
+
+    print("[FLUX] Swapping to small runtime model...")
+
+    for model in [
+        "qwen3:30b-a3b",
+        "gemma4:26b",
+        "qwen3-coder:30b",
+        "qwen3:14b",
+    ]:
+        if model != small_model:
+            _ollama_model(model, keep_alive=0)
+
     time.sleep(2)
-    _ollama_model("qwen3:8b", keep_alive=-1)
-    print("[FLUX] Mini model loaded — JARVIS responsive")
+
+    _ollama_model(small_model, keep_alive=-1)
+
+    print(f"[FLUX] Small runtime model loaded: {small_model}")
 
 
 def _restore_big():
@@ -110,10 +142,7 @@ def _restore_big():
     print("[FLUX] Stopping ComfyUI...")
     subprocess.run(["pkill", "-f", "python3 main.py"], capture_output=True, timeout=5)
     time.sleep(3)
-    print("[FLUX] Restoring big model...")
-    _ollama_model("qwen3:30b-a3b", keep_alive=-1)
-    print("[FLUX] Big model restored — full power")
-
+    print("[FLUX] Flux killed")
 
 def _start_comfyui_if_needed():
     """Start ComfyUI in background. Returns True if ready or already running."""
@@ -280,35 +309,26 @@ def exec_generate_image(prompt: str, enhance: str = "yes") -> str:
         _restore_big()
         return f"FLUX error: {e}"
 
-
-def exec_flux(action: str, prompt: str = "", enhance: str = "yes") -> str:
-    """FLUX image generation dispatcher."""
+def exec_flux(action: str, prompt: str = "", enhance: str = "yes", async_mode: str = "no") -> str:
     action = action.lower().strip()
 
     if action in ("generate", "create", "make"):
         if not prompt:
-            return "Please provide a prompt. Example: generate an image of a sunset over mountains"
+            return "Please provide a prompt."
+
+        if async_mode.lower() in ("yes", "true", "1"):
+            def worker():
+                exec_generate_image(prompt, enhance)
+
+            threading.Thread(target=worker, daemon=True).start()
+
+            return json.dumps({
+                "status": "started",
+                "message": "Image generation started.",
+                "prompt": prompt,
+            }, ensure_ascii=False)
+
         return exec_generate_image(prompt, enhance)
-
-    elif action == "status":
-        flux_ok = FLUX_DIR.exists() and (FLUX_DIR / "src").exists()
-        return (
-            f"FLUX: {'installed' if flux_ok else 'not found'} at {FLUX_DIR}\n"
-            f"Output dir: {IMAGES_DIR}\n"
-            f"Config: {json.dumps(_load_config(), indent=2)}"
-        )
-
-    elif action == "recent":
-        IMAGES_DIR.mkdir(parents=True, exist_ok=True)
-        images = sorted(IMAGES_DIR.glob("*.png"), key=lambda p: p.stat().st_mtime, reverse=True)
-        if images:
-            lines = [f"  {img.name} ({img.stat().st_size // 1024}KB)" for img in images[:10]]
-            return "Recent images:\n" + "\n".join(lines)
-        return "No images generated yet."
-
-    else:
-        return "Available actions: generate <prompt>, status, recent"
-
 
 TOOLS = [
     {
@@ -333,6 +353,10 @@ TOOLS = [
                     },
                 },
                 "required": ["action"],
+                "async_mode": {
+                            "type": "string",
+                            "description": "Run generation in background? yes or no",
+}
             },
         },
     },

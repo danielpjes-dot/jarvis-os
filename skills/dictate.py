@@ -140,3 +140,36 @@ def run(
         "ok": False,
         "speech": f"Unknown dictate action: {action}",
     }
+
+def dictate(
+    action: str,
+    title: str = "Dictation",
+    query: str = "",
+    limit: int = 5,
+    **kwargs,
+):
+    return run(
+        action=action,
+        title=title,
+        query=query,
+        limit=limit,
+    )
+
+
+TOOL_MAP = {
+    "dictate": dictate,
+}
+
+SKILL_META = {
+    "intent_aliases": INTENT_ALIASES,
+    "keywords": KEYWORDS,
+    "route": "tools",
+    "tools": {
+        "dictate": {
+            "intent_aliases": INTENT_ALIASES,
+            "keywords": KEYWORDS,
+            "direct_match": DIRECT_MATCH,
+            "route": "tools",
+        }
+    },
+}

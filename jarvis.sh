@@ -111,10 +111,9 @@ stop_named_processes() {
   pkill -f "react_server.py" 2>/dev/null || true
   pkill -f "scripts/server.py" 2>/dev/null || true
   pkill -f "voice_capture.py" 2>/dev/null || true
-  pkill -f "telegram_watcher.py" 2>/dev/null || true
   pkill -f "dictation_daemon.py" 2>/dev/null || true
   powershell.exe -Command 'Stop-Process -Name mpv -Force -ErrorAction SilentlyContinue' 2>/dev/null || true
-
+  kill $(cat /tmp/jarvis/loops.pid 2>/dev/null) 2>/dev/null||true
   # Ollama may be running under another user/service.
   sudo pkill -f "/usr/local/bin/ollama serve" 2>/dev/null || true
   sudo pkill -f "/usr/local/bin/ollama runner" 2>/dev/null || true
@@ -275,7 +274,11 @@ do_start() {
   log "Starting PTY terminal server on :4010"
   python3 "$PROJECT_DIR/scripts/pty_server.py" > /tmp/jarvis-pty.log 2>&1 &
   echo "$! pty-server" >> "$PIDFILE"
+    echo "Starting loops..."
+    nohup bash "$PROJECT_DIR/scripts/loop.sh" \
+      >> /tmp/jarvis/loops.log 2>&1 &
 
+    echo $! > /tmp/jarvis/loops.pid
   if python3 -c "import sounddevice" 2>/dev/null; then
     log "Starting voice capture (wake word mode)"
     CUDA_VISIBLE_DEVICES="" python3 "$PROJECT_DIR/scripts/voice_capture.py" --wake > /tmp/jarvis-voice.log 2>&1 &
