@@ -25,6 +25,7 @@
     "@modelcontextprotocol/sdk": "^1.29.0",
     "latest": "^0.2.0",
     "n": "^10.2.0",
+    "tts": "^0.1.0",
     "zod": "^4.3.6"
   },
   "devDependencies": {

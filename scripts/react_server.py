@@ -76,6 +76,9 @@ from scripts.model_config import (  # type: ignore
 TELEGRAM_MAX_MESSAGE_CHARS = 3500
 TELEGRAM_NOTIFY_CHAT_ID = os.environ.get("JARVIS_TELEGRAM_CHAT_ID", "6987301428")
 OLLAMA_HOST = os.environ.get("OLLAMA_HOST", "http://127.0.0.1:11434")
+KOKORO_HOST = os.environ.get("KOKORO_HOST", "http://127.0.0.1:8081")
+KOKORO_TIMEOUT_SEC = int(os.environ.get("KOKORO_TIMEOUT_SEC", "5"))
+KOKORO_VOICE = os.environ.get("KOKORO_VOICE", "bm_george")
 PORT = (
     int(sys.argv[sys.argv.index("--port") + 1])
     if "--port" in sys.argv
@@ -124,28 +127,18 @@ TASK_GRAPH_PATH = VAULT_DIR / ".jarvis" / "tasks" / "task_graph.json"
 ACTIVE_PROFILE_PATH = VAULT_DIR / ".jarvis" / "active_profile.json"
 PROFILES_DIR = VAULT_DIR / ".jarvis" / "profiles"
 SETTINGS_PATH = VAULT_DIR / ".jarvis" / "settings.json"
-ORPHEUS_ENABLED = "0"##os.environ.get("JARVIS_ORPHEUS_ENABLED", "1") == "0"
-ORPHEUS_HOST = os.environ.get("JARVIS_ORPHEUS_HOST", "http://127.0.0.1:5100")
-ORPHEUS_START_CMD = os.environ.get(
-    "JARVIS_ORPHEUS_START_CMD",
-    str(PROJECT_ROOT / "scripts" / "start_orpheus.sh"),
-)
-ORPHEUS_STOP_MATCH = os.environ.get("JARVIS_ORPHEUS_STOP_MATCH", "orpheus_server.py")
-ORPHEUS_WARM_ROUTES = {"fast", "reason", "tools"}
-ORPHEUS_COLD_ROUTES = {"code", "deep"}
-ORPHEUS_BOOT_TIMEOUT_SEC = int(os.environ.get("JARVIS_ORPHEUS_BOOT_TIMEOUT_SEC", "25"))
-ORPHEUS_POLL_INTERVAL_SEC = float(os.environ.get("JARVIS_ORPHEUS_POLL_INTERVAL_SEC", "0.5"))
+KOKORO_ENABLED = os.environ.get("JARVIS_KOKORO_ENABLED", "0") == "1"
 WORKFLOW_STATE_PATH = VAULT_DIR / ".jarvis" / "workflow_state.json"
 NO_TOOLS_MODELS: set[str] = set()
 stage_start_events = {"plan", "code_phase", "tool_start", "agent_start", "agent_step"}
 stage_end_events = {"tool_result", "code_step_ready", "agent_final", "final", "warning"}
 DEFAULT_MODE_PROFILES: Dict[str, Any] = {
     "defaults": {
-        "fast": {"mode": "conversation", "persona": "jarvis", "tts_engine": "orpheus", "tts_enabled": True},
-        "tools": {"mode": "tools", "persona": "jarvis", "tts_engine": "orpheus", "tts_enabled": True},
+        "fast": {"mode": "conversation", "persona": "jarvis", "tts_engine": "kokoro", "tts_enabled": True},
+        "tools": {"mode": "tools", "persona": "jarvis", "tts_engine": "kokoro", "tts_enabled": True},
         "code": {"mode": "deep_engineer", "persona": "the_one", "tts_engine": "fallback", "tts_enabled": False},
         "deep": {"mode": "deep_reasoning", "persona": "architect", "tts_engine": "fallback", "tts_enabled": False},
-        "reason": {"mode": "analysis", "persona": "jarvis", "tts_engine": "orpheus", "tts_enabled": True},
+        "reason": {"mode": "analysis", "persona": "jarvis", "tts_engine": "kokoro", "tts_enabled": True},
     },
     "tool_overrides": [
         {
@@ -153,10 +146,16 @@ DEFAULT_MODE_PROFILES: Dict[str, Any] = {
             "tools_any": ["room_command", "radio", "plex", "volume"],
             "mode": "shield",
             "persona": "shield_hill",
-            "tts_engine": "orpheus",
+            "tts_engine": "kokoro",
             "tts_enabled": True,
         }
     ],
+}
+LLAMA_CPP_HOST = os.environ.get("LLAMA_CPP_HOST", "http://127.0.0.1:8081")
+LLAMA_CPP_ROUTES = {
+    r.strip()
+    for r in os.environ.get("JARVIS_LLAMA_CPP_ROUTES", "live,fast").split(",")
+    if r.strip()
 }
 
 SYSTEM_ORCHESTRATOR_PROMPT = """You are JARVIS, a capable local coding and systems assistant.
@@ -256,7 +255,37 @@ Use deeper reasoning, compare alternatives, and make justified recommendations.
 }
 
 ACKS = ["On it.", "Working.", "Understood.", "Processing now.", "Let me handle that."]
+#------------------------------------------------------------------------------
+# Kokoro
+#------------------------------------------------------------------------------
+def is_kokoro_running() -> bool:
+    if not KOKORO_ENABLED:
+        return False
+    return http_get_ok_simple(f"{KOKORO_HOST}/health", timeout=2)
 
+
+def speak_kokoro(text: str, voice: str | None = None) -> bool:
+    if not KOKORO_ENABLED:
+        return False
+
+    payload = {
+        "text": sanitize_for_tts(text),
+        "voice": voice or KOKORO_VOICE,
+    }
+
+    try:
+        req = urllib.request.Request(
+            f"{KOKORO_HOST}/speak",
+            data=json.dumps(payload).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=KOKORO_TIMEOUT_SEC):
+            pass
+        return True
+    except Exception as e:
+        debug(f"Kokoro TTS failed: {e}")
+        return False
 # -----------------------------------------------------------------------------
 # Skill loading
 # -----------------------------------------------------------------------------
@@ -1316,6 +1345,50 @@ def clear_workflow_state() -> None:
     if WORKFLOW_STATE_PATH.exists():
         WORKFLOW_STATE_PATH.unlink()
 
+def request_llama_cpp_chat(payload: Dict[str, Any], timeout: int):
+    llama_payload = {
+        "model": payload.get("model", "gemma4"),
+        "messages": payload.get("messages", []),
+        "stream": payload.get("stream", False),
+        "temperature": payload.get("options", {}).get("temperature", 0.2),
+        "top_p": payload.get("options", {}).get("top_p", 0.8),
+    }
+
+    req = urllib.request.Request(
+        f"{LLAMA_CPP_HOST}/v1/chat/completions",
+        data=json.dumps(llama_payload).encode("utf-8"),
+        headers={"Content-Type": "application/json"},
+    )
+    return urllib.request.urlopen(req, timeout=timeout)
+
+def request_chat_backend(payload: Dict[str, Any], timeout: int, route: str = "fast"):
+    if route in LLAMA_CPP_ROUTES:
+        return request_llama_cpp_chat(payload, timeout)
+    return request_ollama_chat(payload, timeout)
+
+def normalize_chat_response(data: Dict[str, Any]) -> Dict[str, Any]:
+    if "message" in data:
+        return data
+
+    choices = data.get("choices") or []
+    if choices:
+        msg = choices[0].get("message") or {}
+        return {
+            "message": {
+                "role": msg.get("role", "assistant"),
+                "content": msg.get("content", ""),
+            },
+            "raw": data,
+        }
+
+    return {
+        "message": {
+            "role": "assistant",
+            "content": "",
+        },
+        "raw": data,
+    }
+
 def load_markdown_skills() -> list[dict]:
     root = VAULT_DIR / ".jarvis" / "markdown_skills"
     skills = []
@@ -2096,60 +2169,6 @@ def http_get_ok_simple(url: str, timeout: int = 2) -> bool:
         return False
 
 
-def is_orpheus_running() -> bool:
-    if not ORPHEUS_ENABLED or ORPHEUS_ENABLED == "0":
-        return False
-    return http_get_ok_simple(f"{ORPHEUS_HOST}/health", timeout=2)
-
-
-def start_orpheus_process() -> bool:
-    if not ORPHEUS_ENABLED or ORPHEUS_ENABLED == "0":
-        return False
-    if is_orpheus_running():
-        return True
-    if not ORPHEUS_START_CMD.strip():
-        emit_event("warning", "Orpheus start requested but no start command configured", {"orpheus_host": ORPHEUS_HOST})
-        return False
-    try:
-        emit_event("status", "Starting Orpheus", {"cmd": ORPHEUS_START_CMD, "orpheus_host": ORPHEUS_HOST})
-        subprocess.Popen(ORPHEUS_START_CMD, shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    except Exception as e:
-        emit_event("warning", "Failed to launch Orpheus", {"error": str(e), "cmd": ORPHEUS_START_CMD})
-        return False
-
-    deadline = time.time() + ORPHEUS_BOOT_TIMEOUT_SEC
-    while time.time() < deadline:
-        if is_orpheus_running():
-            emit_event("status", "Orpheus is ready", {"orpheus_host": ORPHEUS_HOST})
-            return True
-        time.sleep(ORPHEUS_POLL_INTERVAL_SEC)
-    emit_event("warning", "Orpheus did not become ready in time", {"orpheus_host": ORPHEUS_HOST})
-    return False
-
-
-def stop_orpheus_process() -> bool:
-    if not ORPHEUS_ENABLED or ORPHEUS_ENABLED == "0":
-        return False
-    if not is_orpheus_running():
-        return True
-    try:
-        req = urllib.request.Request(f"{ORPHEUS_HOST}/shutdown", data=b"{}", headers={"Content-Type": "application/json"}, method="POST")
-        with urllib.request.urlopen(req, timeout=3):
-            pass
-    except Exception:
-        try:
-            subprocess.run(["pkill", "-f", ORPHEUS_STOP_MATCH], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
-        except Exception:
-            pass
-
-    deadline = time.time() + 8
-    while time.time() < deadline:
-        if not is_orpheus_running():
-            emit_event("status", "Orpheus stopped", {"orpheus_host": ORPHEUS_HOST})
-            return True
-        time.sleep(0.25)
-    emit_event("warning", "Orpheus stop requested but it still appears alive", {"orpheus_host": ORPHEUS_HOST})
-    return False
 
 
 def sanitize_for_tts(text: str) -> str:
@@ -2161,6 +2180,10 @@ def speak_ack(text: str) -> None:
         return
 
     def _speak() -> None:
+        if speak_kokoro(text):
+            return
+
+        # fallback Windows voice
         try:
             safe = sanitize_for_tts(text)
             subprocess.run(
@@ -2171,8 +2194,6 @@ def speak_ack(text: str) -> None:
                         "Add-Type -AssemblyName System.Speech; "
                         "$s = New-Object System.Speech.Synthesis.SpeechSynthesizer; "
                         "$s.Rate = 2; "
-                        "$null = $s.GetInstalledVoices(); "
-                        "Start-Sleep -Milliseconds 250; "
                         f"$s.Speak('{safe}')"
                     ),
                 ],
@@ -2180,10 +2201,9 @@ def speak_ack(text: str) -> None:
                 capture_output=True,
             )
         except Exception as e:
-            debug(f"ACK TTS error: {e}")
+            debug(f"Fallback ACK TTS error: {e}")
 
     threading.Thread(target=_speak, daemon=True).start()
-
 
 def write_bridge_status(state: str, text: Optional[str] = None) -> None:
     try:
@@ -2297,8 +2317,8 @@ def run_live_router(user_text: str) -> Dict[str, Any]:
     }
     #emit_event("warning", "Live router running", {"error": "Running live router", "payload": payload})
     try:
-        with request_ollama_chat(payload, timeout=CHAT_TIMEOUT_SEC) as resp:
-            data = json.loads(resp.read().decode("utf-8"))
+        with request_chat_backend(payload, timeout=CHAT_TIMEOUT_SEC, route="live") as resp:
+            data = normalize_chat_response(json.loads(resp.read().decode("utf-8")))
 
         raw = data.get("message", {}).get("content", "")
         parsed = parse_json_object_from_text(raw)
@@ -2437,7 +2457,7 @@ def resolve_runtime_mode(route: str, selected_tools: List[Dict[str, Any]]) -> Di
             return {
                 "mode": override.get("mode", "conversation"),
                 "persona": override.get("persona", "jarvis"),
-                "tts_engine": override.get("tts_engine", "orpheus"),
+                "tts_engine": override.get("tts_engine", "kokoro"),
                 "tts_enabled": bool(override.get("tts_enabled", True)),
             }
 
@@ -2445,7 +2465,7 @@ def resolve_runtime_mode(route: str, selected_tools: List[Dict[str, Any]]) -> Di
     return {
         "mode": base.get("mode", "conversation"),
         "persona": base.get("persona", "jarvis"),
-        "tts_engine": base.get("tts_engine", "orpheus"),
+        "tts_engine": base.get("tts_engine", "kokoro"),
         "tts_enabled": bool(base.get("tts_enabled", True)),
     }
 
@@ -2638,31 +2658,46 @@ def get_last_user_text(messages: List[Dict[str, Any]]) -> str:
             return safe_json_dumps(content)
     return ""
 
-
-def should_keep_orpheus_warm(route: str, model: str) -> bool:
+def should_use_kokoro(route: str, model: str) -> bool:
     route = (route or "").strip().lower()
     model = (model or "").strip().lower()
-    if route in ORPHEUS_WARM_ROUTES:
-        return True
-    if route in ORPHEUS_COLD_ROUTES:
+
+    if not KOKORO_ENABLED:
         return False
-    if "qwen3:8b" in model or "qwen3:14b" in model:
-        return True
-    if "gemma4:31b" in model or "30b" in model:
+
+    if route in {"code", "deep"}:
         return False
-    return route not in {"code", "deep"}
+
+    if "30b" in model or "31b" in model:
+        return False
+
+    return route in {"live", "fast", "tools", "reason"}
 
 
-def sync_orpheus_for_route(route: str, model: str) -> None:
-    if not ORPHEUS_ENABLED or ORPHEUS_ENABLED == "0":
+def sync_kokoro_for_route(route: str, model: str) -> None:
+    if not KOKORO_ENABLED:
         return
-    keep_warm = should_keep_orpheus_warm(route, model)
-    emit_event("status", "Syncing Orpheus policy", {"route": route, "model": model, "keep_warm": keep_warm, "orpheus_running": is_orpheus_running()})
-    if keep_warm:
-        start_orpheus_process()
-    else:
-        stop_orpheus_process()
 
+    use_kokoro = should_use_kokoro(route, model)
+
+    emit_event(
+        "status",
+        "Syncing Kokoro policy",
+        {
+            "route": route,
+            "model": model,
+            "use_kokoro": use_kokoro,
+            "kokoro_running": is_kokoro_running(),
+            "kokoro_host": KOKORO_HOST,
+        },
+    )
+
+    if use_kokoro and not is_kokoro_running():
+        emit_event(
+            "warning",
+            "Kokoro selected but not reachable",
+            {"kokoro_host": KOKORO_HOST},
+        )
 
 def is_coder_model(model: str) -> bool:
     return "coder" in (model or "").lower()
@@ -4174,7 +4209,7 @@ class ReactHandler(BaseHTTPRequestHandler):
             persona = runtime_mode.get("persona")
 
             try:
-                sync_orpheus_for_route(resolved_route, model)
+                sync_kokoro_for_route(resolved_route, model)
             except Exception as e:
                 emit_event(
                     "warning",
@@ -4743,7 +4778,7 @@ class ReactHandler(BaseHTTPRequestHandler):
         persona = runtime_mode.get("persona")
 
         try:
-            sync_orpheus_for_route(resolved_route, model)
+            sync_kokoro_for_route(resolved_route, model)
         except Exception as e:
             emit_event(
                 "warning",
@@ -5043,11 +5078,11 @@ if __name__ == "__main__":
     ensure_dirs()
     emit_event("status", "React server starting", {"port": PORT, "ollama_host": OLLAMA_HOST})
     wait_for_ollama()
-    if ORPHEUS_ENABLED:
+    if KOKORO_ENABLED:
         try:
-            sync_orpheus_for_route("fast", resolve_model(requested_model=None, route="fast"))
+            sync_kokoro_for_route("fast", resolve_model(requested_model=None, route="fast"))
         except Exception as e:
-            emit_event("warning", "Initial Orpheus warm start failed", {"error": str(e)})
+            emit_event("warning", "Initial Kokoro warm start failed", {"error": str(e)})
 
     server = ThreadingHTTPServer(("127.0.0.1", PORT), ReactHandler)
     print(f"[REACT] ReAct server v3 on http://127.0.0.1:{PORT}")
