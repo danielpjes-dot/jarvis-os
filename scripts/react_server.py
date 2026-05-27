@@ -46,9 +46,11 @@ from urllib.parse import urlparse
 import re
 import urllib.error
 import urllib.request
-
 PROJECT_ROOT = Path(__file__).parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
+from difflib import SequenceMatcher
+from scripts.context_router import build_context_pack
+from scripts.chat_context import today_log_path, log_chat_event
 from scripts.agent_loop import run_agent_loop
 from services.communications_gateway import CommunicationsGateway
 from services.telegram_gateway import TelegramGateway
@@ -71,6 +73,7 @@ from scripts.model_config import (  # type: ignore
 # -----------------------------------------------------------------------------
 # Config
 # -----------------------------------------------------------------------------
+TELEGRAM_MAX_MESSAGE_CHARS = 3500
 TELEGRAM_NOTIFY_CHAT_ID = os.environ.get("JARVIS_TELEGRAM_CHAT_ID", "6987301428")
 OLLAMA_HOST = os.environ.get("OLLAMA_HOST", "http://127.0.0.1:11434")
 PORT = (
@@ -79,7 +82,10 @@ PORT = (
     else int(os.environ.get("JARVIS_PORT", "7900"))
 )
 TELEGRAM_ENABLED = int(os.environ.get("JARVIS_TELEGRAM_ENABLED", "1"))
-VALID_ROUTES = {"fast", "tools", "reason", "code", "deep"}
+VALID_ROUTES = {"live", "fast", "tools", "reason", "code", "deep"}
+
+
+
 MODE_PROFILE_PATH = PROJECT_ROOT / "config" / "mode_profiles.json"
 
 MAX_ITERATIONS = int(os.environ.get("JARVIS_MAX_ITERATIONS", "8"))
@@ -99,6 +105,12 @@ VAULT_DIR = Path(
         "D:/Jarvis_vault" if os.name == "nt" else "/mnt/d/Jarvis_vault",
     )
 )
+TOOL_USAGE_PATH = VAULT_DIR / ".jarvis" / "tool_usage.json"
+PROMPTS_DIR = VAULT_DIR / ".jarvis" / "prompts"
+LIVE_ROUTER_PROMPT_PATH = PROMPTS_DIR / "live_router.txt"
+LIVE_CHAT_PROMPT_PATH = PROMPTS_DIR / "live_chat.txt"
+PLANNER_PROMPT_PATH = PROMPTS_DIR / "planner.txt"
+CODER_PROMPT_PATH = PROMPTS_DIR / "coder.txt"
 COMMUNICATIONS = CommunicationsGateway(VAULT_DIR)
 TELEGRAM_GATEWAY = TelegramGateway(VAULT_DIR)
 BRIDGE_DIR = Path(os.environ.get("JARVIS_BRIDGE_DIR", "/tmp/jarvis"))
@@ -112,7 +124,7 @@ TASK_GRAPH_PATH = VAULT_DIR / ".jarvis" / "tasks" / "task_graph.json"
 ACTIVE_PROFILE_PATH = VAULT_DIR / ".jarvis" / "active_profile.json"
 PROFILES_DIR = VAULT_DIR / ".jarvis" / "profiles"
 SETTINGS_PATH = VAULT_DIR / ".jarvis" / "settings.json"
-ORPHEUS_ENABLED = os.environ.get("JARVIS_ORPHEUS_ENABLED", "1") == "1"
+ORPHEUS_ENABLED = "0"##os.environ.get("JARVIS_ORPHEUS_ENABLED", "1") == "0"
 ORPHEUS_HOST = os.environ.get("JARVIS_ORPHEUS_HOST", "http://127.0.0.1:5100")
 ORPHEUS_START_CMD = os.environ.get(
     "JARVIS_ORPHEUS_START_CMD",
@@ -248,7 +260,173 @@ ACKS = ["On it.", "Working.", "Understood.", "Processing now.", "Let me handle t
 # -----------------------------------------------------------------------------
 # Skill loading
 # -----------------------------------------------------------------------------
+def load_tool_usage() -> dict:
+    try:
+        return json.loads(TOOL_USAGE_PATH.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
 
+
+def save_tool_usage(data: dict) -> None:
+    TOOL_USAGE_PATH.parent.mkdir(parents=True, exist_ok=True)
+    tmp = TOOL_USAGE_PATH.with_suffix(".tmp")
+    tmp.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
+    tmp.replace(TOOL_USAGE_PATH)
+
+
+def increment_tool_usage(tool_name: str) -> None:
+    data = load_tool_usage()
+    row = data.get(tool_name, {"count": 0})
+    row["count"] = int(row.get("count", 0)) + 1
+    row["last_used"] = now_iso()
+    data[tool_name] = row
+    save_tool_usage(data)
+def write_chat_log(role: str, content: str, route: str = "", model: str = "") -> None:
+    if not log_chat_event:
+        print("[CHAT_LOG] log_chat_event not available")
+        return
+
+    if not content or not str(content).strip():
+        return
+
+    try:
+        log_chat_event(
+            role=role,
+            content=str(content).strip(),
+            route=route,
+            model=model,
+        )
+        print(f"[CHAT_LOG] saved {role}: {str(content)[:80]}")
+    except Exception as e:
+        print(f"[CHAT_LOG] failed: {type(e).__name__}: {e}")
+
+def get_top_used_tools(limit: int = 10) -> list[str]:
+    data = load_tool_usage()
+    return [
+        name
+        for name, _row in sorted(
+            data.items(),
+            key=lambda x: int(x[1].get("count", 0)),
+            reverse=True,
+        )[:limit]
+    ]
+RECENT_TOOL_COMMANDS = {}
+
+def is_duplicate_tool_command(source: str, user_text: str, tool: str, window_sec: int = 10) -> bool:
+    key = f"{source}:{tool}:{user_text.strip().lower()}"
+    now = time.time()
+    last = RECENT_TOOL_COMMANDS.get(key, 0)
+
+    RECENT_TOOL_COMMANDS[key] = now
+    return now - last < window_sec
+
+def fuzzy_score(a: str, b: str) -> float:
+    a = a.lower().strip()
+    b = b.lower().strip()
+
+    score = SequenceMatcher(None, a, b).ratio()
+
+    # Boost prefix/contains matches
+    if a.startswith(b) or b.startswith(a):
+        score = max(score, 0.94)
+
+    if b in a or a in b:
+        score = max(score, 0.90)
+
+    return score
+def clean_tool_result_for_telegram(result: Any) -> str:
+    if isinstance(result, dict):
+        data = result.get("data")
+        if isinstance(data, dict) and data.get("plain"):
+            return str(data["plain"])
+
+        speech = result.get("speech")
+        if isinstance(speech, dict) and speech.get("text"):
+            return str(speech["text"])
+
+        ui = result.get("ui")
+        if isinstance(ui, dict) and ui.get("summary"):
+            return str(ui["summary"])
+
+    return truncate_text(result, limit=1200)
+
+def force_correct_common_tool(user_text: str, live_result: dict) -> dict:
+    text = (user_text or "").lower()
+
+    if "news" in text or "headlines" in text or "day's news" in text or "days news" in text:
+        live_result["action"] = "direct_tool"
+        live_result["route"] = "tools"
+        live_result["tool"] = "news"
+        live_result["intent"] = "daily_news"
+        live_result["args"] = {
+            "action": "top",
+            "location": "Estonia",
+            "limit": 6,
+        }
+        return live_result
+
+    return live_result
+
+def build_skill_command_index() -> list[dict]:
+    index = []
+
+    for tool_name, tool in TOOLS_BY_NAME.items():
+        fn = tool.get("function", {})
+        description = fn.get("description", "")
+
+        phrases = []
+
+        # Tool name itself
+        phrases.append(tool_name.replace("_", " "))
+
+        # Description as weak phrase
+        if description:
+            phrases.append(description)
+
+        # Optional custom metadata if your loader exposes it
+        for phrase in tool.get("commands", []) or []:
+            phrases.append(phrase)
+
+        for phrase in tool.get("aliases", []) or []:
+            phrases.append(phrase)
+
+        for phrase in phrases:
+            if phrase and isinstance(phrase, str):
+                index.append({
+                    "tool_name": tool_name,
+                    "phrase": phrase,
+                    "tool": tool,
+                })
+
+    return index
+def load_markdown_skill_by_name(name: str) -> dict | None:
+    skills = load_markdown_skills()
+
+    for skill in skills:
+        if skill.get("name", "").lower() == name.lower():
+            return skill
+
+    return None
+def resolve_skill_command(user_text: str, threshold: float = 0.82) -> dict | None:
+    best = None
+    best_score = 0.0
+
+    for item in build_skill_command_index():
+        score = fuzzy_score(user_text, item["phrase"])
+
+        if score > best_score:
+            best_score = score
+            best = item
+
+    if not best or best_score < threshold:
+        return None
+
+    return {
+        "tool_name": best["tool_name"],
+        "tool": best["tool"],
+        "phrase": best["phrase"],
+        "score": round(best_score, 3),
+    }
 
 def build_intent_tool_candidates(tool_skill_meta: Dict[str, Dict[str, Any]]) -> Dict[str, List[str]]:
     out: Dict[str, List[str]] = {}
@@ -409,7 +587,6 @@ def extract_planner_steps(answer: str) -> List[Dict[str, Any]]:
             steps.append({"goal": goal})
 
     return steps
-
 def build_simple_code_plan(user_text: str, paths: List[str]) -> Dict[str, Any]:
     planner_model = get_planner_model()
 
@@ -417,7 +594,18 @@ def build_simple_code_plan(user_text: str, paths: List[str]) -> Dict[str, Any]:
     "Create a concrete coding implementation plan.\n"
     "Return ONLY valid JSON with this exact shape:\n"
     "{\n"
-    '  "files": ["relative/path.ext"],\n'
+    '  "speak": "short summary of the plan",\n'
+    '  "intent": "code_plan_create",\n'
+    '  "action": "code",\n'
+    '  "route": "code",\n'
+    '  "chat_confidence": 0.0,\n'
+    '  "execution_confidence": 1.0,\n'
+    '  "continue_plan": false,\n'
+    '  "create_new_plan": true,\n'
+    '  "plan_action": "create",\n'
+    '  "tool": null,\n'
+    '  "args": {},\n'
+    '  "path": ["/mnt/e/coding/projectx"],\n'
     '  "steps": [\n'
     '    {\n'
     '      "id": 1,\n'
@@ -444,7 +632,18 @@ def build_simple_code_plan(user_text: str, paths: List[str]) -> Dict[str, Any]:
     "- Do not create a plan with only setup/directory steps.\n\n"
     "Examples:\n"
     "{\n"
-    '  "files": ["love.html"],\n'
+    '  "speak": "I will create a small HTML file with the requested page.",\n'
+    '  "intent": "code_plan_create",\n'
+    '  "action": "code",\n'
+    '  "route": "code",\n'
+    '  "chat_confidence": 0.0,\n'
+    '  "execution_confidence": 1.0,\n'
+    '  "continue_plan": false,\n'
+    '  "create_new_plan": true,\n'
+    '  "plan_action": "create",\n'
+    '  "tool": null,\n'
+    '  "args": {},\n'
+    '  "path": ["/mnt/e/coding/projectx"],\n'
     '  "steps": [\n'
     '    {"id": 1, "goal": "Create the HTML structure for the page.", "target_files": ["love.html"]},\n'
     '    {"id": 2, "goal": "Add CSS for the animated pulsing red heart.", "target_files": ["love.html"]},\n'
@@ -459,7 +658,11 @@ def build_simple_code_plan(user_text: str, paths: List[str]) -> Dict[str, Any]:
         "model": planner_model,
         "messages": [{"role": "user", "content": prompt}],
         "stream": False,
-        "options": {"temperature": 0, "num_predict": 600},
+        "options": {
+    "temperature": 0,
+    "num_predict": 1400,
+    "num_ctx": 8192,
+},
     }
     plan_files: List[str] = []
     try:
@@ -479,10 +682,17 @@ def build_simple_code_plan(user_text: str, paths: List[str]) -> Dict[str, Any]:
             )
 
             raw_content = data.get("message", {}).get("content", "")
-            
-            plan_files = data.get("files", []) if isinstance(data, dict) else []
-
             answer = strip_thinking_tags(raw_content).strip()
+
+            parsed_plan = parse_json_object_from_text(answer) or {}
+
+            plan_files = parsed_plan.get("files", [])
+            if not isinstance(plan_files, list):
+                plan_files = []
+
+            raw_steps = parsed_plan.get("steps", [])
+            if not isinstance(raw_steps, list):
+                raw_steps = extract_planner_steps(answer)
 
             if not answer and raw_content:
                 answer = raw_content.strip()
@@ -523,15 +733,84 @@ def build_simple_code_plan(user_text: str, paths: List[str]) -> Dict[str, Any]:
     plan_id = make_plan_id()
 
     plan = {
-    "plan_id": plan_id,
-    "current_step": 0,
-    "user_request": user_text,
-    "paths": paths,
-    "files": plan_files or paths,
-    "planner_model": planner_model,
-    "steps": steps,
-    "created_at": now_iso(),
-    "status": "waiting_for_approval",
+        "plan_id": plan_id,
+        "current_step": 0,
+
+        "user_request": user_text,
+
+        "paths": paths,
+        "files": plan_files or paths,
+
+        "planner_model": planner_model,
+
+        "speak": parsed_plan.get(
+            "speak",
+            "Plan created."
+        ),
+
+        "intent": parsed_plan.get(
+            "intent",
+            "code_plan_create",
+        ),
+
+        "action": parsed_plan.get(
+            "action",
+            "code",
+        ),
+
+        "route": parsed_plan.get(
+            "route",
+            "code",
+        ),
+
+        "chat_confidence": float(
+            parsed_plan.get(
+                "chat_confidence",
+                0.0,
+            )
+        ),
+
+        "execution_confidence": float(
+            parsed_plan.get(
+                "execution_confidence",
+                1.0,
+            )
+        ),
+
+        "continue_plan": bool(
+            parsed_plan.get(
+                "continue_plan",
+                False,
+            )
+        ),
+
+        "create_new_plan": bool(
+            parsed_plan.get(
+                "create_new_plan",
+                True,
+            )
+        ),
+
+        "plan_action": parsed_plan.get(
+            "plan_action",
+            "create",
+        ),
+
+        "tool": parsed_plan.get(
+            "tool",
+            None,
+        ),
+
+        "args": parsed_plan.get(
+            "args",
+            {},
+        ),
+
+        "steps": steps,
+
+        "created_at": now_iso(),
+
+        "status": "waiting_for_approval",
     }
 
     save_json(plan_id, "plan.json", plan)
@@ -607,7 +886,105 @@ def normalize_patch_text(content: str) -> str:
         text = "\n".join(out)
 
     return text
+def complete_tool_args_with_meta(
+    tool_name: str,
+    user_text: str,
+    parsed: dict,
+) -> dict:
+    if not tool_name or tool_name not in TOOLS_BY_NAME:
+        return parsed
 
+    tool_schema = TOOLS_BY_NAME.get(tool_name, {})
+    tool_meta = TOOL_SKILL_META.get(tool_name, {})
+
+    prompt = f"""
+You fill missing tool arguments.
+
+Return ONLY valid JSON:
+{{
+  "tool": "{tool_name}",
+  "args": {{}}
+}}
+
+User message:
+{user_text}
+
+Router result:
+{json.dumps(parsed, ensure_ascii=False)}
+
+Tool schema:
+{json.dumps(tool_schema, ensure_ascii=False)}
+
+Tool metadata:
+{json.dumps(tool_meta, ensure_ascii=False)}
+
+Rules:
+- Return only argument keys that exist in Tool schema properties.
+- Remove any existing args that are not valid for this tool.
+- Fill required missing args from user message, intent, schema, and metadata.
+- Do not invent unrelated values.
+- If a required value is impossible to infer, leave it missing.
+- Return JSON only.
+""".strip()
+
+    payload = {
+        "model": resolve_model(requested_model=None, route="live"),
+        "messages": [{"role": "user", "content": prompt}],
+        "stream": False,
+        "options": {
+            "temperature": 0,
+            "top_p": 0.2,
+            "num_ctx": 2048,
+        },
+    }
+
+    try:
+        with request_ollama_chat(payload, timeout=CHAT_TIMEOUT_SEC) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+
+        raw = data.get("message", {}).get("content", "")
+        filled = parse_json_object_from_text(raw)
+
+        if not isinstance(filled, dict):
+            return parsed
+
+        filled_args = filled.get("args")
+        if not isinstance(filled_args, dict):
+            return parsed
+
+        valid_props = (
+            tool_schema
+            .get("function", {})
+            .get("parameters", {})
+            .get("properties", {})
+        )
+
+        valid_arg_names = set(valid_props.keys())
+
+        merged_args = {
+            **(parsed.get("args") or {}),
+            **filled_args,
+        }
+
+        parsed["args"] = {
+            k: v
+            for k, v in merged_args.items()
+            if k in valid_arg_names
+        }
+
+        return parsed
+
+    except Exception as e:
+        emit_event(
+            "warning",
+            "Tool arg completion failed",
+            {
+                "tool": tool_name,
+                "error": str(e),
+            },
+        )
+        return parsed
+    
 def reload_all_skills() -> Dict[str, Any]:
     global TOOLS, TOOL_MAP, TOOL_KEYWORDS, TOOL_SKILL_META
     global TOOLS_BY_NAME, TOOL_LIST_TEXT
@@ -659,6 +1036,127 @@ def match_markdown_skill(user_text: str) -> Optional[Dict[str, Any]]:
 # -----------------------------------------------------------------------------
 # Utilities
 # -----------------------------------------------------------------------------
+def read_last_chat_log_chars(max_chars: int = 4000) -> str:
+    path = today_log_path()
+
+    if not path.exists():
+        return ""
+
+    text = path.read_text(encoding="utf-8", errors="ignore")
+    return text[-max_chars:]
+
+def load_prompt_file(path: Path, fallback: str = "") -> str:
+    try:
+        text = path.read_text(encoding="utf-8", errors="ignore").strip()
+        return text or fallback
+    except Exception:
+        return fallback
+
+
+def get_tool_names_text() -> str:
+    try:
+        return ", ".join(sorted(TOOLS_BY_NAME.keys()))
+    except Exception:
+        return ""
+    
+def build_compact_tool_catalog(limit: int = 10) -> str:
+    preferred = get_top_used_tools(limit)
+
+    core = [
+        "radio",
+        "weather",
+        "news",
+        "timer",
+        "chat_log",
+        "memory",
+        "flux",
+        "list_skills",
+    ]
+
+    names: list[str] = []
+
+    for name in core + preferred:
+        if name in TOOLS_BY_NAME and name not in names:
+            names.append(name)
+
+    lines = []
+
+    for name in names[:limit]:
+        fn = TOOLS_BY_NAME[name].get("function", {})
+        desc = (fn.get("description") or "").split(".")[0]
+        props = fn.get("parameters", {}).get("properties", {})
+        args = ", ".join(props.keys()) or "none"
+
+        lines.append(f"- {name}({args}): {desc}")
+
+    return "\n".join(lines)
+
+def build_short_term_context() -> str:
+    try:
+        from scripts.chat_context import read_recent_chat
+    except Exception:
+        try:
+            from chat_context import read_recent_chat
+        except Exception:
+            return ""
+
+    try:
+        rows = read_recent_chat(
+            minutes=30,
+            max_items=12,
+        )
+    except Exception as e:
+        print(f"[CHAT_CONTEXT] read failed: {e}")
+        return ""
+
+    if not rows:
+        return ""
+
+    lines = []
+
+    for item in rows:
+        role = str(item.get("role", "unknown")).upper()
+        route = item.get("route") or "-"
+        content = str(item.get("content", "")).strip()
+
+        if not content:
+            continue
+
+        content = content.replace("\n", " ")
+
+        if len(content) > 400:
+            content = content[:400] + "..."
+
+        lines.append(
+            f"- {role}[{route}]: {content}"
+        )
+
+    if not lines:
+        return ""
+
+    return (
+        "[ACTIVE CHAT CONTEXT]\n"
+        "# Recent Chat Context\n\n"
+        + "\n".join(lines)
+        + "\n[/ACTIVE CHAT CONTEXT]"
+    )
+
+def load_named_prompt(path: Path, fallback: str = "") -> str:
+    prompt = load_prompt_file(path, fallback=fallback)
+
+    parts = [prompt]
+
+    last_exchange = build_last_exchange_context()
+    if last_exchange:
+        parts.append(last_exchange)
+
+    short_context = build_short_term_context()
+    if short_context:
+        parts.append(short_context)
+
+    out = "\n\n".join(p for p in parts if p and p.strip())
+    return out.replace("{{TOOL_CATALOG}}", build_compact_tool_catalog(limit=10)) 
+
 def parse_workflow_questions(md_skill: Dict[str, Any]) -> List[Dict[str, str]]:
     content = md_skill.get("content", "")
 
@@ -873,15 +1371,52 @@ def clean_telegram_prefix(text: str) -> str:
         return text[len(prefix):].strip()
     return text
 
+def split_telegram_text(text: str, limit: int = TELEGRAM_MAX_MESSAGE_CHARS) -> list[str]:
+    text = str(text or "").strip()
+
+    if not text:
+        return []
+
+    chunks = []
+
+    while len(text) > limit:
+        cut = text.rfind("\n", 0, limit)
+
+        if cut < 1000:
+            cut = text.rfind(" ", 0, limit)
+
+        if cut < 1000:
+            cut = limit
+
+        chunks.append(text[:cut].strip())
+        text = text[cut:].strip()
+
+    if text:
+        chunks.append(text)
+
+    return chunks
+
+
 def notify_telegram(text: str) -> None:
     if not TELEGRAM_NOTIFY_CHAT_ID:
         debug("Telegram notify skipped: missing JARVIS_TELEGRAM_CHAT_ID")
         return
 
     try:
-        TELEGRAM_GATEWAY.send_message(TELEGRAM_NOTIFY_CHAT_ID, text)
+        clean_text = clean_tool_result_for_telegram(text)
+
+        for i, chunk in enumerate(split_telegram_text(clean_text), start=1):
+            if i > 1:
+                chunk = f"(continued {i})\n\n{chunk}"
+
+            TELEGRAM_GATEWAY.send_message(
+                TELEGRAM_NOTIFY_CHAT_ID,
+                chunk,
+            )
+
     except Exception as e:
         debug(f"Telegram notify failed: {e}")
+
 def parse_file_patch(content: str) -> Optional[Dict[str, str]]:
     text = content or ""
 
@@ -1067,6 +1602,7 @@ def character_stage_message(event_type: str, message: str, data: Optional[Dict[s
     step_id = step.get("id") if isinstance(step, dict) else data.get("task_id")
     route = data.get("route") or data.get("resolved_route")
     model = data.get("model") or data.get("resolved_model") or data.get("planner_model")
+    
     if event_type == "code_edit_output":
         preview = str(data.get("result_preview", ""))[:1500]
 
@@ -1198,6 +1734,108 @@ def character_stage_message(event_type: str, message: str, data: Optional[Dict[s
         )
 
     return None
+def contains_patch(text: str) -> bool:
+    text = text or ""
+    return (
+        "--- FILE:" in text
+        or "diff --git" in text
+        or "@@" in text
+        or "### PATCH" in text
+    )
+
+
+def looks_like_markdown_report(text: str) -> bool:
+    text = (text or "").strip()
+
+    if not text:
+        return False
+
+    if contains_patch(text):
+        return False
+
+    return (
+        text.startswith("#")
+        or "\n## " in text
+        or "- " in text
+        or len(text) > 800
+    )
+
+# Replace classify_agent_output_kind to also handle analyze_code
+def classify_agent_output_kind(skill_name, user_text, result=None):
+    result = result or {}
+    name = (skill_name or "").lower().strip()
+    text = (user_text or "").lower().strip()
+
+    result_kind = result.get("kind")
+    if result_kind in {"report", "patch", "message"}:
+        return result_kind
+
+    result_text = (
+        result.get("markdown")
+        or result.get("report")
+        or result.get("text")
+        or result.get("content")
+        or result.get("answer")
+        or ""
+    )
+
+    if contains_patch(result_text):
+        return "patch"
+
+    if looks_like_markdown_report(result_text):
+        return "report"
+
+    if name.startswith("analyze") or text.startswith("analyze ") or "analyze" in text:
+        return "report"
+
+    patch_words = [
+        "fix ", "change ", "edit ", "modify ", "implement ",
+        "refactor ", "apply patch", "write code", "create file",
+    ]
+
+    if name in {"code_edit", "apply_patch", "coder", "fix_file", "refactor_file"}:
+        return "patch"
+
+    if any(w in text for w in patch_words):
+        return "patch"
+
+    return "message"
+
+def write_analysis_report(skill_name, plan_id, result):
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    safe_skill = skill_name.replace("/", "_").replace(" ", "_")
+
+    path = VAULT_DIR / "Reports" / f"{ts}_{plan_id}.md"
+
+    markdown = (
+        result.get("markdown")
+        or result.get("report")
+        or result.get("text")
+        or result.get("content")
+        or ""
+    )
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(markdown, encoding="utf-8")
+
+    return path
+
+def classify_skill_task(skill_name: str, user_text: str, result: dict | None = None) -> str:
+    name = skill_name.lower()
+    text = user_text.lower()
+
+    # Analysis is always report mode, including code analysis
+    if name.startswith("analyze") or text.startswith("analyze"):
+        return "report"
+
+    # Only explicit modification/coding actions are patch mode
+    if name in {"code_edit", "apply_patch", "coder", "fix_file", "refactor_file"}:
+        return "patch"
+
+    if any(w in text for w in ["fix ", "change ", "edit ", "modify ", "implement ", "add "]):
+        return "patch"
+
+    return "message"
 
 def emit_event(
     event_type: str,
@@ -1218,7 +1856,7 @@ def emit_event(
         stage_text = character_stage_message(event_type, message, data)
 
         if TELEGRAM_ENABLED and stage_text:
-            notify_telegram(stage_text)
+            notify_telegram(clean_tool_result_for_telegram(stage_text))
 
 
         with open(EVENTS_FILE, "a", encoding="utf-8") as f:
@@ -1226,6 +1864,7 @@ def emit_event(
 
         typing_events = {
         "plan",
+        "router",
         "code_phase",
         "tool_start",
         "status",
@@ -1255,6 +1894,8 @@ def emit_event(
             "final",
             "code_phase",
             "code_step_ready",
+            "Coding planner full response",
+            "Live router decision",
             "agent_start",
             "agent_step",
             "agent_final",
@@ -1269,7 +1910,6 @@ def emit_event(
         if event_type == "warning":
             emoji = "⚠️"
         if TELEGRAM_ENABLED and event_type in important_events:
-
             route = str(payload["data"].get("route", ""))
             model = str(
                 payload["data"].get("model")
@@ -1289,20 +1929,111 @@ def emit_event(
             if model:
                 telegram_text += f"Model: {model}\n"
 
-            if payload["data"]:
-                preview = json.dumps(
-                    payload["data"],
-                    ensure_ascii=False,
-                    indent=2,
-                )[:1200]
-
-                telegram_text += f"\nData:\n{preview}"
-
+            # Do not send raw payload JSON to Telegram
             notify_telegram(telegram_text)
 
     except Exception:
         pass
+def save_report(
+    skill_name: str,
+    plan_id: str,
+    result: Any,
+    route: str = "code",
+) -> Dict[str, Any]:
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    safe_skill = (skill_name or "unknown").replace("/", "_").replace(" ", "_")
 
+    # --- Aggregate full agent trace into one markdown document ---
+    sections: List[str] = []
+
+    # Pull each observation (one per agent step)
+    observations = result.get("observations") or []
+    for obs in observations:
+        raw = obs.get("observation") or obs.get("content") or ""
+
+        # observations may be JSON-wrapped tool results
+        if isinstance(raw, str):
+            try:
+                data = json.loads(raw)
+                text = (
+                    data.get("markdown")
+                    or data.get("report")
+                    or data.get("text")
+                    or data.get("content")
+                    or data.get("answer")
+                    or ""
+                )
+                if text:
+                    raw = text
+            except Exception:
+                pass
+
+        if raw and raw.strip():
+            sections.append(raw.strip())
+
+    # Final answer is the synthesis — always append last
+    final_answer = (
+        result.get("answer")
+        or result.get("markdown")
+        or result.get("report")
+        or result.get("text")
+        or result.get("content")
+        or ""
+    ).strip()
+
+    # If final_answer is already a superset of all sections (agent summarized),
+    # use it alone. Otherwise prepend the observations for full context.
+    if final_answer and all(
+        section[:120] in final_answer for section in sections if section
+    ):
+        markdown = final_answer
+    else:
+        parts = sections + ([final_answer] if final_answer else [])
+        markdown = "\n\n---\n\n".join(parts)
+
+    if not markdown:
+        markdown = json.dumps(result, indent=2, ensure_ascii=False)
+
+    # Prepend a header
+    header = f"# Report: {safe_skill}\n\n_Plan: {plan_id} — {ts}_\n\n"
+    markdown = header + markdown
+
+    report_dir = VAULT_DIR / "Reports"
+    report_dir.mkdir(parents=True, exist_ok=True)
+
+    filename = f"{ts}_{safe_skill}_{plan_id[:12]}.md"
+    path = report_dir / filename
+    path.write_text(markdown, encoding="utf-8")
+
+    emit_event("artifact", "Report saved", {
+        "plan_id": plan_id,
+        "skill": skill_name,
+        "path": str(path),
+        "chars": len(markdown),
+        "sections": len(sections),
+        "route": route,
+    })
+
+    append_event(
+        "report.saved",
+        f"Report saved for {skill_name}",
+        plan_id=plan_id,
+        route=route,
+        model="",
+        payload={
+            "path": str(path),
+            "chars": len(markdown),
+            "sections": len(sections),
+        },
+    )
+
+    return {
+        "ok": True,
+        "kind": "report",
+        "path": str(path),
+        "markdown": markdown,
+        "message": f"Report written to {path}",
+    }
 
 def recent_events(limit: int = 100) -> List[Dict[str, Any]]:
     if not EVENTS_FILE.exists():
@@ -1366,13 +2097,13 @@ def http_get_ok_simple(url: str, timeout: int = 2) -> bool:
 
 
 def is_orpheus_running() -> bool:
-    if not ORPHEUS_ENABLED:
+    if not ORPHEUS_ENABLED or ORPHEUS_ENABLED == "0":
         return False
     return http_get_ok_simple(f"{ORPHEUS_HOST}/health", timeout=2)
 
 
 def start_orpheus_process() -> bool:
-    if not ORPHEUS_ENABLED:
+    if not ORPHEUS_ENABLED or ORPHEUS_ENABLED == "0":
         return False
     if is_orpheus_running():
         return True
@@ -1397,7 +2128,7 @@ def start_orpheus_process() -> bool:
 
 
 def stop_orpheus_process() -> bool:
-    if not ORPHEUS_ENABLED:
+    if not ORPHEUS_ENABLED or ORPHEUS_ENABLED == "0":
         return False
     if not is_orpheus_running():
         return True
@@ -1524,6 +2255,111 @@ def parse_json_object_from_text(text: str) -> Optional[Dict[str, Any]]:
     return None
 
 
+def run_live_router(user_text: str) -> Dict[str, Any]:
+    prompt = load_named_prompt(
+       LIVE_ROUTER_PROMPT_PATH,
+       fallback=(
+           "You are JARVIS Live Router. Return ONLY valid JSON with fields: "
+            "speak, transcript, intent, action, route, tool, confidence, args. "
+            "Default action is chat_only and route live."
+        ),
+    )
+ 
+
+    prompt = prompt.replace(
+        "{{TOOL_CATALOG}}",
+        build_live_tool_catalog()
+    )
+    self_hint = build_self_context_prompt(
+        persona=None,
+        max_tools=8,
+    )
+
+    prompt = (
+        prompt
+        + "\n\nJARVIS SELF-CONTEXT HINT:\n"
+        + self_hint[:2500]
+    )
+    model = resolve_model(requested_model=None, route="live")
+
+    payload = {
+        "model": model,
+        "messages": [
+            {"role": "system", "content": prompt},
+            {"role": "user", "content": user_text},
+        ],
+        "stream": False,
+        "options": {
+            "temperature": 0.1,
+            "top_p": 0.7,
+            "num_ctx": 4096,
+        },
+    }
+    #emit_event("warning", "Live router running", {"error": "Running live router", "payload": payload})
+    try:
+        with request_ollama_chat(payload, timeout=CHAT_TIMEOUT_SEC) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+
+        raw = data.get("message", {}).get("content", "")
+        parsed = parse_json_object_from_text(raw)
+        if isinstance(parsed, dict):
+            parsed.setdefault("action", "chat_only")
+            parsed.setdefault("route", "live")
+            parsed.setdefault("tool", None)
+            parsed.setdefault("args", {})
+            parsed.setdefault("speak", "")
+            parsed.setdefault("transcript", user_text)
+
+            # Backward compatibility with old router schema
+            old_conf = parsed.get("confidence")
+
+            if "chat_confidence" not in parsed:
+                if parsed.get("action") == "chat_only":
+                    parsed["chat_confidence"] = float(old_conf or 0.85)
+                else:
+                    parsed["chat_confidence"] = 0.0
+
+            if "escalation_confidence" not in parsed:
+                if parsed.get("action") in {"direct_tool", "planner", "code", "deep_agent"}:
+                    parsed["escalation_confidence"] = float(old_conf or 0.85)
+                else:
+                    parsed["escalation_confidence"] = 0.0
+
+            if "execute_confidence" not in parsed:
+                if parsed.get("action") in {"direct_tool", "planner", "code", "deep_agent"}:
+                    parsed["execute_confidence"] = float(old_conf or 0.85)
+                else:
+                    parsed["execute_confidence"] = 0.0
+
+            return parsed
+
+        return {
+            "speak": raw.strip() or "I can discuss that.",
+            "transcript": user_text,
+            "intent": "chat",
+            "action": "chat_only",
+            "route": "live",
+            "tool": None,
+            "chat_confidence": 0.5,
+            "escalation_confidence": 0.0,
+            "execute_confidence": 0.0,
+            "args": {},
+        }
+
+    except Exception as e:
+        emit_event("warning", "Live router failed", {"error": str(e)})
+        return {
+            "speak": "",
+            "transcript": user_text,
+            "intent": "fallback",
+            "action": "chat_only",
+            "route": "live",
+            "tool": None,
+            "chat_confidence": 0.0,
+            "escalation_confidence": 0.0,
+            "execute_confidence": 0.0,
+            "args": {},
+        }
 def load_mode_profiles() -> Dict[str, Any]:
     try:
         if MODE_PROFILE_PATH.exists():
@@ -1576,7 +2412,10 @@ def get_profile_options(profile_override: Optional[str] = None) -> Dict[str, Any
     if isinstance(top_p, (int, float)):
         options["top_p"] = top_p
     return options
-
+def return_chat_response(self, payload: dict, user_text: str, reply_text: str, route: str, model: str):
+    write_chat_log("user", user_text, route=route, model=model)
+    write_chat_log("assistant", reply_text, route=route, model=model)
+    self._json_response(payload)
 
 def resolve_runtime_mode(route: str, selected_tools: List[Dict[str, Any]]) -> Dict[str, Any]:
     cfg = load_mode_profiles()
@@ -1635,33 +2474,44 @@ def write_runtime_mode(route: str, model: str, selected_tools: List[Dict[str, An
 def build_self_context(persona: Optional[str] = None) -> Dict[str, Any]:
     profile = load_active_profile(profile_override=persona)
     cfg = load_model_config()
-    capabilities = []
-    for tool_name, meta in TOOL_SKILL_META.items():
-        try:
-            tool_desc = TOOLS_BY_NAME[tool_name]["function"].get("description", "")
-        except Exception:
-            tool_desc = meta.get("description", "")
-        capabilities.append(
-            {
-                "tool": tool_name,
-                "description": tool_desc,
-                "category": meta.get("category", ""),
-                "capabilities": meta.get("capabilities", []),
-                "requirements": meta.get("requirements", []),
-                "route": meta.get("route"),
-                "keywords": meta.get("keywords", []),
-                "intent_aliases": meta.get("intent_aliases", []),
-            }
-        )
+
     return {
         "identity": {"id": profile.get("id"), "label": profile.get("label"), "systemPrompt": profile.get("systemPrompt")},
         "models": {"routes": cfg.get("models", {}), "planner_model": cfg.get("planner_model")},
-        "skills": get_loaded_skills(),
-        "capabilities": capabilities,
         "tool_count": len(TOOL_MAP),
         "available_routes": list(MODE_PROMPTS.keys()),
     }
+def build_last_exchange_context() -> str:
+    try:
+        from scripts.chat_context import read_last_messages
+    except Exception:
+        try:
+            from chat_context import read_last_messages
+        except Exception:
+            return ""
 
+    try:
+        last_user, last_assistant = read_last_messages()
+    except Exception:
+        return ""
+
+    blocks = []
+
+    if last_user:
+        blocks.append(
+            "[LAST USER MESSAGE]\n"
+            f"{last_user}\n"
+            "[/LAST USER MESSAGE]"
+        )
+
+    if last_assistant:
+        blocks.append(
+            "[LAST ASSISTANT MESSAGE]\n"
+            f"{last_assistant}\n"
+            "[/LAST ASSISTANT MESSAGE]"
+        )
+
+    return "\n\n".join(blocks)
 
 def build_self_context_prompt(persona: Optional[str] = None, max_tools: int = 20) -> str:
     ctx = build_self_context(persona=persona)
@@ -1688,10 +2538,26 @@ def build_system_prompt_for_route(route: str, persona: Optional[str] = None) -> 
         profile.get("systemPrompt") or ""
     ).strip() or "You are JARVIS, a capable local assistant."
 
+    external_prompt_by_route = {
+        "live": LIVE_CHAT_PROMPT_PATH,
+        "fast": LIVE_CHAT_PROMPT_PATH,
+        "reason": PLANNER_PROMPT_PATH,
+        "code": CODER_PROMPT_PATH,
+    }
+
+    external_route_prompt = ""
+    if route in external_prompt_by_route:
+        external_route_prompt = load_prompt_file(external_prompt_by_route[route], "")
+
     if route == "code":
+        coder_prompt = external_route_prompt or MODE_PROMPTS.get("code", "").strip()
+
         parts = [
             profile_prompt,
+            coder_prompt,
             CODER_WORKSPACE_HINT.strip(),
+            build_last_exchange_context(),
+            build_short_term_context(),
             load_coder_memory(),
             build_self_context_prompt(persona=persona),
         ]
@@ -1702,8 +2568,11 @@ def build_system_prompt_for_route(route: str, persona: Optional[str] = None) -> 
         if isinstance(mode_prompts, dict):
             profile_mode_prompt = (mode_prompts.get(route) or "").strip()
 
-        route_prompt = profile_mode_prompt or MODE_PROMPTS.get(route or "reason", "").strip()
-
+        route_prompt = (
+            profile_mode_prompt
+            or external_route_prompt
+            or MODE_PROMPTS.get(route or "reason", "").strip()
+        )
         parts = [
             profile_prompt,
             route_prompt,
@@ -1785,7 +2654,7 @@ def should_keep_orpheus_warm(route: str, model: str) -> bool:
 
 
 def sync_orpheus_for_route(route: str, model: str) -> None:
-    if not ORPHEUS_ENABLED:
+    if not ORPHEUS_ENABLED or ORPHEUS_ENABLED == "0":
         return
     keep_warm = should_keep_orpheus_warm(route, model)
     emit_event("status", "Syncing Orpheus policy", {"route": route, "model": model, "keep_warm": keep_warm, "orpheus_running": is_orpheus_running()})
@@ -1917,6 +2786,46 @@ def call_ollama_once(model: str, messages: List[Dict[str, Any]], route: str, per
 # Tool selection
 # -----------------------------------------------------------------------------
 LAST_TELEGRAM_ACTION_AT = 0.0
+def maybe_send_telegram_media(result: Any) -> bool:
+    try:
+        data = result
+        if isinstance(result, str):
+            data = json.loads(result)
+
+        paths = []
+
+        if isinstance(data, dict):
+            for key in ["image_path", "path", "file", "filename"]:
+                value = data.get(key)
+                if isinstance(value, str) and value.lower().endswith((".png", ".jpg", ".jpeg", ".webp")):
+                    paths.append(value)
+
+            ui = data.get("ui")
+            if isinstance(ui, dict):
+                value = ui.get("path") or ui.get("image_path") or ui.get("file")
+                if isinstance(value, str) and value.lower().endswith((".png", ".jpg", ".jpeg", ".webp")):
+                    paths.append(value)
+
+            images = data.get("images")
+            if isinstance(images, list):
+                for value in images:
+                    if isinstance(value, str) and value.lower().endswith((".png", ".jpg", ".jpeg", ".webp")):
+                        paths.append(value)
+
+        for image_path in paths:
+            p = Path(image_path).expanduser()
+            if p.exists():
+                TELEGRAM_GATEWAY.send_photo(
+                    TELEGRAM_NOTIFY_CHAT_ID,
+                    str(p),
+                    caption="Generated image"
+                )
+                return True
+
+    except Exception as e:
+        emit_event("warning", "Telegram media send failed", {"error": str(e)})
+
+    return False
 
 def telegram_chat_action(action: str = "typing") -> None:
     global LAST_TELEGRAM_ACTION_AT
@@ -2068,7 +2977,23 @@ def direct_tools_for_text(user_text: str) -> List[Dict[str, Any]]:
         if intent_alias in text:
             matched_tool_names.extend(tool_names)
     return dedupe_tools([TOOLS_BY_NAME[name] for name in matched_tool_names if name in TOOLS_BY_NAME])
+def build_live_tool_catalog(max_tools: int = 40) -> str:
+    catalog = []
 
+    for tool_name, tool in sorted(TOOLS_BY_NAME.items()):
+        fn = tool.get("function", {})
+        meta = TOOL_SKILL_META.get(tool_name, {})
+
+        catalog.append({
+            "name": tool_name,
+            "description": fn.get("description", "")[:300],
+            "parameters": fn.get("parameters", {}),
+            "intent_aliases": meta.get("intent_aliases", []),
+            "keywords": meta.get("keywords", []),
+            "direct_match": meta.get("direct_match", []),
+        })
+
+    return json.dumps(catalog[:max_tools], ensure_ascii=False)
 
 def select_tools_by_hints(user_text: str) -> List[Dict[str, Any]]:
     text = (user_text or "").lower()
@@ -2326,49 +3251,29 @@ def normalize_tool_calls(assistant_msg: Dict[str, Any]) -> List[Dict[str, Any]]:
         normalized.append({"id": call.get("id", f"tool_{idx}"), "type": "function", "function": {"name": fn_name, "arguments": fn_args}})
     return normalized
 
-
 def execute_tool(fn_name: str, fn_args: Dict[str, Any]) -> str:
     executor = TOOL_MAP.get(fn_name)
     if not executor:
         emit_event("warning", f"Unknown tool {fn_name}")
         return f"Unknown tool: {fn_name}"
+
     started = time.time()
     tool_payload = {
         "tool": fn_name,
         "args": fn_args,
     }
 
-    # Extra coder visibility
     if fn_name == "code_edit":
         tool_payload["coder_task"] = fn_args.get("task")
         tool_payload["coder_path"] = fn_args.get("path")
         tool_payload["coder_mode"] = fn_args.get("mode")
 
-    emit_event(
-        "tool_start",
-        f"Running tool {fn_name}",
-        tool_payload,
-    )
+    emit_event("tool_start", f"Running tool {fn_name}", tool_payload)
+
     try:
         result = executor(**fn_args)
-        if fn_name == "flux":
-            try:
-                data = result if isinstance(result, dict) else json.loads(result)
-                image_path = (
-                    data.get("image_path")
-                    or data.get("path")
-                    or data.get("file")
-                    or data.get("output")
-                )
-
-                if image_path:
-                    TELEGRAM_GATEWAY.send_photo(
-                        TELEGRAM_NOTIFY_CHAT_ID,
-                        image_path,
-                        caption="🎨 Flux image generated"
-                    )
-            except Exception as e:
-                debug(f"Telegram Flux image send failed: {e}")
+        
+        increment_tool_usage(fn_name)
         if fn_name == "code_edit":
             emit_event(
                 "code_edit_output",
@@ -2380,21 +3285,105 @@ def execute_tool(fn_name: str, fn_args: Dict[str, Any]) -> str:
                     "mode": fn_args.get("mode"),
                 },
             )
+
         elapsed = time.time() - started
-        preview =  truncate_text(extract_tool_content(result), 3000),
+        preview = truncate_text(extract_tool_content(result), 3000)
+
         debug(f"Tool ok: {fn_name} in {elapsed:.2f}s")
-        emit_event("tool_result", f"Tool {fn_name} completed", {"tool": fn_name, "elapsed_sec": round(elapsed, 3), "result_preview": preview})
+
+        emit_event(
+            "tool_result",
+            f"Tool {fn_name} completed",
+            {
+                "tool": fn_name,
+                "elapsed_sec": round(elapsed, 3),
+                "result_preview": preview,
+            },
+        )
+
         if isinstance(result, dict):
-            emit_event("skill_result", f"Skill {fn_name} returned structured result", {"tool": fn_name, "result": result})
+            emit_event(
+                "skill_result",
+                f"Skill {fn_name} returned structured result",
+                {"tool": fn_name, "result": result},
+            )
             return json.dumps(result, ensure_ascii=False)
+
         return truncate_text(result)
+
     except Exception as e:
         elapsed = time.time() - started
         debug(f"Tool failed: {fn_name} in {elapsed:.2f}s :: {e}")
-        emit_event("warning", f"Tool {fn_name} failed", {"tool": fn_name, "elapsed_sec": round(elapsed, 3), "error": str(e)})
-        return truncate_text({"error": str(e), "tool": fn_name, "traceback": traceback.format_exc(limit=3)})
+        emit_event(
+            "warning",
+            f"Tool {fn_name} failed",
+            {
+                "tool": fn_name,
+                "elapsed_sec": round(elapsed, 3),
+                "error": str(e),
+            },
+        )
+        return truncate_text({
+            "error": str(e),
+            "tool": fn_name,
+            "traceback": traceback.format_exc(limit=3),
+        })
+    
+def send_flux_result_to_telegram(result: Any) -> bool:
+    try:
+        data = result
 
+        if isinstance(result, str):
+            data = json.loads(result)
 
+        if not isinstance(data, dict):
+            return False
+
+        image_path = (
+            data.get("image_path")
+            or data.get("path")
+            or data.get("file")
+            or data.get("output")
+        )
+
+        if not image_path:
+            ui = data.get("ui")
+            if isinstance(ui, dict):
+                image_path = (
+                    ui.get("image_path")
+                    or ui.get("path")
+                    or ui.get("file")
+                    or ui.get("output")
+                )
+
+        if not image_path:
+            emit_event("warning", "Flux result had no image path", {"result": data})
+            return False
+
+        path = Path(str(image_path)).expanduser()
+
+        if not path.is_absolute():
+            path = PROJECT_ROOT / path
+
+        path = path.resolve()
+
+        if not path.exists():
+            emit_event("warning", "Flux image path does not exist", {"path": str(path)})
+            return False
+
+        TELEGRAM_GATEWAY.send_photo(
+            TELEGRAM_NOTIFY_CHAT_ID,
+            str(path),
+            caption="🎨 Flux image generated",
+        )
+
+        emit_event("status", "Flux image sent to Telegram", {"path": str(path)})
+        return True
+
+    except Exception as e:
+        emit_event("warning", "Flux Telegram image send failed", {"error": str(e)})
+        return False
+    
 def wait_for_ollama(max_wait_sec: int = 30) -> bool:
     emit_event("status", "Waiting for Ollama", {"host": OLLAMA_HOST})
     for _ in range(max_wait_sec):
@@ -2591,7 +3580,194 @@ class ReactHandler(BaseHTTPRequestHandler):
 
         user_text = get_last_user_text(messages)
         user_text = clean_telegram_prefix(user_text)
+        #### REMove if needed after testing
+    
 
+        live_result = run_live_router(user_text)
+        live_result = force_correct_common_tool(user_text, live_result)
+        live_action = live_result.get("action")
+        #live_confidence = float(live_result.get("confidence") or 0)
+        chat_confidence = float(
+            live_result.get("chat_confidence", 0)
+        )
+
+        escalation_confidence = float(
+            live_result.get("escalation_confidence", 0)
+)
+        execute_confidence = float(
+            live_result.get("execute_confidence", 0)
+)
+
+        live_speak = str(live_result.get("speak") or "").strip()
+        write_chat_log("assistant", live_speak, route=live_action, model="live")
+        live_transcript = str(live_result.get("transcript") or "").strip()
+        live_tool = str(live_result.get("tool") or "").strip()
+        live_intent = str(live_result.get("intent") or "").strip()
+        live_args = live_result.get("args") or {}
+        emit_event(
+            "Live router",
+            "Reply and confidence",
+            {
+                "speak": live_speak,
+                "tool": live_tool,
+                "escalation_confidence": escalation_confidence,
+                "execute_confidence": execute_confidence,
+                "chat_confidence": chat_confidence,
+                "user_text": user_text[:200],
+            },
+        )
+        if not isinstance(live_args, dict):
+            live_args = {}
+
+        if live_tool == "radio" and live_args.get("action") == "play" and not live_args.get("station"):
+            live_action = "chat_only"
+            live_speak = "Which radio station should I play?"
+        notify_telegram(f"{live_speak}")
+        if live_transcript:
+            user_text = live_transcript
+        #else:
+        ##    user_text_for_routing = user_text
+        if live_action == "chat_only" and (chat_confidence >= 0.70 or escalation_confidence == 0.0) and live_speak:
+            #if source == "telegram":
+            #    notify_telegram(live_speak)
+            
+            self._json_response({
+                "model": "live_router",
+                "created_at": now_iso(),
+                "message": {
+                    "role": "assistant",
+                    "content": live_speak,
+                },
+                "done": True,
+                "route": "live",
+                "live": live_result,
+            })
+            return
+        ##elif source == "telegram":
+        ##    notify_telegram(f"{live_speak}")
+        #if live_action == "direct_tool":
+        live_direct_skill_match = resolve_skill_command(user_text)
+        live_tool_fixed = live_tool
+        
+        if live_direct_skill_match and live_direct_skill_match.get("score", 0) >= 0.88:
+            live_tool_fixed = live_direct_skill_match.get("tool_name")
+        if (
+            live_action == "direct_tool"
+            and execute_confidence >= 0.75
+            and live_tool_fixed
+            and live_tool_fixed in TOOL_MAP
+        ):
+            live_result = complete_tool_args_with_meta(
+            tool_name=live_tool_fixed,
+            user_text=user_text,
+            parsed=live_result,
+            )
+            live_args = live_result.get("args") or {}
+            result = execute_tool(live_tool_fixed, live_args)
+            sent_media = False
+            if source == "telegram" and live_tool_fixed == "flux":
+                sent_media = send_flux_result_to_telegram(result)
+                if source == "telegram":
+                    if sent_media:
+                        notify_telegram("Image sent to Telegram!")
+                    else:
+                        notify_telegram("Failed to send image to Telegram.")
+            content = extract_tool_content(result)
+            reply = content or live_speak or f"Done: {live_tool_fixed}"
+            if log_chat_event and reply.strip():
+                try:
+                    write_chat_log("user", user_text, route=route, model=model)
+                    write_chat_log("assistant", reply_text, route=route, model=model)
+                except Exception as e:
+                    print(f"[CHAT_LOG] assistant and user log failed: {e}")
+            ##if source == "telegram":
+            ##    notify_telegram(reply)
+            
+            emit_event(
+                "router",
+                "Live router decision",
+                {
+                    "action": live_result.get("action"),
+                    "route": live_result.get("route"),
+                    "tool": live_tool_fixed,
+                    "chat_confidence": live_result.get("chat_confidence"),
+                    "escalation_confidence": live_result.get("escalation_confidence"),
+                    "execute_confidence": live_result.get("execute_confidence"),
+                    "intent": live_result.get("intent"),
+                    "speak": live_result.get("speak", "")[:300],
+                },
+            )
+            self._json_response({
+                "model": "live_router",
+                "created_at": now_iso(),
+                "message": {
+                    "role": "assistant",
+                    "content": reply,
+                },
+                "done": True,
+                "route": "tools",
+                "format": "direct_tool",
+                "tool": live_tool,
+                "tool_result": result,
+                "live": live_result,
+            })
+            return
+    
+        normalized_user = user_text.strip().lower()
+
+        is_code_request = any(x in normalized_user for x in [
+            "code",
+            "fix",
+            "edit",
+            "patch",
+            "implement",
+            "create script",
+            "save it",
+            "write it",
+            ".py",
+            ".js",
+            ".ts",
+            "tester",
+            "test_",
+            "react_server.py",
+        ])
+
+        if live_action == "code" or live_result.get("route") == "code":
+            requested_route = "code"
+
+        if is_code_request:
+            requested_route = "code"
+
+        # Disable fuzzy skill matching for coder requests
+        if requested_route == "code":
+            direct_skill_match = None
+        else:
+            direct_skill_match = resolve_skill_command(user_text)
+            if direct_skill_match and direct_skill_match.get("score", 0) >= 0.88:
+                live_result.update({
+                    "action": "direct_tool",
+                    "route": "tools",
+                    "tool": direct_skill_match["tool_name"],
+                    "chat_confidence": 0.0,
+                    "escalation_confidence": 1.0,
+                    "execute_confidence": 1.0,
+                    "args": live_result.get("args") or {},
+                })
+                requested_route = "tools"
+
+        live_action = live_result.get("action")
+        if live_action == "chat_only":
+            requested_route = "live"
+        elif live_action == "direct_tool":
+            requested_route = "tools"
+        elif live_action == "planner":
+            requested_route = "reason"
+        elif live_action == "code":
+            requested_route = "code"
+        elif live_action == "deep_agent":
+            requested_route = "deep"
+        if direct_skill_match:
+            requested_route = "tools"
         workflow_state = load_workflow_state()
 
         if workflow_state:
@@ -2633,27 +3809,106 @@ class ReactHandler(BaseHTTPRequestHandler):
                     "done": True,
                 })
                 return
+            if live_action == "chat_only" and requested_route == "live" and live_intent == "chat_history_query":
+                model = resolve_model(requested_model=requested_model, route="live")
+
+                try:
+                    from scripts.chat_context import read_last_chat_log_chars
+                except Exception:
+                    from chat_context import read_last_chat_log_chars
+
+                recent_chat = read_last_chat_log_chars(max_chars=4000)
+
+                history_context = (
+                    "Recent chat log. Use this to answer the user's question about recent discussion. "
+                    "Do not dump the log unless the user asks. Answer concisely.\n\n"
+                    + recent_chat
+                )
+
+                messages.insert(1, {
+                    "role": "system",
+                    "content": history_context,
+                })
+
+                data = call_ollama_once(
+                    model=model,
+                    messages=messages,
+                    route="live",
+                    persona=None,
+                    tools=None,
+                    stream=False,
+                )
+
+                reply_text = (
+                    data.get("message", {}).get("content", "")
+                    if isinstance(data, dict)
+                    else ""
+                )
+                write_chat_log("assistant", reply_text, route=route, model=model)
+                if log_chat_event and reply_text.strip():
+                    try:
+                        write_chat_log("user", user_text, route=route, model=model)
+                        write_chat_log("assistant", reply_text, route=route, model=model)
+                    except Exception as e:
+                        print(f"[CHAT_LOG] assistant log failed: {e}")
+                if source == "telegram" and reply_text.strip():
+                    notify_telegram("test"+reply_text.strip())
+
+                self._json_response({
+                    **data,
+                    "route": "live",
+                    "live": live_result,
+                    "chat_history_used": True,
+                })
+                return
+            if live_result.get("action") == "chat_only" and requested_route == "live":
+                model = resolve_model(requested_model=requested_model, route="live")
+                self_context = build_self_context_prompt(persona=persona, max_tools=20)
+
+                messages.insert(1, {
+                    "role": "system",
+                    "content": (
+                        "JARVIS self-context. Use this to understand who you are and what you can do. "
+                        "Do not over-explain it unless asked.\n\n"
+                        + self_context
+                    )
+                })
+                data = call_ollama_once(
+                    model=model,
+                    messages=messages,
+                    route="live",
+                    persona=None,
+                    tools=None,
+                    stream=False,
+                )
+
+                reply_text = (
+                    data.get("message", {}).get("content", "")
+                    if isinstance(data, dict)
+                    else ""
+                )
+                write_chat_log("assistant", reply_text, route=route, model=model)
+                if source == "telegram" and reply_text.strip():
+                    notify_telegram(reply_text.strip())
+                write_chat_log("assistant", reply_text, route=route, model=model)
+                self._json_response({
+                    **data,
+                    "route": "live",
+                    "live": live_result,
+                })
+                return
+        # ------------------------------------------------------------
+        # Memory context
+        # ------------------------------------------------------------
+        # IMPORTANT:
+        # - user_text stays clean/raw for route detection, command parsing, and tool selection.
+        # - planner_user_text may include memory hints for planning/reasoning only.
+        # - memory must never override the current user command.
+        # ------------------------------------------------------------
+
         plan_command, plan_command_id = parse_plan_command(user_text)
-##### planner
-        if source == "telegram" and plan_command in {"proceed", "continue", "next", "run", "modify", "cancel"}:
-            requested_route = "code"
-            requested_model = None
+        lower_user = user_text.strip().lower()
 
-        if requested_route not in VALID_ROUTES:
-            requested_route = detect_route(user_text, source)
-
-        selected_tools: List[Dict[str, Any]] = []
-
-        plan_command, plan_command_id = parse_plan_command(user_text)
-
-        if plan_command in {"proceed", "continue", "next", "run", "modify", "cancel"}:
-            selected_tools = []
-        elif should_select_tools(user_text, requested_route, requested_model):
-            selected_tools = choose_tools(
-                user_text,
-                requested_route=requested_route,
-                requested_model=requested_model,
-            )
         active_task_followups = {
             "proceed",
             "continue",
@@ -2666,11 +3921,166 @@ class ReactHandler(BaseHTTPRequestHandler):
             "show directory",
             "save it and show directory",
         }
+        direct_command_prefixes = (
+            "list skills",
+            "show skills",
+            "what skills",
+            "reload skills",
+            "play ",
+            "stop radio",
+            "timer ",
+            "set timer",
+            "health",
+        )
+        normalized_user = user_text.strip().lower()
+
+        is_active_followup = normalized_user in active_task_followups
+        skip_memory = (
+            requested_route == "live"
+            or bool(direct_skill_match)
+            or  is_active_followup
+            or bool(md_skill)
+            or plan_command in {"proceed", "continue", "next", "run", "yes", "cancel"}
+            or lower_user.startswith(direct_command_prefixes)
+        )
+
+        context_pack = ""
+        planner_user_text = user_text
+
+        if not skip_memory:
+            context_pack = build_context_pack(user_text)
+
+            if context_pack:
+                context_system_message = {
+                    "role": "system",
+                    "content": (
+                        "Memory context is optional background only. "
+                        "The current user message is the command. "
+                        "Do not change the user's intent based on memory. "
+                        "If memory conflicts with the current command, ignore memory.\n\n"
+                        + context_pack
+                    ),
+                }
+
+                insert_at = 1 if messages and messages[0].get("role") == "system" else 0
+                messages.insert(insert_at, context_system_message)
+
+                planner_user_text = (
+                    "USER COMMAND:\n"
+                    f"{user_text}\n\n"
+                    "OPTIONAL MEMORY HINTS:\n"
+                    f"{context_pack[:2500]}\n\n"
+                    "Instruction: obey USER COMMAND. Use memory only as supporting context."
+                )
+                emit_event(
+                    "debug",
+                    "Planner text",
+                    {
+                        "chars": len(planner_user_text),
+                        "preview": planner_user_text[:4000],
+                    },
+                )
+        #plan_command, plan_command_id = parse_plan_command(user_text)
+##### planner
+
+        if source == "telegram" and plan_command in {"proceed", "continue", "next", "run", "modify", "cancel","accept"}:
+            requested_route = "code"
+            requested_model = None
+
+        if requested_route not in VALID_ROUTES:
+            requested_route = detect_route(user_text, source)
+
+        selected_tools: List[Dict[str, Any]] = []
+
+        plan_command, plan_command_id = parse_plan_command(user_text)
+        plan_decision = None
+
+        if plan_command in {"proceed", "continue", "next", "run", "yes", "accept"}:
+            plan_decision = {
+                "action": "code",
+                "route": "code",
+                "chat_confidence": 0.0,
+                "execution_confidence": 1.0,
+                "continue_plan": True,
+                "plan_action": "continue",
+            }
+            requested_route = "code"
+            requested_model = None
+
+        elif plan_command == "modify":
+            plan_decision = {
+                "action": "planner",
+                "route": "reason",
+                "chat_confidence": 1.0,
+                "execution_confidence": 0.0,
+                "continue_plan": True,
+                "plan_action": "modify",
+            }
+            requested_route = "code"
+            requested_model = None
+
+        elif plan_command == "cancel":
+            plan_decision = {
+                "action": "code",
+                "route": "code",
+                "chat_confidence": 0.0,
+                "execution_confidence": 1.0,
+                "continue_plan": True,
+                "plan_action": "cancel",
+            }
+            requested_route = "code"
+            requested_model = None
+
+        if direct_skill_match:
+            selected_tools = [direct_skill_match["tool"]]
+        elif plan_command in {"proceed", "continue", "next", "run", "modify", "cancel"}:
+            selected_tools = []
+        elif should_select_tools(user_text, requested_route, requested_model):
+            selected_tools = choose_tools(
+                user_text,
+                requested_route=requested_route,
+                requested_model=requested_model,
+            )
+        emit_event(
+            "router",
+            "Fuzzy skill command match",
+            {
+                "matched": bool(direct_skill_match),
+                "tool": direct_skill_match.get("tool_name") if direct_skill_match else None,
+                "phrase": direct_skill_match.get("phrase") if direct_skill_match else None,
+                "score": direct_skill_match.get("score") if direct_skill_match else None,
+                "user_text": user_text[:200],
+            },
+        )
 
         resolved_route = normalized_route(requested_route, selected_tools)
 
+        is_code_request = any(x in user_text.lower() for x in [
+            "code", "fix", "edit", "implement", "create script",
+            "save it", ".py", "tester"
+        ])
+
+        if is_code_request or (plan_decision and plan_decision.get("execution_confidence", 0) >= 0.85):
+            resolved_route = "code"
+
+        if resolved_route == "code":
+            requested_model = None
+            model = resolve_model(requested_model=None, route="code")
+            selected_tools = [TOOLS_BY_NAME["code_edit"]] if "code_edit" in TOOLS_BY_NAME else []
+        else:
+            model = resolve_model(requested_model=requested_model, route=resolved_route)
+
         route = resolved_route
-        model = resolve_model(requested_model=requested_model, route=resolved_route)
+        if log_chat_event:
+            try:
+                log_chat_event(
+                    role="user",
+                    content=user_text,
+                    route=route,
+                    model=model,
+                )
+            except Exception as e:
+                print(f"[CHAT_LOG] user log failed: {e}")
         if user_text.lower().startswith("agent: continue"):
             task = get_active_task(TASK_GRAPH_PATH)
 
@@ -2689,10 +4099,11 @@ class ReactHandler(BaseHTTPRequestHandler):
             route == "deep" 
             or user_text.lower().startswith(("agent:", "do task:"))
         )
-         
+    
+
         if agent_requested:
             result = run_agent_loop(
-                user_message=user_text,
+                user_message=planner_user_text,
                 route=route,
                 model=model,
                 tools_by_name=TOOLS_BY_NAME,
@@ -2707,7 +4118,26 @@ class ReactHandler(BaseHTTPRequestHandler):
                 task_id=body.get("task_id"),
                 max_steps=8,
             )
+            write_chat_log("assistant", reply_text, route=route, model=model)
+            if isinstance(result, dict) and result.get("kind") == "report":
+                report_path = write_analysis_report(
+                    skill_name=tool_name,
+                    plan_id=result.get("plan_id") or plan_id,
+                    result=result,
+                )
 
+                emit_event("artifact", "Analysis report written", {
+                    "plan_id": plan_id,
+                    "skill": tool_name,
+                    "path": str(report_path),
+                })
+
+                return {
+                    "ok": True,
+                    "kind": "report",
+                    "path": str(report_path),
+                    "message": f"Report written to {report_path}",
+                }
             self._json_response({
                 "model": model,
                 "created_at": now_iso(),
@@ -2844,7 +4274,7 @@ class ReactHandler(BaseHTTPRequestHandler):
                 return
             # Modify current plan / create new modified plan
             if command == "modify" or user_text.strip().lower().startswith("modify this plan:"):
-                active_plan = build_simple_code_plan(user_text, paths)
+                active_plan = build_simple_code_plan(planner_user_text, paths)
                 
                 emit_event(
                     "code_phase",
@@ -2866,6 +4296,7 @@ class ReactHandler(BaseHTTPRequestHandler):
                     payload={"steps": active_plan.get("steps", [])},
                 )
                 save_active_plan(active_plan)
+                
                 self._json_response(
                     {
                         "model": model,
@@ -2877,18 +4308,22 @@ class ReactHandler(BaseHTTPRequestHandler):
                 return
 
             # New request creates plan first
-            if command not in {"proceed", "continue", "next", "run", "yes"}:
-                active_plan = build_simple_code_plan(user_text, paths)
+            if command not in {"proceed", "continue", "next", "run", "yes","accept"}:
+                active_plan = build_simple_code_plan(planner_user_text, paths)
     # ADD HERE
-                if needs_output_path(user_text, paths):
+                plan_files = active_plan.get("files") or []
+                has_plan_file = any("." in str(p).split("/")[-1] for p in plan_files)
+
+                if needs_output_path(user_text, paths) and not has_plan_file:
                     plan_id = active_plan["plan_id"]
 
                     active_plan["state"] = "waiting_input"
                     active_plan["waiting_for"] = "output_path"
-
                     save_active_plan(active_plan)
 
-                    return {
+                    self._json_response({
+                        "model": model,
+                        "created_at": now_iso(),
                         "message": {
                             "role": "assistant",
                             "content": (
@@ -2899,8 +4334,11 @@ class ReactHandler(BaseHTTPRequestHandler):
                                 "- app/page.tsx\n"
                                 "- scripts/test.py"
                             ),
-                        }
-                    }
+                        },
+                        "done": True,
+                        "route": "code",
+                    })
+                    return
 
                 # continue normal planner/coder flow
                 emit_event(
@@ -3045,9 +4483,61 @@ class ReactHandler(BaseHTTPRequestHandler):
                 task_id=active_plan.get("plan_id"),
                 max_steps=len(active_plan.get("steps", [])) + 2,
             )
-            ##result = execute_tool(tool_name, fn_args)
+
+            result_dict = result if isinstance(result, dict) else {}
+            result_kind = classify_agent_output_kind(
+                skill_name=tool_name,
+                user_text=user_text,
+                result=result_dict,
+            )
+
             content = extract_last_patch_from_anything(result)
             content = normalize_patch_text(content)
+
+            if result_kind == "report":
+                _plan_id = active_plan.get("plan_id") or "report_" + str(uuid.uuid4())[:8]
+
+                markdown = (
+                    result_dict.get("markdown")
+                    or result_dict.get("report")
+                    or result_dict.get("answer")
+                    or result_dict.get("text")
+                    or result_dict.get("content")
+                    or content
+                )
+
+                report_path = write_analysis_report(
+                    skill_name=tool_name,
+                    plan_id=_plan_id,
+                    result={"markdown": markdown},
+                )
+
+                emit_event(
+                    "artifact",
+                    "Analysis report written",
+                    {
+                        "plan_id": _plan_id,
+                        "skill": tool_name,
+                        "path": str(report_path),
+                    },
+                )
+
+                self._json_response(
+                    {
+                        "model": model,
+                        "created_at": now_iso(),
+                        "message": {
+                            "role": "assistant",
+                            "content": markdown,
+                        },
+                        "done": True,
+                        "route": resolved_route,
+                        "format": "report",
+                        "report_path": str(report_path),
+                    }
+                )
+                return
+
             if "--- FILE:" not in content or "@@" not in content:
                 emit_event(
                     "warning",
@@ -3064,8 +4554,12 @@ class ReactHandler(BaseHTTPRequestHandler):
                     "This output was rejected.\n\n"
                     f"Preview:\n{content[:1500]}"
                 )
+
             patch_file = f"patches/step_{step.get('id')}.patch"
-            (plan_dir(active_plan["plan_id"]) / patch_file).write_text(content, encoding="utf-8")
+            (plan_dir(active_plan["plan_id"]) / patch_file).write_text(
+                content,
+                encoding="utf-8",
+            )
 
             append_event(
                 "coder.done",
@@ -3079,6 +4573,7 @@ class ReactHandler(BaseHTTPRequestHandler):
                     "chars": len(content),
                 },
             )
+
             if "### PATCH" in content:
                 patch_part = content.split("### PATCH", 1)[1].strip()
             else:
@@ -3106,6 +4601,7 @@ class ReactHandler(BaseHTTPRequestHandler):
                     "validation": validation,
                 },
             )
+
             append_event(
                 "patch.validated",
                 "Coder output validation completed",
@@ -3115,6 +4611,7 @@ class ReactHandler(BaseHTTPRequestHandler):
                 model=model,
                 payload={"validation": validation},
             )
+
             if not validation["ok"]:
                 retry_instruction = (
                     active_plan.get("user_request", user_text)
@@ -3146,6 +4643,7 @@ class ReactHandler(BaseHTTPRequestHandler):
 
                 retry_result = execute_tool(tool_name, retry_args)
                 retry_content = extract_tool_content(retry_result)
+                retry_content = normalize_patch_text(retry_content)
                 retry_validation = validate_coder_output(retry_content)
 
                 if retry_validation["ok"]:
@@ -3178,6 +4676,7 @@ class ReactHandler(BaseHTTPRequestHandler):
                         "result": apply_result,
                     },
                 )
+
                 append_event(
                     "patch.applied" if apply_result.get("ok") else "patch.apply_failed",
                     "Patch applied" if apply_result.get("ok") else "Patch apply failed",
@@ -3187,6 +4686,7 @@ class ReactHandler(BaseHTTPRequestHandler):
                     model=model,
                     payload={"result": apply_result},
                 )
+
                 if apply_result.get("ok"):
                     step["status"] = "done"
                     step["summary"] = summarize_step_result(content)
@@ -3207,7 +4707,7 @@ class ReactHandler(BaseHTTPRequestHandler):
                             "remaining": len(steps) - active_plan["current_step"],
                         },
                     )
-                    
+
                     emit_event(
                         "code_step_ready",
                         f"Step {step.get('id')} complete. Ready for next step.",
@@ -3216,7 +4716,9 @@ class ReactHandler(BaseHTTPRequestHandler):
                             "step": step,
                             "current_step": active_plan["current_step"],
                             "remaining": len(steps) - active_plan["current_step"],
-                            "next_step": steps[active_plan["current_step"]] if active_plan["current_step"] < len(steps) else None,
+                            "next_step": steps[active_plan["current_step"]]
+                            if active_plan["current_step"] < len(steps)
+                            else None,
                         },
                     )
                 else:
@@ -3232,7 +4734,6 @@ class ReactHandler(BaseHTTPRequestHandler):
                 }
             )
             return
-
         # ------------------------------------------------------------------
         # Normal non-direct route
         # ------------------------------------------------------------------
@@ -3314,72 +4815,23 @@ class ReactHandler(BaseHTTPRequestHandler):
                     }
                 )
                 return
-
         if selected_tools:
             ack = random.choice(ACKS)
             write_bridge_status("thinking", ack)
             append_log(f"[{datetime.now().strftime('%H:%M:%S')}] ACK: {ack}")
             speak_ack(ack)
 
-            result = react_chat(model, messages, selected_tools, route=resolved_route, persona=persona)
-            self._json_response(result)
-
-            tool_names = [t["function"]["name"] for t in selected_tools]
-            runtime_mode = write_runtime_mode(resolved_route, model, selected_tools)
-            persona = runtime_mode.get("persona")
-
-            try:
-                sync_orpheus_for_route(resolved_route, model)
-            except Exception as e:
-                emit_event("warning", "Orpheus sync failed", {"route": resolved_route, "model": model, "error": str(e)})
-
-            debug(f"Runtime mode: {runtime_mode}")
-            debug(
-                f"POST /api/chat requested_model={requested_model!r} requested_route={requested_route!r} source={source!r} "
-                f"resolved_route={resolved_route!r} resolved_model={model!r} persona={persona!r} stream={stream} "
-                f"tool_count={len(selected_tools)} user={user_text[:140]!r}"
-            )
-            debug(f"Selected {len(selected_tools)} tools: {tool_names}")
-
-            emit_event(
-                "status",
-                "Incoming chat request",
-                {
-                    "requested_model": requested_model,
-                    "requested_route": requested_route,
-                    "source": source,
-                    "resolved_route": resolved_route,
-                    "resolved_model": model,
-                    "stream": stream,
-                    "tool_count": len(selected_tools),
-                    "tools": tool_names,
-                    "user_preview": user_text[:140],
-                    "runtime_mode": runtime_mode,
-                },
+            result = react_chat(
+                model,
+                messages,
+                selected_tools,
+                route=resolved_route,
+                persona=persona,
             )
 
-            if stream:
-                self.send_response(200)
-                self.send_header("Content-Type", "application/x-ndjson")
-                self.send_header("Cache-Control", "no-cache")
-                self.send_header("Connection", "keep-alive")
-                self.send_header("Access-Control-Allow-Origin", "*")
-                self.end_headers()
-                stream_direct_chat(self, model, messages, selected_tools=selected_tools, route=resolved_route, persona=persona)
-                return
-
-            if is_simple_direct_chat(user_text, selected_tools, resolved_route):
-                try:
-                    data = call_ollama_once(model=model, messages=messages, route=resolved_route, persona=persona, tools=None, stream=False)
-                    self._json_response(data)
-                    return
-                except Exception as e:
-                    self._json_response({"model": model, "created_at": now_iso(), "message": {"role": "assistant", "content": f"Error calling Ollama: {e}"}, "done": True})
-                    return
-
-            result = react_chat(model, messages, selected_tools, route=resolved_route, persona=persona)
             self._json_response(result)
             return
+        
 
     def do_GET(self) -> None:
         path = urlparse(self.path).path
@@ -3550,14 +5002,27 @@ class ReactHandler(BaseHTTPRequestHandler):
         self.send_header("Access-Control-Allow-Headers", "Content-Type")
         self.end_headers()
 
-    def _json_response(self, data: Dict[str, Any], code: int = 200) -> None:
-        body = json.dumps(data, ensure_ascii=False).encode("utf-8")
-        self.send_response(code)
-        self.send_header("Content-Type", "application/json; charset=utf-8")
-        self.send_header("Access-Control-Allow-Origin", "*")
-        self.send_header("Content-Length", str(len(body)))
-        self.end_headers()
-        self.wfile.write(body)
+    def _json_response(self, payload: Dict[str, Any], code: int = 200) -> None:
+        try:
+            data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+            self.send_response(code)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
+        except BrokenPipeError:
+            emit_event(
+                "warning",
+                "Client disconnected before response could be sent",
+                {"code": code},
+            )
+        except Exception as e:
+            emit_event(
+                "warning",
+                "Failed sending JSON response",
+                {"error": str(e), "code": code},
+            )
 
     def _write_sse_json(self, data: Dict[str, Any]) -> None:
         line = json.dumps(data, ensure_ascii=False) + "\n"
