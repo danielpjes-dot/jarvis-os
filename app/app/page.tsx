@@ -524,6 +524,8 @@ export default function JarvisPage() {
   const [history, setHistory] = useState<HistoryEntry[]>([]);
   const [reactServerReady, setReactServerReady] = useState(false);
   const [reactServerHealth, setReactServerHealth] = useState<any>(null);
+  const [ollamaServerReady, setOllamaServerReady] = useState(false);
+  const [ollamaServerHealth, setOllamaServerHealth] = useState<any>(null);
   const [pendingApprovals, setPendingApprovals] = useState(0);
   const [brain, setBrain] = useState("claude");
   const [liveBrain, setLiveBrain] = useState("unknown");
@@ -562,12 +564,24 @@ export default function JarvisPage() {
   const parlourWsRef = useRef<WebSocket | null>(null);
   const vadRef = useRef<any>(null);
   const [cameraEnabled, setCameraEnabled] = useState(true);
+  const [micEnabled, setMicEnabled] = useState(true);
+  const [muted, setMuted] = useState(false);
+
+const micEnabledRef = useRef(true);
+const mutedRef = useRef(false);
   const [parlourConnected, setParlourConnected] = useState(false);
   const ambientPhaseRef = useRef(0);
   const BAR_COUNT = 40;
   const BAR_GAP = 3;
   const [micActive, setMicActive] = useState(false);
+  const waveformModeRef = useRef<"idle" | "user" | "ai">("idle");
+useEffect(() => {
+  micEnabledRef.current = micEnabled;
+}, [micEnabled]);
 
+useEffect(() => {
+  mutedRef.current = muted;
+}, [muted]);
   useEffect(() => {
     stateRef.current = state;
   }, [state]);
@@ -665,7 +679,7 @@ useEffect(() => {
 
     async function checkLocalAiServices() {
       try {
-        const kokoro = await fetch("http://127.0.0.1:5100/health", {
+        const kokoro = await fetch("http://127.0.0.1:5100/tts/health", {
           cache: "no-store",
         });
         if (active) setKokoroReady(kokoro.ok);
@@ -754,73 +768,82 @@ useEffect(() => {
     };
   }, [openTab]);
 
-  useEffect(() => {
-    let active = true;
+ useEffect(() => {
+  let active = true;
 
-    async function poll() {
-      try {
-        const res = await fetch("http://localhost:4000/api/state");
-        const data = await res.json();
+async function pollBrain() {
+  try {
+    const res = await fetch("http://127.0.0.1:11434/api/ps", {
+      cache: "no-store",
+    });
 
-        if (!active) return;
+    const data = await res.json();
+    if (!active) return;
 
-        if (data.brain) setBrain(data.brain);
+    const models = data?.models || [];
+    const activeModel = models[0] || null;
 
-        const validStates = ["standby", "thinking", "speaking", "listening"];
-        if (validStates.includes(data.state)) setState(data.state as JarvisState);
+    setOllamaServerReady(res.ok);
+    setOllamaServerHealth(data);
 
-        if (data.emotion) setEmotion(data.emotion);
+    if (activeModel) {
+      const name = activeModel.name || activeModel.model || "unknown";
+      const details = activeModel.details || {};
 
-        if (data.lastOutput && data.lastOutput !== output) {
-          setOutput(data.lastOutput);
-
-          setHistory((h) => {
-            const last = h[h.length - 1];
-            if (last?.role === "jarvis" && last.text === data.lastOutput) {
-              return h;
-            }
-
-            return [
-              ...h,
-              {
-                role: "jarvis",
-                text: data.lastOutput,
-                timestamp: Date.now(),
-              },
-            ];
-          });
-
-          const BROWSER_TTS = false;
-
-          if (BROWSER_TTS && data.lastOutput !== lastSpokenRef.current) {
-            lastSpokenRef.current = data.lastOutput;
-          }
-        }
-      } catch {}
+      setBrain(name);
+      setLiveModel(
+        `${details.family || ""} ${details.parameter_size || ""}`.trim() || name
+      );
+    } else {
+      setBrain("unknown");
+      setLiveModel(null);
     }
+  } catch {
+    if (!active) return;
 
-    poll();
-    const id = setInterval(poll, 500);
+    setOllamaServerReady(false);
+    setOllamaServerHealth(null);
+    setBrain("unknown");
+    setLiveModel(null);
+  }
+}
 
-    return () => {
-      active = false;
-      clearInterval(id);
-    };
-  }, [output]);
+  pollBrain();
+  const id = setInterval(pollBrain, 5000);
 
-  const handleSend = useCallback(async (text: string) => {
-    setHistory((h) => [...h, { role: "user", text, timestamp: Date.now() }]);
+  return () => {
+    active = false;
+    clearInterval(id);
+  };
+}, []);
 
-    try {
-      await fetch("http://localhost:4000/api/input", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ text }),
-      });
-    } catch {
-      setOutput("Connection error. Is the bridge server running?");
-    }
-  }, []);
+const handleSend = useCallback(async (text: string) => {
+  setHistory((h) => [...h, { role: "user", text, timestamp: Date.now() }]);
+  setState("thinking");
+
+  try {
+    const res = await fetch("http://127.0.0.1:7900/api/chat", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        source: "react",
+        route: "live",
+        messages: [{ role: "user", content: text }],
+        stream: false,
+      }),
+    });
+
+    const data = await res.json();
+    const reply = data?.message?.content || "";
+
+    setOutput(reply);
+    setHistory((h) => [...h, { role: "jarvis", text: reply, timestamp: Date.now() }]);
+    setState("standby");
+  } catch {
+    setOutput("Connection error. Is the ReAct server running on port 7900?");
+    setState("standby");
+  }
+}, []);
 
   function audioBufferToWav(buffer: AudioBuffer): Blob {
     const numChannels = 1;
@@ -1018,16 +1041,20 @@ const ensureAudioCtx = useCallback(() => {
 
 
   // ── Waveform ──
-  const getStateColor = useCallback(() => {
-    const colors: Record<string, string> = {
-      listening: "#4ade80",
-      thinking: "#f59e0b",
-      speaking: "#818cf8",
-      standby: "#3a3d46",
-      asking: "#f0c040",
-    };
-    return colors[stateRef.current] || "#3a3d46";
-  }, []);
+const getStateColor = useCallback(() => {
+  if (waveformModeRef.current === "user") return "#4ade80"; // green mic
+  if (waveformModeRef.current === "ai") return "#f59e0b";   // orange AI
+
+  const colors: Record<string, string> = {
+    listening: "#4ade80",
+    thinking: "#f59e0b",
+    speaking: "#f59e0b",
+    standby: "#3a3d46",
+    asking: "#f0c040",
+  };
+
+  return colors[stateRef.current] || "#3a3d46";
+}, []);
 
   const drawWaveform = useCallback(() => {
     const canvas = waveformCanvasRef.current;
@@ -1107,7 +1134,25 @@ const ensureAudioCtx = useCallback(() => {
     streamSourcesRef.current = [];
     streamNextTimeRef.current = 0;
   }, []);
+  const playAudioBlob = useCallback(async (base64Audio: string, mime = "audio/wav") => {
+    if (mutedRef.current) return;
 
+    stopPlayback();
+    ensureAudioCtx();
+
+  const audio = new Audio(`data:${mime};base64,${base64Audio}`);
+  waveformModeRef.current = "ai";
+  setState("speaking");
+  setAiSpeaking(true);
+
+  audio.onended = () => {
+    waveformModeRef.current = "idle";
+    setState("listening");
+    setAiSpeaking(false);
+  };
+
+  await audio.play();
+}, [stopPlayback, ensureAudioCtx]);
   const startStreamPlayback = useCallback((_sampleRate = 24000) => {
     stopPlayback();
     ensureAudioCtx();
@@ -1118,6 +1163,7 @@ const ensureAudioCtx = useCallback(() => {
 
   const queueAudioChunk = useCallback((base64Pcm: string) => {
     ensureAudioCtx();
+    if (mutedRef.current) return;
     const ctx = audioCtxRef.current!;
     const analyser = analyserRef.current!;
 
@@ -1184,17 +1230,23 @@ const ensureAudioCtx = useCallback(() => {
     return btoa(bin);
   }, []);
 
-  // ── Parlour WebSocket ──
+
   const connectParlour = useCallback(() => {
-    const ws = new WebSocket("ws://127.0.0.1:8000/ws");
+    const ws = new WebSocket("ws://127.0.0.1:7900/ws");
     parlourWsRef.current = ws;
 
-    ws.onopen = () => setParlourConnected(true);
+    
+    ws.onopen = () => {
+      console.log("[WS] connected");
+      setParlourConnected(true);
+    };
+
     ws.onclose = () => {
       setParlourConnected(false);
       setTimeout(connectParlour, 3000);
     };
     ws.onmessage = ({ data }) => {
+      console.log("[WS] message", data);
       const msg = JSON.parse(data);
 
       if (msg.type === "text") {
@@ -1214,7 +1266,32 @@ const ensureAudioCtx = useCallback(() => {
             return copy;
           });
         }
-      } else if (msg.type === "audio_start") {
+      } else if (msg.type === "tts_blob") {
+          if (ignoreIncomingAudioRef.current) {
+            ignoreIncomingAudioRef.current = false;
+            return;
+          }
+
+          playAudioBlob(msg.audio, msg.mime || "audio/wav");
+
+        } else if (msg.type === "tts") {
+          console.log("[TTS] received", msg.audio?.length);
+
+          if (ignoreIncomingAudioRef.current) {
+            ignoreIncomingAudioRef.current = false;
+            return;
+          }
+
+          waveformModeRef.current = "ai";
+
+          startStreamPlayback(msg.sample_rate || 24000);
+
+          for (const chunk of msg.audio || []) {
+            if (chunk?.audio) {
+              queueAudioChunk(chunk.audio);
+            }
+          }
+        } else if (msg.type === "audio_start") {
         if (ignoreIncomingAudioRef.current) return;
         startStreamPlayback(msg.sample_rate || 24000);
       } else if (msg.type === "audio_chunk") {
@@ -1229,89 +1306,157 @@ const ensureAudioCtx = useCallback(() => {
       }
     };
   }, [startStreamPlayback, queueAudioChunk, stopPlayback]);
-
   // ── VAD init ──
   useEffect(() => {
     let mediaStream: MediaStream | null = null;
+    let audioStream: MediaStream | null = null;
+    let videoStream: MediaStream | null = null;
 
     async function initVAD() {
-     if (vadRef.current) return;
-      try {
-        mediaStream = await navigator.mediaDevices.getUserMedia({
-          video: { width: 640, height: 480, facingMode: "user" },
-          audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true },
-        });
-        if (videoRef.current) videoRef.current.srcObject = mediaStream;
-        alwaysOnRef.current = true;
-        setMicActive(true);
-        setState("listening");
-        connectParlour();
-        for (let i = 0; i < 50; i++) {
-          // @ts-ignore
-          if (MicVAD) break;
-          await new Promise((r) => setTimeout(r, 100));
-        }
-        // @ts-ignore — vad loaded via CDN script tag
-        const myvad = await MicVAD.new({
-          getStream: async () => new MediaStream(mediaStream!.getAudioTracks()),
-          positiveSpeechThreshold: 0.5,
-          negativeSpeechThreshold: 0.25,
-          redemptionMs: 600,
-          minSpeechMs: 300,
-          preSpeechPadMs: 300,
-          onnxWASMBasePath: "/vad/",
-          baseAssetPath: "/vad/",
-          onSpeechStart: () => {
-            const BARGE_IN_GRACE_MS = 800;
-            if (stateRef.current === "speaking") {
-              if (Date.now() - speakingStartedAtRef.current < BARGE_IN_GRACE_MS) return;
-              stopPlayback();
-              ignoreIncomingAudioRef.current = true;
-              parlourWsRef.current?.send(JSON.stringify({ type: "interrupt" }));
-              setState("listening");
-            }
-          },
-          onSpeechEnd: (audio: Float32Array) => {
-            if (stateRef.current !== "listening") return;
-            if (!parlourWsRef.current || parlourWsRef.current.readyState !== WebSocket.OPEN) {
-              // fallback to react_server text path
-              return;
-            }
-            const wavBase64 = float32ToWavBase64(audio);
-            const imageBase64 = captureFrame();
-            setState("thinking");
-            setHistory(h => [...h, { role: "user", text: "…", timestamp: Date.now() }]);
-            const payload: any = { audio: wavBase64 };
-            if (imageBase64) payload.image = imageBase64;
-            parlourWsRef.current.send(JSON.stringify(payload));
+  if (vadRef.current) return;
 
-            // Connect mic to analyser for waveform during processing
-            ensureAudioCtx();
-            if (mediaStream && audioCtxRef.current && analyserRef.current && !micSourceRef.current) {
-              micSourceRef.current = audioCtxRef.current.createMediaStreamSource(mediaStream);
-            }
-            try { micSourceRef.current?.connect(analyserRef.current!); } catch {}
-          },
-        });
+  let audioStream: MediaStream | null = null;
+  let videoStream: MediaStream | null = null;
 
-        vadRef.current = myvad;
-        myvad.start();
+  try {
+    // 1. Mic first. This is required.
+    audioStream = await navigator.mediaDevices.getUserMedia({
+      audio: {
+        echoCancellation: true,
+        noiseSuppression: true,
+        autoGainControl: true,
+      },
+    });
 
-        // Sync VAD threshold with speaking state
-        const syncVad = () => {
-          if (vadRef.current) {
-            vadRef.current.setOptions?.({
-              positiveSpeechThreshold: stateRef.current === "speaking" ? 0.92 : 0.5
-            });
-          }
-          setTimeout(syncVad, 1000);
-        };
-        syncVad();
+    // 2. Camera optional. If denied/busy, continue audio-only.
+    try {
+      videoStream = await navigator.mediaDevices.getUserMedia({
+        video: { width: 640, height: 480, facingMode: "user" },
+      });
 
-      } catch (e) {
-        console.warn("VAD/camera init failed:", e);
+      if (videoRef.current) {
+        videoRef.current.srcObject = videoStream;
       }
+    } catch (e) {
+      console.warn("Camera denied/busy, continuing audio-only:", e);
     }
+
+    mediaStream = new MediaStream([
+      ...audioStream.getAudioTracks(),
+      ...(videoStream ? videoStream.getVideoTracks() : []),
+    ]);
+
+    ensureAudioCtx();
+
+    if (audioCtxRef.current?.state === "suspended") {
+      await audioCtxRef.current.resume();
+    }
+
+    if (audioCtxRef.current && analyserRef.current) {
+      micSourceRef.current =
+        audioCtxRef.current.createMediaStreamSource(audioStream);
+
+      micSourceRef.current.connect(analyserRef.current);
+    }
+
+    alwaysOnRef.current = true;
+    setMicActive(true);
+    setState("listening");
+
+    connectParlour();
+
+    const myvad = await MicVAD.new({
+      getStream: async () =>
+        new MediaStream(audioStream!.getAudioTracks()),
+
+      positiveSpeechThreshold: 0.5,
+      negativeSpeechThreshold: 0.25,
+      redemptionMs: 600,
+      minSpeechMs: 300,
+      preSpeechPadMs: 300,
+      onnxWASMBasePath: "/vad/",
+      baseAssetPath: "/vad/",
+
+      onSpeechStart: () => {
+        if (!micEnabledRef.current) return;
+        const BARGE_IN_GRACE_MS = 800;
+        console.log("[VAD] speech start");
+
+        waveformModeRef.current = "user";
+
+        if (stateRef.current === "speaking") {
+          if (Date.now() - speakingStartedAtRef.current < BARGE_IN_GRACE_MS) {
+            return;
+          }
+
+          stopPlayback();
+          ignoreIncomingAudioRef.current = true;
+          parlourWsRef.current?.send(JSON.stringify({ type: "interrupt" }));
+          setState("listening");
+        }
+      },
+
+onSpeechEnd: (audio: Float32Array) => {
+  if (!micEnabledRef.current) {
+    waveformModeRef.current = "idle";
+    setState("standby");
+    return;
+  }
+
+  console.log("[VAD] speech end", audio.length);
+
+  const ws = parlourWsRef.current;
+  console.log("[WS] exists", !!ws, "state", ws?.readyState);
+
+  if (!ws || ws.readyState !== WebSocket.OPEN) {
+    console.log("[WS] not connected, cannot send audio");
+    setState("listening");
+    return;
+  }
+
+  const wavBase64 = float32ToWavBase64(audio);
+  console.log("[WS] wav length", wavBase64.length);
+
+  const imageBase64 = captureFrame();
+
+  setState("thinking");
+
+  setHistory((h) => [
+    ...h,
+    { role: "user", text: "…", timestamp: Date.now() },
+  ]);
+
+  ws.send(
+    JSON.stringify({
+      type: "audio",
+      audio: wavBase64,
+      ...(imageBase64 ? { image: imageBase64 } : {}),
+    })
+  );
+
+  console.log("[WS] sent audio");
+},
+    });
+
+    vadRef.current = myvad;
+    myvad.start();
+
+    const syncVad = () => {
+      if (vadRef.current) {
+        vadRef.current.setOptions?.({
+          positiveSpeechThreshold:
+            stateRef.current === "speaking" ? 0.92 : 0.5,
+        });
+      }
+
+      setTimeout(syncVad, 1000);
+    };
+
+    syncVad();
+  } catch (e) {
+    console.warn("VAD/mic init failed:", e);
+  }
+}
 
     initVAD();
 
@@ -1337,16 +1482,70 @@ const ensureAudioCtx = useCallback(() => {
   }, [connectParlour, float32ToWavBase64, captureFrame, stopPlayback, ensureAudioCtx]);
 
   // Disconnect mic from analyser when not listening
-  useEffect(() => {
-    if (state !== "listening" && micSourceRef.current && analyserRef.current) {
-      try { micSourceRef.current.disconnect(analyserRef.current); } catch {}
-    }
-  }, [state]);
-
-  function handleVoiceToggle() {
-    // VAD is always-on now — toggle camera instead
-    setCameraEnabled(c => !c);
+  //useEffect(() => {
+  //  if (state !== "listening" && micSourceRef.current && analyserRef.current) {
+  //    try { micSourceRef.current.disconnect(analyserRef.current); } catch {}
+  //  }
+  //}, [state]);
+  function setAiSpeaking(isSpeaking: boolean) {
+  if (isSpeaking) {
+    vadRef.current?.pause?.();
+    waveformModeRef.current = "ai";
+    setState("speaking");
+    return;
   }
+
+  waveformModeRef.current = "idle";
+
+  if (micEnabledRef.current) {
+    vadRef.current?.start?.();
+    setMicActive(true);
+    setState("listening");
+  } else {
+    setMicActive(false);
+    setState("standby");
+  }
+}
+function handleVoiceToggle() {
+  setMicEnabled((current) => {
+    const next = !current;
+
+    if (next) {
+      vadRef.current?.start?.();
+      setMicActive(true);
+      setState("listening");
+    } else {
+      vadRef.current?.pause?.();
+      setMicActive(false);
+
+      waveformModeRef.current = "idle";
+      setState("standby");
+
+      if (stateRef.current === "speaking") {
+        stopPlayback();
+      }
+    }
+
+    return next;
+  });
+}
+function handleCameraToggle() {
+  setCameraEnabled((enabled) => !enabled);
+}
+
+function handleMuteToggle() {
+  setMuted((m) => {
+    const next = !m;
+
+    if (next) {
+      stopPlayback();
+      parlourWsRef.current?.send(JSON.stringify({ type: "interrupt" }));
+      setState(micEnabledRef.current ? "listening" : "standby");
+    }
+
+    return next;
+  });
+}
 
   const isProcessing = state === "thinking" || state === "speaking";
 const activeBrain =
@@ -1611,8 +1810,177 @@ const activeModel =
                     : "VAD/parlor offline or camera muted"}{" "}
                   &middot; Type below for text
                 </p>
+                  <div className="absolute bottom-3 left-15 flex gap-2 z-10">
+<button
+  onClick={handleMuteToggle}
+  title={muted ? "Voice Output Muted" : "Voice Output Enabled"}
+  className={`
+    relative w-10 h-10 rounded-full border
+    flex items-center justify-center
+    transition-all duration-300
+    ${
+      muted
+        ? "border-red-400/60 bg-red-500/10 text-red-400"
+        : "border-green-400/60 bg-green-500/10 text-green-400 shadow-[0_0_12px_rgba(74,222,128,0.25)]"
+    }
+  `}
+>
+  {muted ? (
+    <>
+      {/* speaker */}
+      <svg
+        width="16"
+        height="16"
+        viewBox="0 0 24 24"
+        fill="none"
+        stroke="currentColor"
+        strokeWidth="2"
+      >
+        <polygon points="11 5 6 9 2 9 2 15 6 15 11 19" />
+        <line x1="22" y1="2" x2="2" y2="22" />
+      </svg>
 
+      <span className="absolute -top-1 -right-1 w-2 h-2 rounded-full bg-red-400" />
+    </>
+  ) : (
+    <>
+      {/* speaker on */}
+      <svg
+        width="16"
+        height="16"
+        viewBox="0 0 24 24"
+        fill="none"
+        stroke="currentColor"
+        strokeWidth="2"
+      >
+        <polygon points="11 5 6 9 2 9 2 15 6 15 11 19" />
+        <path d="M15.5 8.5a5 5 0 0 1 0 7" />
+        <path d="M18.5 5.5a9 9 0 0 1 0 13" />
+      </svg>
+
+      <span className="absolute -top-1 -right-1 w-2 h-2 rounded-full bg-green-400 animate-pulse" />
+    </>
+  )}
+</button>
+
+<button
+  onClick={handleCameraToggle}
+  title={cameraEnabled ? "Camera Enabled" : "Camera Disabled"}
+  className={`
+    relative w-10 h-10 rounded-full border
+    flex items-center justify-center
+    transition-all duration-300
+    ${
+      cameraEnabled
+        ? "border-green-400/60 bg-green-500/10 text-green-400 shadow-[0_0_12px_rgba(74,222,128,0.25)]"
+        : "border-red-400/60 bg-red-500/10 text-red-400"
+    }
+  `}
+>
+  {cameraEnabled ? (
+    <>
+      <svg
+        width="16"
+        height="16"
+        viewBox="0 0 24 24"
+        fill="none"
+        stroke="currentColor"
+        strokeWidth="2"
+        strokeLinecap="round"
+        strokeLinejoin="round"
+      >
+        <path d="M23 7l-7 5 7 5V7z" />
+        <rect x="1" y="5" width="15" height="14" rx="2" ry="2" />
+      </svg>
+
+      <span className="absolute -top-1 -right-1 w-2 h-2 rounded-full bg-green-400 animate-pulse" />
+    </>
+  ) : (
+    <>
+      <svg
+        width="16"
+        height="16"
+        viewBox="0 0 24 24"
+        fill="none"
+        stroke="currentColor"
+        strokeWidth="2"
+        strokeLinecap="round"
+        strokeLinejoin="round"
+      >
+        <path d="M23 7l-7 5 7 5V7z" />
+        <rect x="1" y="5" width="15" height="14" rx="2" ry="2" />
+        <line x1="22" y1="2" x2="2" y2="22" />
+      </svg>
+
+      <span className="absolute -top-1 -right-1 w-2 h-2 rounded-full bg-red-400" />
+    </>
+  )}</button>
+  <button
+   type="button"
+  onClick={handleVoiceToggle}
+  title={micEnabled ? "Microphone Enabled" : "Microphone Disabled"}
+  className={`
+    relative w-10 h-10 rounded-full border
+    flex items-center justify-center
+    transition-all duration-300
+    ${
+      micEnabled
+        ? "border-green-400/60 bg-green-500/10 text-green-400 shadow-[0_0_12px_rgba(74,222,128,0.25)]"
+        : "border-red-400/60 bg-red-500/10 text-red-400"
+    }
+  `}
+>
+  {micEnabled ? (
+    <>
+      <svg
+        width="16"
+        height="16"
+        viewBox="0 0 24 24"
+        fill="none"
+        stroke="currentColor"
+        strokeWidth="2"
+        strokeLinecap="round"
+        strokeLinejoin="round"
+      >
+        <path d="M12 1a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3z" />
+        <path d="M19 10v2a7 7 0 0 1-14 0v-2" />
+        <line x1="12" y1="19" x2="12" y2="23" />
+        <line x1="8" y1="23" x2="16" y2="23" />
+      </svg>
+
+      <span className="absolute -top-1 -right-1 w-2 h-2 rounded-full bg-green-400 animate-pulse" />
+    </>
+  ) : (
+    <>
+      <svg
+        width="16"
+        height="16"
+        viewBox="0 0 24 24"
+        fill="none"
+        stroke="currentColor"
+        strokeWidth="2"
+        strokeLinecap="round"
+        strokeLinejoin="round"
+      >
+        <path d="M12 1a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3z" />
+        <path d="M19 10v2a7 7 0 0 1-14 0v-2" />
+        <line x1="12" y1="19" x2="12" y2="23" />
+        <line x1="8" y1="23" x2="16" y2="23" />
+
+        {/* disable slash */}
+        <line x1="22" y1="2" x2="2" y2="22" />
+      </svg>
+
+      <span className="absolute -top-1 -right-1 w-2 h-2 rounded-full bg-red-400" />
+    </>
+  )}
+
+</button>
+       
+      
+</div>
                 <div className="max-w-xl mx-auto">
+
                   <InputBar
                     onSend={handleSend}
                     disabled={isProcessing}
@@ -1765,12 +2133,10 @@ const activeModel =
             <div className="p-3 space-y-2">
               {[
                 { name: "NEXT.JS SERVER", status: true },
-                { name: "BRIDGE (4000)", status: true },
                 { name: "REACT SERVER (7900)", status: reactServerReady },
                 { name: "OLLAMA", status: Boolean(reactServerHealth?.ollama_ready) },
                 { name: "LLAMA.CPP (8081)", status: llamaCppReady },
                 { name: "KOKORO TTS (5100)", status: kokoroReady },
-                { name: "PARLOR WS (8000)", status: parlourConnected },
               ].map((conn) => (
                 <div key={conn.name} className="flex items-center gap-2">
                   <span

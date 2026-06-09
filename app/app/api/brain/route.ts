@@ -27,11 +27,11 @@ export async function GET() {
 
     let brain = "unknown";
 
-    if (modelName?.includes("qwen3-coder")) brain = "ollama_code";
-    else if (modelName?.includes("qwen3:8b")) brain = "ollama_fast";
-    else if (modelName?.includes("qwen3:14b")) brain = "ollama_reason";
-    else if (modelName?.includes("gemma")) brain = "ollama_deep";
-
+    //if (modelName?.includes("qwen3-coder")) brain = "ollama_code";
+    //else if (modelName?.includes("qwen3:8b")) brain = "ollama_fast";
+    //else if (modelName?.includes("qwen3:14b")) brain = "ollama_reason";
+    //else if (modelName?.includes("gemma")) brain = "ollama_deep";
+    brain=modelName
     return NextResponse.json({
       ok: true,
       brain,

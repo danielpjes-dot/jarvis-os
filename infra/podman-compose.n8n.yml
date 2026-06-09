@@ -1,0 +1,74 @@
+# JARVIS OS — n8n automation hub
+# Location: /mnt/e/coding/jarvis-os/infra/podman-compose.n8n.yml
+#
+# Usage:
+#   podman-compose -f infra/podman-compose.n8n.yml up -d
+#   podman-compose -f infra/podman-compose.n8n.yml down
+#
+# Or managed via: scripts/jarvis.sh n8n:start / n8n:stop
+
+version: "3.8"
+
+networks:
+  jarvis-net:
+    # Shared network — other JARVIS containers can join this
+    # to reach n8n at http://jarvis-n8n:5678 without going through host
+    driver: bridge
+    name: jarvis-net
+
+volumes:
+  n8n_data:
+    # Rootless Podman: stored at ~/.local/share/containers/storage/volumes/n8n_data
+    name: n8n_data
+
+services:
+  n8n:
+    image: docker.io/n8nio/n8n:latest
+    container_name: jarvis-n8n
+    restart: unless-stopped
+    networks:
+      - jarvis-net
+    ports:
+      # Accessible at http://localhost:5678 from WSL2 host and Windows browser
+      - "127.0.0.1:5678:5678"
+    volumes:
+      - n8n_data:/home/node/.n8n:Z
+      # Mount JARVIS vault read-only so n8n workflows can read Obsidian notes
+      - /mnt/d/Jarvis_vault:/jarvis_vault:ro,Z
+    environment:
+      # ── Auth ──────────────────────────────────────────────────────────────
+      N8N_BASIC_AUTH_ACTIVE: "true"
+      N8N_BASIC_AUTH_USER: "${N8N_USER:-jarvis}"
+      N8N_BASIC_AUTH_PASSWORD: "${N8N_PASSWORD:?N8N_PASSWORD must be set in .env}"
+
+      # ── URLs ──────────────────────────────────────────────────────────────
+      # WEBHOOK_URL must be reachable from the outside if you use webhooks
+      # from external services (Telegram, GitHub, etc.)
+      # For local-only: http://localhost:5678 is fine.
+      WEBHOOK_URL: "${N8N_WEBHOOK_URL:-http://localhost:5678}"
+      N8N_EDITOR_BASE_URL: "${N8N_EDITOR_URL:-http://localhost:5678}"
+
+      # ── JARVIS API bridge ─────────────────────────────────────────────────
+      # The WSL2 host gateway so n8n workflows can POST to JARVIS FastAPI
+      # Set automatically by jarvis.sh; override here if needed
+      JARVIS_API_URL: "${JARVIS_API_URL:-http://172.18.0.1:8000}"
+
+      # ── Execution ─────────────────────────────────────────────────────────
+      EXECUTIONS_PROCESS: "main"
+      EXECUTIONS_DATA_SAVE_ON_ERROR: "all"
+      EXECUTIONS_DATA_SAVE_ON_SUCCESS: "last"
+      EXECUTIONS_DATA_MAX_AGE: "168"       # 7 days retention
+      N8N_LOG_LEVEL: "info"
+
+      # ── Timezone ──────────────────────────────────────────────────────────
+      GENERIC_TIMEZONE: "Europe/Tallinn"
+      TZ: "Europe/Tallinn"
+
+    # Rootless Podman: no special user needed; container runs as node (uid 1000)
+    # If permission errors on volume: podman unshare chown -R 1000:1000 ~/.n8n
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:5678/healthz || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 20s
