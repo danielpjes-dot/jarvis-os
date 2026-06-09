@@ -143,15 +143,27 @@ useEffect(() => {
     }
 
   async function openFile(path: string) {
+    const fullPath = `${rootDir}/${path}`;
     setActiveFile(path);
+    setEditorText("Loading file...\n" + fullPath);
 
-    await fetch("http://localhost:4000/api/input", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ text: `read file ${rootDir}/${path}` }),
-    });
+    try {
+      const res = await fetch(
+        `/api/coding/read-file?path=${encodeURIComponent(fullPath)}`,
+        { cache: "no-store" }
+      );
 
-    setEditorText(`// Requested file through JARVIS:\n// ${path}\n\nWaiting for coding skill response...`);
+      const data = await res.json();
+
+      if (!data.ok) {
+        setEditorText(`Failed to read file:\n${data.error || "Unknown error"}`);
+        return;
+      }
+
+      setEditorText(data.content || "");
+    } catch (e) {
+      setEditorText(`Failed to read file:\n${String(e)}`);
+    }
   }
 
   function sendTerminalInput() {

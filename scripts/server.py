@@ -561,6 +561,33 @@ class JarvisHandler(http.server.SimpleHTTPRequestHandler):
                 self._json_response({"status": "error", "message": str(e)}, 500)
 
             return
+        
+        if path == "/tts/speak":
+            data = read_json_body(self)
+
+            try:
+                kokoro = requests.post("http://127.0.0.1:5100/tts/speak",
+            json={
+                "text": text,
+                "voice": voice,
+                "play": False
+            },
+            timeout=60, ).json()
+
+                broadcast_ws({
+                    "type": "tts_audio",
+                    "text": text,
+                    "voice": kokoro["voice"],
+                    "sample_rate": kokoro["sample_rate"],
+                    "format": kokoro["format"],
+                    "chunks": kokoro["chunks"],
+                })
+
+            except Exception as e:
+                log(f"Kokoro custom speak failed: {e}")
+                self._json_response({"status": "error", "message": str(e)}, 500)
+
+            return
 
         if path == "/api/coding/write-file":
             data = read_json_body(self)

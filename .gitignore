@@ -28,6 +28,8 @@ certs/
 # Env
 .env
 .env.local
+exported*
+netum*
 
 # Runtime state files
 input.txt
@@ -44,6 +46,8 @@ mempalace.yaml
 bridge/
 orpheus_env/
 
+# Jarvis OS sqllite data
+data/
 # Next.js
 .next/
 app/.next/
@@ -64,3 +68,4 @@ config/plex.json
 config/cloud_llm.json
 config/twilio.json
 config/email.json
+config/*.json

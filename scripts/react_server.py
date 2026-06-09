@@ -37,6 +37,10 @@ import threading
 import time
 import traceback
 import uuid
+import asyncio
+import numpy as np
+import base64
+import wave
 from dataclasses import dataclass, field
 from datetime import datetime,timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -48,13 +52,16 @@ import urllib.error
 import urllib.request
 PROJECT_ROOT = Path(__file__).parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
+import tts
 from difflib import SequenceMatcher
+from memory.redis_memory import *
 from scripts.context_router import build_context_pack
 from scripts.chat_context import today_log_path, log_chat_event
-from scripts.agent_loop import run_agent_loop
+from scripts.agent_loop_core import run_agent_loop
 from services.communications_gateway import CommunicationsGateway
 from services.telegram_gateway import TelegramGateway
 from scripts.jarvis_history import make_plan_id, save_json, append_event, plan_dir
+import memory.memory_router   
 from skills.loader import (  # type: ignore
     get_all_keywords,
     get_all_skill_meta,
@@ -76,7 +83,7 @@ from scripts.model_config import (  # type: ignore
 TELEGRAM_MAX_MESSAGE_CHARS = 3500
 TELEGRAM_NOTIFY_CHAT_ID = os.environ.get("JARVIS_TELEGRAM_CHAT_ID", "6987301428")
 OLLAMA_HOST = os.environ.get("OLLAMA_HOST", "http://127.0.0.1:11434")
-KOKORO_HOST = os.environ.get("KOKORO_HOST", "http://127.0.0.1:8081")
+KOKORO_HOST = os.environ.get("KOKORO_HOST", "http://127.0.0.1:5100")
 KOKORO_TIMEOUT_SEC = int(os.environ.get("KOKORO_TIMEOUT_SEC", "5"))
 KOKORO_VOICE = os.environ.get("KOKORO_VOICE", "bm_george")
 PORT = (
@@ -86,7 +93,6 @@ PORT = (
 )
 TELEGRAM_ENABLED = int(os.environ.get("JARVIS_TELEGRAM_ENABLED", "1"))
 VALID_ROUTES = {"live", "fast", "tools", "reason", "code", "deep"}
-
 
 
 MODE_PROFILE_PATH = PROJECT_ROOT / "config" / "mode_profiles.json"
@@ -101,7 +107,7 @@ TOOL_RESULT_CHAR_LIMIT = int(os.environ.get("JARVIS_TOOL_RESULT_CHAR_LIMIT", "12
 ENABLE_TTS_ACK = os.environ.get("JARVIS_ENABLE_TTS_ACK", "1") == "1"
 ENABLE_STREAM_STATUS = os.environ.get("JARVIS_ENABLE_STREAM_STATUS", "1") == "1"
 DEBUG = os.environ.get("JARVIS_DEBUG", "1") == "1"
-
+HF_TOKEN = os.environ.get("HUGGINGFACEHUB_API_TOKEN", "")
 VAULT_DIR = Path(
     os.environ.get(
         "JARVIS_VAULT_DIR",
@@ -258,34 +264,474 @@ ACKS = ["On it.", "Working.", "Understood.", "Processing now.", "Let me handle t
 #------------------------------------------------------------------------------
 # Kokoro
 #------------------------------------------------------------------------------
-def is_kokoro_running() -> bool:
-    if not KOKORO_ENABLED:
-        return False
-    return http_get_ok_simple(f"{KOKORO_HOST}/health", timeout=2)
+def _inline_chat(body: dict) -> dict:
+    captured: dict = {}
 
+    class FakeHandler(ReactHandler):
+        def __init__(self):
+            pass  # skip BaseHTTPRequestHandler init
 
-def speak_kokoro(text: str, voice: str | None = None) -> bool:
-    if not KOKORO_ENABLED:
-        return False
+        def _json_response(self, payload: dict, code: int = 200) -> None:
+            captured.update(payload)
 
+        def _write_sse_json(self, data: dict) -> None:
+            pass
+
+        def log_message(self, fmt: str, *args) -> None:
+            pass
+
+    handler = FakeHandler()
+
+    requested_model = body.get("model")
+    requested_route = body.get("route")
+    source = body.get("source", "voice")
+    messages = body.get("messages", [])
+
+    user_text = get_last_user_text(messages)
+    user_text = clean_telegram_prefix(user_text)
+
+    handled, route_override = handler.handle_live_router(
+        body=body,
+        user_text=user_text,
+        requested_model=requested_model,
+        requested_route=requested_route,
+        source=source,
+        messages=messages,
+    )
+
+    if not handled:
+        user_text = body.get("_user_text", user_text)
+        if route_override:
+            requested_route = route_override
+
+        handler.handle_full_pipeline(
+            body=body,
+            user_text=user_text,
+            requested_model=requested_model,
+            requested_route=requested_route,
+            source=source,
+            messages=messages,
+            stream=False,
+        )
+
+    return captured or {"message": {"role": "assistant", "content": ""}, "done": True
+    }
+
+async def speak_via_kokoro(
+    wfile,
+    text: str,
+    voice: str,
+    play: bool,
+    interrupted: asyncio.Event,
+):
+    text = str(text or "").strip()
+    voice=str(voice)
+    if not text or interrupted.is_set():
+        return
+    print(
+    "[KOKORO] voice type=",
+    type(voice),
+    "value=",
+    repr(voice),
+    flush=True,
+        )
+    
+    safe_voice = voice if voice.startswith(("af_", "am_", "bf_", "bm_")) else KOKORO_VOICE
+    play=False
     payload = {
-        "text": sanitize_for_tts(text),
-        "voice": voice or KOKORO_VOICE,
+        "text": text,
+        "voice": safe_voice,
+        "play": play,
     }
 
     try:
         req = urllib.request.Request(
-            f"{KOKORO_HOST}/speak",
+            f"{KOKORO_HOST}/tts/speak",
             data=json.dumps(payload).encode("utf-8"),
             headers={"Content-Type": "application/json"},
             method="POST",
         )
-        with urllib.request.urlopen(req, timeout=KOKORO_TIMEOUT_SEC):
-            pass
-        return True
+
+        loop = asyncio.get_running_loop()
+
+        response_data = await loop.run_in_executor(
+            None,
+            lambda: json.loads(
+                urllib.request.urlopen(
+                    req,
+                    timeout=KOKORO_TIMEOUT_SEC,
+                ).read().decode("utf-8")
+            ),
+        )
+
+        if interrupted.is_set():
+            return
+
+        _ws_send_json(wfile, {
+            "type": "tts",
+            "text": text,
+            "voice": safe_voice,
+            "audio": response_data.get("chunks", []),
+            "sample_rate": response_data.get("sample_rate", 24000),
+            "format": response_data.get("format", "int16_pcm_base64"),
+        })
+
     except Exception as e:
-        debug(f"Kokoro TTS failed: {e}")
-        return False
+        emit_event(
+            "warning",
+            "Kokoro speak failed",
+            {
+                "error": str(e),
+                "voice": safe_voice,
+                "preview": text[:100],
+            },
+        ) 
+
+def is_kokoro_running() -> bool:
+    return http_get_ok_simple(
+    f"{KOKORO_HOST}/tts/health",
+    timeout=2
+)
+def get_gpu_stats() -> list:
+    try:
+        result = subprocess.run(
+            [
+                "nvidia-smi",
+                "--query-gpu=name,temperature.gpu,utilization.gpu,memory.used,memory.total,power.draw,power.limit,fan.speed,clocks.gr,clocks.mem",
+                "--format=csv,noheader,nounits",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=5,
+            check=False,
+        )
+
+        gpus = []
+
+        for line in result.stdout.strip().split("\n"):
+            if not line.strip():
+                continue
+
+            parts = [p.strip() for p in line.split(",")]
+            if len(parts) < 10:
+                continue
+
+            gpus.append({
+                "name": parts[0],
+                "temp": int(float(parts[1])),
+                "utilization": int(float(parts[2])),
+                "memUsed": int(float(parts[3])),
+                "memTotal": int(float(parts[4])),
+                "power": float(parts[5]),
+                "powerLimit": float(parts[6]),
+                "fan": int(float(parts[7])) if parts[7] != "[N/A]" else 0,
+                "clockCore": int(float(parts[8])),
+                "clockMem": int(float(parts[9])),
+            })
+
+        return gpus
+
+    except Exception as e:
+        emit_event("warning", "GPU stats failed", {"error": str(e)})
+        return []
+
+# Add these WebSocket frame helpers and the runner before ReactHandler class:
+def _ws_read_message(rfile) -> bytes | None:
+    chunks: list[bytes] = []
+
+    while True:
+        header = rfile.read(2)
+        if len(header) < 2:
+            return None
+
+        fin = (header[0] & 0x80) != 0
+        opcode = header[0] & 0x0F
+        masked = (header[1] & 0x80) != 0
+        length = header[1] & 0x7F
+
+        if opcode == 0x8:
+            return None
+
+        if opcode == 0x9:
+            continue
+
+        if length == 126:
+            length = int.from_bytes(rfile.read(2), "big")
+        elif length == 127:
+            length = int.from_bytes(rfile.read(8), "big")
+
+        mask = rfile.read(4) if masked else b"\x00\x00\x00\x00"
+        data = bytearray(rfile.read(length))
+
+        if masked:
+            for i in range(len(data)):
+                data[i] ^= mask[i % 4]
+
+        if opcode in (0x1, 0x2, 0x0):
+            chunks.append(bytes(data))
+
+        if fin:
+            return b"".join(chunks)
+        
+def _ws_read_frame(rfile) -> bytes | None:
+    """Read one WebSocket frame, return payload bytes or None on close."""
+    try:
+        header = rfile.read(2)
+        if len(header) < 2:
+            return None
+
+        fin = (header[0] & 0x80) != 0
+        opcode = header[0] & 0x0F
+        masked = (header[1] & 0x80) != 0
+        length = header[1] & 0x7F
+
+        if opcode == 0x8:  # close
+            return None
+        if opcode == 0x9:  # ping
+            return b""    # ignore pings for now
+
+        if length == 126:
+            length = int.from_bytes(rfile.read(2), "big")
+        elif length == 127:
+            length = int.from_bytes(rfile.read(8), "big")
+
+        mask = rfile.read(4) if masked else b"\x00\x00\x00\x00"
+        data = bytearray(rfile.read(length))
+
+        if masked:
+            for i in range(len(data)):
+                data[i] ^= mask[i % 4]
+
+        return bytes(data)
+
+    except Exception:
+        return None
+
+
+def _ws_send_frame(wfile, payload: bytes, opcode: int = 0x1) -> None:
+    """Send one WebSocket text or binary frame."""
+    try:
+        length = len(payload)
+        header = bytearray()
+        header.append(0x80 | opcode)
+
+        if length <= 125:
+            header.append(length)
+        elif length <= 65535:
+            header.append(126)
+            header.extend(length.to_bytes(2, "big"))
+        else:
+            header.append(127)
+            header.extend(length.to_bytes(8, "big"))
+
+        wfile.write(bytes(header) + payload)
+        wfile.flush()
+    except Exception:
+        pass
+
+
+
+def _ws_send_json(wfile, data: dict) -> None:
+    _ws_send_frame(wfile, json.dumps(data, ensure_ascii=False).encode("utf-8"))
+
+
+async def _run_live_ws(rfile, wfile) -> None:
+    import concurrent.futures
+
+    loop = asyncio.get_event_loop()
+    msg_queue: asyncio.Queue = asyncio.Queue()
+    interrupted = asyncio.Event()
+    running = [True]
+
+    def reader_thread():
+        while running[0]:
+            ##raw = _ws_read_frame(rfile)
+            raw = _ws_read_message(rfile)
+            if raw is None:
+                loop.call_soon_threadsafe(msg_queue.put_nowait, None)
+                return
+
+            if raw:
+                try:
+                    msg = json.loads(raw.decode("utf-8"))
+                    loop.call_soon_threadsafe(msg_queue.put_nowait, msg)
+                except Exception as e:
+                    debug(f"WS decode failed: {e}")
+
+    executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+    loop.run_in_executor(executor, reader_thread)
+
+    profile = load_active_profile()
+    voice = profile.get("voice", "af_george")
+
+    try:
+        while True:
+            msg = await msg_queue.get()
+            if msg is None:
+                break
+
+            msg_type = msg.get("type", "user_audio")
+
+            if msg_type == "interrupt":
+                interrupted.set()
+                continue
+
+            interrupted.clear()
+
+            if msg_type not in {"user_audio", "audio"}:
+                continue
+
+            audio_b64 = msg.get("audio", "")
+            image_b64 = msg.get("image")
+
+            transcript = await loop.run_in_executor(
+                None,
+                lambda a=audio_b64: transcribe_audio_b64(a),
+            )
+
+            if not transcript or len(transcript.strip()) < 2:
+                continue
+
+            _ws_send_json(wfile, {
+                "type": "transcription",
+                "text": transcript,
+            })
+
+            messages = []
+
+            live_prompt = load_prompt_file(LIVE_CHAT_PROMPT_PATH, fallback="")
+            system_content = (
+                live_prompt
+                or profile.get("systemPrompt")
+                or SYSTEM_ORCHESTRATOR_PROMPT
+            )
+
+            short_ctx = build_short_term_context()
+            last_exchange = build_last_exchange_context()
+            coder_mem = load_coder_memory(max_chars=1000)
+
+            context_parts = [
+                p for p in [short_ctx, last_exchange, coder_mem]
+                if p and p.strip()
+            ]
+
+            if context_parts:
+                system_content += "\n\n" + "\n\n".join(context_parts)
+
+            messages.append({
+                "role": "system",
+                "content": system_content,
+            })
+
+            context_pack = build_context_pack(transcript)
+            if context_pack:
+                messages.append({
+                    "role": "system",
+                    "content": (
+                        "Memory context — optional background only. "
+                        "Do not change user intent based on memory.\n\n"
+                        + context_pack
+                    ),
+                })
+
+            if image_b64:
+                messages.append({
+                    "role": "system",
+                    "content": (
+                        "The user is showing their camera. "
+                        "Describe what you see if relevant."
+                    ),
+                })
+
+            messages.append({
+                "role": "user",
+                "content": transcript,
+            })
+
+            if interrupted.is_set():
+                continue
+
+            body = {
+                "source": "voice",
+                "route": "live",
+                "messages": messages,
+                "stream": False,
+            }
+            n = increment_loop()
+            push_memory(f"[{n}] user: {transcript}")
+            print("[LIVE] calling inline chat", flush=True)
+            messages.insert(0, {
+                "role": "system",
+                "content": format_state_block(),
+            })
+            #chat_result = await loop.run_in_executor(
+            #    None,
+            #    lambda b=body: _inline_chat(b),
+            #)
+            chat_result=memory_router.route(body)
+            reply = chat_result.get("message", {}).get("content", "") or ""
+            route = chat_result.get("route", "live")
+            tool = chat_result.get("tool")
+            live = chat_result.get("live") or {}
+            live_memory = chat_result.get("need_memory")
+            live_memory_conf = chat_result.get("memory_confidence")
+            live_action = live.get("action")
+            live_speak = str(live.get("speak") or "").strip()
+
+            write_chat_log("user", transcript, route=route, model="voice")
+            write_chat_log("assistant", reply, route=route, model="voice")
+
+            if interrupted.is_set():
+                continue
+
+            _ws_send_json(wfile, {
+                "type": "text",
+                "text": reply,
+                "route": route,
+                "tool": tool,
+                "transcription": transcript,
+                "live_memory": live_memory,
+                "live_memory_conf": live_memory_conf,
+            })
+
+            # Rule:
+            # chat_only: speak live_speak/reply and stop.
+            # tools/escalation: speak live_speak as ack, then final reply.
+            if live_action == "chat_only":
+                await speak_via_kokoro(
+                    wfile,
+                    live_speak or reply,
+                    voice,
+                    True,
+                    interrupted,
+                )
+                continue
+
+            if live_speak:
+                await speak_via_kokoro(
+                    wfile,
+                    live_speak,
+                    voice,
+                    True,
+                    interrupted,
+                )
+
+            if reply.strip():
+                await speak_via_kokoro(
+                    wfile,
+                    reply,
+                    voice,
+                    True,
+                    interrupted,
+                )
+
+    finally:
+        running[0] = False
+        executor.shutdown(wait=False)
+
+
+
+
 # -----------------------------------------------------------------------------
 # Skill loading
 # -----------------------------------------------------------------------------
@@ -659,6 +1105,7 @@ def build_simple_code_plan(user_text: str, paths: List[str]) -> Dict[str, Any]:
     "- For debugging tasks, include steps to identify the failure point and verify the fix.\n"
     "- The final step must verify or complete the requested file/code change.\n"
     "- Do not create a plan with only setup/directory steps.\n\n"
+    "- Coding is also done to staging folder not to production code directly, so include staging file paths when relevant. after testing move files to tested and make directory plan-id\n\n"
     "Examples:\n"
     "{\n"
     '  "speak": "I will create a small HTML file with the requested page.",\n'
@@ -674,9 +1121,10 @@ def build_simple_code_plan(user_text: str, paths: List[str]) -> Dict[str, Any]:
     '  "args": {},\n'
     '  "path": ["/mnt/e/coding/projectx"],\n'
     '  "steps": [\n'
-    '    {"id": 1, "goal": "Create the HTML structure for the page.", "target_files": ["love.html"]},\n'
-    '    {"id": 2, "goal": "Add CSS for the animated pulsing red heart.", "target_files": ["love.html"]},\n'
-    '    {"id": 3, "goal": "Add the visible text requested by the user and ensure the file is complete.", "target_files": ["love.html"]}\n'
+    '    {"id": 1, "goal": "Create the HTML structure for the page.", "tool":"coding","target_files": ["love.html"]},\n'
+    '    {"id": 2, "goal": "Add CSS for the animated pulsing red heart.", "tool":"coding", "target_files": ["love.html"]},\n'
+    '    {"id": 3, "goal": "Add the visible text requested by the user and ensure the file is complete.", "tool":"coding", "target_files": ["love.html"]}\n'
+    '    {"id": 3, "goal": "test code with pytest in podmman.", "tool":"podman", "target_files": ["love.html"]}\n'
     "  ]\n"
     "}\n\n"
     f"User request:\n{user_text}\n\n"
@@ -877,6 +1325,792 @@ def build_tool_hints(tool_skill_meta: Dict[str, Dict[str, Any]]) -> Dict[str, Li
     return out
 
 
+
+# -----------------------------------------------------------------------------
+# Audio transcription (Whisper via llama-server or fallback)
+# -----------------------------------------------------------------------------
+def transcribe_audio_b64(audio_b64: str) -> str:
+    """Transcribe base64 WAV audio using llama-server /v1/audio/transcriptions."""
+    if not audio_b64:
+        return ""
+
+    LLAMA_SERVER = os.environ.get("JARVIS_LLAMA_SERVER", "http://127.0.0.1:8081")
+
+    try:
+        import base64
+        audio_bytes = base64.b64decode(audio_b64)
+
+        boundary = "----JarvisAudioBoundary"
+        body = bytearray()
+        body.extend(f"--{boundary}\r\n".encode())
+        body.extend(b'Content-Disposition: form-data; name="file"; filename="audio.wav"\r\n')
+        body.extend(b"Content-Type: audio/wav\r\n\r\n")
+        body.extend(audio_bytes)
+        body.extend(f"\r\n--{boundary}\r\n".encode())
+        body.extend(b'Content-Disposition: form-data; name="model"\r\n\r\n')
+        body.extend(b"whisper-1")
+        body.extend(f"\r\n--{boundary}--\r\n".encode())
+
+        req = urllib.request.Request(
+            f"{LLAMA_SERVER}/v1/audio/transcriptions",
+            data=bytes(body),
+            headers={"Content-Type": f"multipart/form-data; boundary={boundary}"},
+            method="POST",
+        )
+
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+            return str(data.get("text", "")).strip()
+
+    except Exception as e:
+        emit_event("warning", "Audio transcription failed", {"error": str(e)})
+
+        # Fallback: send audio as input_audio to chat completions and ask for transcription
+        try:
+            payload = {
+                "model": "gemma4",
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "input_audio",
+                                "input_audio": {"data": audio_b64, "format": "wav"},
+                            },
+                            {"type": "text", "text": "Transcribe exactly what is said. Return only the transcription, nothing else."},
+                        ],
+                    }
+                ],
+                "stream": False,
+            }
+
+            req = urllib.request.Request(
+                f"{LLAMA_SERVER}/v1/chat/completions",
+                data=json.dumps(payload).encode(),
+                headers={"Content-Type": "application/json"},
+            )
+
+            with urllib.request.urlopen(req, timeout=60) as resp:
+                data = json.loads(resp.read().decode("utf-8"))
+                raw = data.get("choices", [{}])[0].get("message", {}).get("content", "")
+                # Strip thinking tags and prompt echo
+                raw = strip_thinking_tags(raw).strip()
+                if "<channel|>" in raw:
+                    raw = raw.split("<channel|>")[-1].strip()
+                return raw
+
+        except Exception as e2:
+            emit_event("warning", "Audio transcription fallback failed", {"error": str(e2)})
+            return ""
+
+
+
+def handle_live_router(
+    self,
+    body: dict,
+    user_text: str,
+    requested_model: str | None,
+    requested_route: str | None,
+    source: str,
+    messages: list,
+) -> tuple[bool, str | None]:
+    """
+    Fast path: live router, direct tool execution, chat_only responses.
+
+    Returns (handled, requested_route_override).
+    If handled=True, response has already been sent.
+    If handled=False, caller should proceed to handle_full_pipeline.
+    requested_route_override may override requested_route for the full pipeline.
+    """
+    live_result = run_live_router(user_text)
+    live_result = force_correct_common_tool(user_text, live_result)
+
+    live_action = live_result.get("action")
+    chat_confidence = float(live_result.get("chat_confidence", 0))
+    escalation_confidence = float(live_result.get("escalation_confidence", 0))
+    execute_confidence = float(live_result.get("execute_confidence", 0))
+    memory_confidence = float(live_result.get("memory_confidence", 0))
+    need_memory = bool(live_result.get("need_memory", False))
+    live_speak = str(live_result.get("speak") or "").strip()
+    live_transcript = str(live_result.get("transcript") or "").strip()
+    live_tool = str(live_result.get("tool") or "").strip()
+    live_intent = str(live_result.get("intent") or "").strip()
+    live_args = live_result.get("args") or {}
+
+
+
+    write_chat_log("assistant", live_speak, route=live_action, model="live")
+
+    emit_event(
+        "Live router",
+        "Reply and confidence",
+        {
+            "speak": live_speak,
+            "tool": live_tool,
+            "escalation_confidence": escalation_confidence,
+            "execute_confidence": execute_confidence,
+            "chat_confidence": chat_confidence,
+            "need_memory": need_memory,
+            "memory_confidence": memory_confidence,
+            "user_text": user_text[:200],
+        },
+    )
+
+    if not isinstance(live_args, dict):
+        live_args = {}
+
+    if live_tool == "radio" and live_args.get("action") == "play" and not live_args.get("station"):
+        live_action = "chat_only"
+        live_speak = "Which radio station should I play?"
+
+    if live_transcript:
+        user_text = live_transcript
+        # Patch messages in-place so full pipeline sees clean transcript
+        for i in range(len(messages) - 1, -1, -1):
+            if messages[i].get("role") == "user":
+                messages[i] = {**messages[i], "content": user_text}
+                break
+
+    # --- chat_only fast return ---
+    if live_action == "chat_only" and (chat_confidence >= 0.70 or escalation_confidence == 0.0) and live_speak:
+        self._json_response({
+            "model": "live_router",
+            "created_at": now_iso(),
+            "message": {"role": "assistant", "content": live_speak},
+            "done": True,
+            "route": "live",
+            "live": live_result,
+        })
+        return True, None
+
+    # --- direct tool fast return ---
+    live_direct_skill_match = resolve_skill_command(user_text)
+    live_tool_fixed = live_tool
+
+    if live_direct_skill_match and live_direct_skill_match.get("score", 0) >= 0.88:
+        live_tool_fixed = live_direct_skill_match.get("tool_name")
+
+    if (
+        live_action == "direct_tool"
+        and execute_confidence >= 0.75
+        and live_tool_fixed
+        and live_tool_fixed in TOOL_MAP
+    ):
+        live_result = complete_tool_args_with_meta(
+            tool_name=live_tool_fixed,
+            user_text=user_text,
+            parsed=live_result,
+        )
+        live_args = live_result.get("args") or {}
+        result = execute_tool(live_tool_fixed, live_args)
+
+        if source == "telegram" and live_tool_fixed == "flux":
+            sent_media = send_flux_result_to_telegram(result)
+            notify_telegram("Image sent to Telegram!" if sent_media else "Failed to send image to Telegram.")
+
+        content = extract_tool_content(result)
+        reply = content or live_speak or f"Done: {live_tool_fixed}"
+
+        try:
+            write_chat_log("user", user_text, route="tools", model="live_router")
+            write_chat_log("assistant", reply, route="tools", model="live_router")
+        except Exception as e:
+            print(f"[CHAT_LOG] direct tool log failed: {e}")
+
+        emit_event(
+            "router",
+            "Live router decision",
+            {
+                "action": live_result.get("action"),
+                "route": live_result.get("route"),
+                "tool": live_tool_fixed,
+                "chat_confidence": live_result.get("chat_confidence"),
+                "escalation_confidence": live_result.get("escalation_confidence"),
+                "execute_confidence": live_result.get("execute_confidence"),
+                "intent": live_result.get("intent"),
+                "speak": live_result.get("speak", "")[:300],
+            },
+        )
+
+        self._json_response({
+            "model": "live_router",
+            "created_at": now_iso(),
+            "message": {"role": "assistant", "content": reply},
+            "done": True,
+            "route": "tools",
+            "format": "direct_tool",
+            "tool": live_tool_fixed,
+            "tool_result": result,
+            "live": live_result,
+        })
+        return True, None
+
+       # --- chat_history_query shortcut ---
+    if live_result.get("action") == "chat_only" and requested_route == "live" and live_intent == "chat_history_query":
+        model = resolve_model(requested_model=requested_model, route="live")
+        try:
+            from scripts.chat_context import read_last_chat_log_chars
+        except Exception:
+            from chat_context import read_last_chat_log_chars
+        recent_chat = read_last_chat_log_chars(max_chars=4000)
+        messages.insert(1, {
+            "role": "system",
+            "content": (
+                "Recent chat log. Use this to answer the user's question about recent discussion. "
+                "Do not dump the log unless the user asks. Answer concisely.\n\n"
+                + recent_chat
+            ),
+        })
+        data = call_ollama_once(model=model, messages=messages, route="live", persona=None, tools=None, stream=False)
+        reply_text = data.get("message", {}).get("content", "") if isinstance(data, dict) else ""
+        write_chat_log("assistant", reply_text, route="live", model=model)
+        if source == "telegram" and reply_text.strip():
+            notify_telegram(reply_text.strip())
+        self._json_response({**data, "route": "live", "live": live_result, "chat_history_used": True})
+        return
+
+    # --- live chat_only with self context ---
+    if live_result.get("action") == "chat_only" and requested_route == "live":
+        model = resolve_model(requested_model=requested_model, route="live")
+        self_context = build_self_context_prompt(persona=None, max_tools=20)
+        messages.insert(1, {
+            "role": "system",
+            "content": "JARVIS self-context. Use this to understand who you are and what you can do.\n\n" + self_context,
+        })
+        data = call_ollama_once(model=model, messages=messages, route="live", persona=None, tools=None, stream=False)
+        reply_text = data.get("message", {}).get("content", "") if isinstance(data, dict) else ""
+        write_chat_log("assistant", reply_text, route="live", model=model)
+        if source == "telegram" and reply_text.strip():
+            notify_telegram(reply_text.strip())
+        self._json_response({**data, "route": "live", "live": live_result})
+        return
+     # --- not handled, determine route override for full pipeline ---
+    route_override = None
+    if live_action == "chat_only":
+        route_override = "live"
+    elif live_action == "direct_tool":
+        route_override = "tools"
+    elif live_action == "planner":
+        route_override = "reason"
+    elif live_action == "code":
+        route_override = "code"
+    elif live_action == "deep_agent":
+        route_override = "deep"
+
+    # Store live_result on body so full pipeline can use it
+    body["_live_result"] = live_result
+    body["_live_intent"] = live_intent
+    body["_user_text"] = user_text  # updated with transcript if any
+
+    return False, route_override
+
+
+def handle_full_pipeline(
+    self,
+    body: dict,
+    user_text: str,
+    requested_model: str | None,
+    requested_route: str | None,
+    source: str,
+    messages: list,
+    stream: bool,
+) -> None:
+    """
+    Full pipeline: workflow, memory, tool selection, code route, agent, react chat.
+    """
+    live_result = body.get("_live_result", {})
+    live_intent = body.get("_live_intent", "")
+
+    # --- code request detection ---
+    normalized_user = user_text.strip().lower()
+
+    is_code_request = (
+        any(ext in normalized_user for ext in [
+            ".py", ".js", ".ts", ".tsx", ".jsx", ".sql", ".yaml", ".json", ".html",
+        ])
+        and any(verb in normalized_user for verb in [
+            "fix", "edit", "patch", "refactor", "change", "update", "modify",
+        ])
+    )
+
+    if live_result.get("action") == "code" or live_result.get("route") == "code":
+        requested_route = "code"
+
+    if is_code_request:
+        requested_route = "code"
+
+    # --- fuzzy skill match (skip for code) ---
+    if requested_route == "code":
+        direct_skill_match = None
+    else:
+        direct_skill_match = resolve_skill_command(user_text)
+        if direct_skill_match and direct_skill_match.get("score", 0) >= 0.88:
+            live_result.update({
+                "action": "direct_tool",
+                "route": "tools",
+                "tool": direct_skill_match["tool_name"],
+                "chat_confidence": 0.0,
+                "escalation_confidence": 1.0,
+                "execute_confidence": 1.0,
+                "args": live_result.get("args") or {},
+            })
+            requested_route = "tools"
+
+    if direct_skill_match:
+        requested_route = "tools"
+
+    # --- workflow ---
+    workflow_state = load_workflow_state()
+    if workflow_state:
+        reply = continue_markdown_workflow(user_text, workflow_state)
+        self._json_response({
+            "model": "workflow",
+            "created_at": now_iso(),
+            "message": {"role": "assistant", "content": reply},
+            "done": True,
+        })
+        return
+
+    md_skill = match_markdown_skill(user_text)
+    if md_skill:
+        body["markdown_skill"] = md_skill
+        requested_route = md_skill.get("route", requested_route or "reason")
+
+        if md_skill.get("type") == "interview_workflow":
+            state = {
+                "skill": md_skill.get("name"),
+                "skill_path": md_skill.get("path"),
+                "phase": "interview",
+                "answers": {},
+            }
+            save_workflow_state(state)
+            question = get_next_workflow_question(state)
+            self._json_response({
+                "model": "workflow",
+                "created_at": now_iso(),
+                "message": {"role": "assistant", "content": question or "Workflow started."},
+                "done": True,
+            })
+            return
+
+
+
+    # --- memory context ---
+    plan_command, plan_command_id = parse_plan_command(user_text)
+    lower_user = user_text.strip().lower()
+
+    active_task_followups = {
+        "proceed", "continue", "save it", "write it", "create it",
+        "do it", "yes", "yes proceed", "show directory", "save it and show directory",
+    }
+    direct_command_prefixes = (
+        "list skills", "show skills", "what skills", "reload skills",
+        "play ", "stop radio", "timer ", "set timer", "health",
+    )
+
+    is_active_followup = normalized_user in active_task_followups
+    skip_memory = (
+        requested_route == "live"
+        or bool(direct_skill_match)
+        or is_active_followup
+        or bool(md_skill)
+        or plan_command in {"proceed", "continue", "next", "run", "yes", "cancel"}
+        or lower_user.startswith(direct_command_prefixes)
+    )
+
+    context_pack = ""
+    planner_user_text = user_text
+
+    if not skip_memory:
+        context_pack = build_context_pack(user_text)
+        if context_pack:
+            insert_at = 1 if messages and messages[0].get("role") == "system" else 0
+            messages.insert(insert_at, {
+                "role": "system",
+                "content": (
+                    "Memory context is optional background only. "
+                    "The current user message is the command. "
+                    "Do not change the user's intent based on memory. "
+                    "If memory conflicts with the current command, ignore memory.\n\n"
+                    + context_pack
+                ),
+            })
+            planner_user_text = (
+                f"USER COMMAND:\n{user_text}\n\n"
+                f"OPTIONAL MEMORY HINTS:\n{context_pack[:2500]}\n\n"
+                "Instruction: obey USER COMMAND. Use memory only as supporting context."
+            )
+
+    # --- telegram plan commands ---
+    if source == "telegram" and plan_command in {"proceed", "continue", "next", "run", "modify", "cancel", "accept"}:
+        requested_route = "code"
+        requested_model = None
+
+    if requested_route not in VALID_ROUTES:
+        requested_route = detect_route(user_text, source)
+
+    # --- plan commands ---
+    selected_tools: List[Dict[str, Any]] = []
+    plan_decision = None
+
+    if plan_command in {"proceed", "continue", "next", "run", "yes", "accept"}:
+        plan_decision = {"action": "code", "route": "code", "chat_confidence": 0.0, "execution_confidence": 1.0, "continue_plan": True, "plan_action": "continue"}
+        requested_route = "code"
+        requested_model = None
+    elif plan_command == "modify":
+        plan_decision = {"action": "planner", "route": "reason", "chat_confidence": 1.0, "execution_confidence": 0.0, "continue_plan": True, "plan_action": "modify"}
+        requested_route = "code"
+        requested_model = None
+    elif plan_command == "cancel":
+        plan_decision = {"action": "code", "route": "code", "chat_confidence": 0.0, "execution_confidence": 1.0, "continue_plan": True, "plan_action": "cancel"}
+        requested_route = "code"
+        requested_model = None
+
+    if direct_skill_match:
+        selected_tools = [direct_skill_match["tool"]]
+    elif plan_command in {"proceed", "continue", "next", "run", "modify", "cancel"}:
+        selected_tools = []
+    elif should_select_tools(user_text, requested_route, requested_model):
+        selected_tools = choose_tools(user_text, requested_route=requested_route, requested_model=requested_model)
+
+    emit_event("router", "Fuzzy skill command match", {
+        "matched": bool(direct_skill_match),
+        "tool": direct_skill_match.get("tool_name") if direct_skill_match else None,
+        "score": direct_skill_match.get("score") if direct_skill_match else None,
+        "user_text": user_text[:200],
+    })
+
+    resolved_route = normalized_route(requested_route, selected_tools)
+
+    if is_code_request or (plan_decision and plan_decision.get("execution_confidence", 0) >= 0.85):
+        resolved_route = "code"
+
+    if resolved_route == "code":
+        requested_model = None
+        model = resolve_model(requested_model=None, route="code")
+        selected_tools = [TOOLS_BY_NAME["code_edit"]] if "code_edit" in TOOLS_BY_NAME else []
+    else:
+        model = resolve_model(requested_model=requested_model, route=resolved_route)
+
+    route = resolved_route
+
+    if log_chat_event:
+        try:
+            log_chat_event(role="user", content=user_text, route=route, model=model)
+        except Exception as e:
+            print(f"[CHAT_LOG] user log failed: {e}")
+
+    # --- agent continue ---
+    if user_text.lower().startswith("agent: continue"):
+        task = get_active_task(TASK_GRAPH_PATH)
+        if task:
+            user_text = (
+                f"Continue this task.\n\nOriginal request:\n{task.get('user_request')}\n\n"
+                f"Steps:\n{json.dumps(task.get('steps', []), indent=2)}\n\n"
+                f"Recent events:\n{json.dumps(task.get('events', [])[-10:], indent=2)}"
+            )
+            body["task_id"] = task.get("id")
+
+    agent_requested = route == "deep" or user_text.lower().startswith(("agent:", "do task:"))
+
+    if agent_requested:
+        result = run_agent_loop(
+            user_message=planner_user_text,
+            route=route,
+            model=model,
+            tools_by_name=TOOLS_BY_NAME,
+            tool_map=TOOL_MAP,
+            call_ollama_once=call_ollama_once,
+            execute_tool=execute_tool,
+            emit_event=emit_event,
+            truncate_text=truncate_text,
+            strip_thinking_tags=strip_thinking_tags,
+            now_iso=now_iso,
+            task_graph_path=TASK_GRAPH_PATH,
+            task_id=body.get("task_id"),
+            max_steps=8,
+        )
+        result_kind = classify_agent_output_kind("agent", user_text, result if isinstance(result, dict) else {})
+        if result_kind == "report":
+            _plan_id = (result.get("plan_id") if isinstance(result, dict) else None) or "agent_" + str(uuid.uuid4())[:8]
+            report_path = write_analysis_report(
+                skill_name="agent",
+                plan_id=_plan_id,
+                result={"markdown": result.get("answer", "") if isinstance(result, dict) else "", **({} if not isinstance(result, dict) else result)},
+            )
+            emit_event("artifact", "Analysis report written", {"plan_id": _plan_id, "path": str(report_path)})
+            self._json_response({
+                "model": model, "created_at": now_iso(),
+                "message": {"role": "assistant", "content": result.get("answer", "") if isinstance(result, dict) else ""},
+                "done": True, "route": route, "format": "report", "report_path": str(report_path),
+            })
+        else:
+            answer = result.get("answer", "") if isinstance(result, dict) else ""
+            write_chat_log("assistant", answer, route=route, model=model)
+            self._json_response({
+                "model": model, "created_at": now_iso(),
+                "message": {"role": "assistant", "content": answer},
+                "done": True, "route": route, "format": "agent",
+                "task_id": result.get("task_id") if isinstance(result, dict) else None,
+                "agent": {
+                    "trace": result.get("trace", []) if isinstance(result, dict) else [],
+                    "observations": result.get("observations", []) if isinstance(result, dict) else [],
+                },
+            })
+        return
+
+    # --- code route ---
+    if resolved_route == "code" and is_coder_model(model):
+        coder_tool = get_coder_tool()
+        if coder_tool:
+            selected_tools = [coder_tool]
+
+        tool_names = [t["function"]["name"] for t in selected_tools if isinstance(t, dict) and isinstance(t.get("function"), dict)]
+        runtime_mode = write_runtime_mode(resolved_route, model, selected_tools)
+        persona = runtime_mode.get("persona")
+
+        try:
+            sync_kokoro_for_route(resolved_route, model)
+        except Exception as e:
+            emit_event("warning", "Kokoro sync failed", {"route": resolved_route, "model": model, "error": str(e)})
+
+        emit_event("status", "Incoming coder skill request", {
+            "resolved_route": resolved_route, "resolved_model": model,
+            "tools": tool_names, "user_preview": user_text[:140],
+        })
+
+        if not selected_tools:
+            self._json_response({
+                "model": model, "created_at": now_iso(),
+                "message": {"role": "assistant", "content": f"Code route selected but no coder skill loaded. Found: {tool_names}"},
+                "done": True,
+            })
+            return
+
+        ack = random.choice(ACKS)
+        write_bridge_status("thinking", ack)
+        speak_ack(ack)
+
+        tool_name = selected_tools[0]["function"]["name"]
+        paths = body.get("paths")
+        if not isinstance(paths, list) or not paths:
+            paths = guess_coding_paths(user_text)
+
+        command, requested_plan_id = parse_plan_command(user_text)
+        active_plan = load_plan_by_id(requested_plan_id) if requested_plan_id else load_active_plan()
+        if requested_plan_id and active_plan:
+            save_active_plan(active_plan)
+
+        emit_event("code_phase", "Guessed coding paths", {"paths": paths})
+
+        if command == "cancel":
+            if not requested_plan_id:
+                self._json_response({"model": model, "created_at": now_iso(), "message": {"role": "assistant", "content": "Cancel failed: missing plan id."}, "done": True})
+                return
+            plan = load_plan_by_id(requested_plan_id)
+            if not plan:
+                self._json_response({"model": model, "created_at": now_iso(), "message": {"role": "assistant", "content": f"Plan not found: {requested_plan_id}"}, "done": True})
+                return
+            plan["status"] = "cancelled"
+            plan["cancelled_at"] = now_iso()
+            save_json(requested_plan_id, "status.json", plan)
+            self._json_response({"model": model, "created_at": now_iso(), "message": {"role": "assistant", "content": f"Cancelled plan {requested_plan_id}."}, "done": True})
+            return
+
+        if command == "modify" or user_text.strip().lower().startswith("modify this plan:"):
+            active_plan = build_simple_code_plan(planner_user_text, paths)
+            save_json(active_plan["plan_id"], "plan.json", active_plan)
+            save_active_plan(active_plan)
+            self._json_response({"model": model, "created_at": now_iso(), "message": {"role": "assistant", "content": render_plan(active_plan)}, "done": True})
+            return
+
+        if command not in {"proceed", "continue", "next", "run", "yes", "accept"}:
+            active_plan = build_simple_code_plan(planner_user_text, paths)
+            plan_files = active_plan.get("files") or []
+            has_plan_file = any("." in str(p).split("/")[-1] for p in plan_files)
+
+            if needs_output_path(user_text, paths) and not has_plan_file:
+                plan_id = active_plan["plan_id"]
+                active_plan["state"] = "waiting_input"
+                active_plan["waiting_for"] = "output_path"
+                save_active_plan(active_plan)
+                self._json_response({
+                    "model": model, "created_at": now_iso(),
+                    "message": {"role": "assistant", "content": f"PLAN_ID: {plan_id}\n\nWhere should I save the generated file?\n\nExamples:\n- love.html\n- app/page.tsx\n- scripts/test.py"},
+                    "done": True, "route": "code",
+                })
+                return
+
+            emit_event("code_phase", "Plan created", {"phase": "plan_created", "plan_id": active_plan.get("plan_id"), "steps": active_plan.get("steps", [])})
+            save_active_plan(active_plan)
+            self._json_response({"model": model, "created_at": now_iso(), "message": {"role": "assistant", "content": render_plan(active_plan)}, "done": True})
+            return
+
+        if not active_plan:
+            self._json_response({"model": model, "created_at": now_iso(), "message": {"role": "assistant", "content": "No active coding plan found. Send the coding request first."}, "done": True})
+            return
+
+        current_step = int(active_plan.get("current_step", 0))
+        steps = active_plan.get("steps", [])
+
+        if current_step >= len(steps):
+            self._json_response({"model": model, "created_at": now_iso(), "message": {"role": "assistant", "content": "Coding plan is already complete."}, "done": True})
+            return
+
+        step = steps[current_step]
+
+        emit_event("code_phase", f"Running step {step.get('id')}: {step.get('goal')}", {
+            "phase": "running_step", "plan_id": active_plan.get("plan_id"), "step": step, "paths": paths,
+        })
+
+        result = run_agent_loop(
+            user_message=(
+                "Execute this approved plan only.\n\n"
+                f"Plan:\n{json.dumps(active_plan, indent=2)}\n\n"
+                "Rules:\n- Follow the plan step by step.\n- Use code_edit only for file changes.\n- Stop when the plan is complete.\n"
+            ),
+            route="code", model=model,
+            tools_by_name=TOOLS_BY_NAME,
+            tool_map=TOOL_MAP,
+            call_ollama_once=call_ollama_once, execute_tool=execute_tool,
+            emit_event=emit_event, truncate_text=truncate_text,
+            strip_thinking_tags=strip_thinking_tags, now_iso=now_iso,
+            task_graph_path=TASK_GRAPH_PATH, task_id=active_plan.get("plan_id"),
+            max_steps=len(active_plan.get("steps", [])) + 2,
+        )
+
+        result_dict = result if isinstance(result, dict) else {}
+        result_kind = classify_agent_output_kind(tool_name, user_text, result_dict)
+        content = extract_last_patch_from_anything(result)
+        content = normalize_patch_text(content)
+
+        if result_kind == "report":
+            _plan_id = active_plan.get("plan_id") or "report_" + str(uuid.uuid4())[:8]
+            markdown = result_dict.get("markdown") or result_dict.get("answer") or content
+            report_path = write_analysis_report(skill_name=tool_name, plan_id=_plan_id, result={"markdown": markdown})
+            emit_event("artifact", "Analysis report written", {"plan_id": _plan_id, "path": str(report_path)})
+            self._json_response({
+                "model": model, "created_at": now_iso(),
+                "message": {"role": "assistant", "content": markdown},
+                "done": True, "route": resolved_route, "format": "report", "report_path": str(report_path),
+            })
+            return
+
+        if "--- FILE:" not in content or "@@" not in content:
+            content = f"Coder returned analysis instead of a patch.\n\nThis output was rejected.\n\nPreview:\n{content[:1500]}"
+
+        patch_file = f"patches/step_{step.get('id')}.patch"
+        (plan_dir(active_plan["plan_id"]) / patch_file).write_text(content, encoding="utf-8")
+
+        patch_part = content.split("### PATCH", 1)[1].strip() if "### PATCH" in content else content
+        validation = validate_coder_output(patch_part)
+
+        if not validation["ok"]:
+            retry_args = {
+                "task": (
+                    active_plan.get("user_request", user_text)
+                    + "\n\nYour previous answer was rejected.\nProblems:\n"
+                    + "\n".join(f"- {p}" for p in validation.get("problems", []))
+                    + "\n\nReturn ONLY:\n--- FILE: path/to/file.py\n@@\n<minimal patch>\n"
+                ),
+                "path": paths[0] if paths else str(PROJECT_ROOT),
+                "model": model, "mode": "patch",
+            }
+            retry_result = execute_tool(tool_name, retry_args)
+            retry_content = normalize_patch_text(extract_tool_content(retry_result))
+            retry_validation = validate_coder_output(retry_content)
+            if retry_validation["ok"]:
+                content = retry_content
+                validation = retry_validation
+            else:
+                content = wrap_invalid_coder_output(retry_content, retry_validation)
+                validation = retry_validation
+
+        emit_event("final", "Coder skill response ready", {"route": resolved_route, "model": model, "validated": validation["ok"]})
+
+        if validation["ok"]:
+            apply_result = apply_file_patch(content)
+            if apply_result.get("ok"):
+                step["status"] = "done"
+                step["summary"] = summarize_step_result(content)
+                active_plan["current_step"] = current_step + 1
+                save_active_plan(active_plan)
+                save_json(active_plan["plan_id"], "status.json", active_plan)
+                emit_event("code_step_ready", f"Step {step.get('id')} complete.", {
+                    "plan_id": active_plan.get("plan_id"), "step": step,
+                    "current_step": active_plan["current_step"],
+                    "remaining": len(steps) - active_plan["current_step"],
+                    "next_step": steps[active_plan["current_step"]] if active_plan["current_step"] < len(steps) else None,
+                })
+            else:
+                content = content + "\n\nAPPLY FAILED:\n" + json.dumps(apply_result, indent=2)
+
+        self._json_response({"model": model, "created_at": now_iso(), "message": {"role": "assistant", "content": content}, "done": True, "validation": validation})
+        return
+
+    # --- normal non-code route ---
+    tool_names = [t["function"]["name"] for t in selected_tools]
+    runtime_mode = write_runtime_mode(resolved_route, model, selected_tools)
+    persona = runtime_mode.get("persona")
+
+    try:
+        sync_kokoro_for_route(resolved_route, model)
+    except Exception as e:
+        emit_event("warning", "Kokoro sync failed", {"route": resolved_route, "model": model, "error": str(e)})
+
+    emit_event("status", "Incoming chat request", {
+        "resolved_route": resolved_route, "resolved_model": model,
+        "stream": stream, "tool_count": len(selected_tools),
+        "tools": tool_names, "user_preview": user_text[:140],
+    })
+
+    if stream:
+        self.send_response(200)
+        self.send_header("Content-Type", "application/x-ndjson")
+        self.send_header("Cache-Control", "no-cache")
+        self.send_header("Connection", "keep-alive")
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.end_headers()
+        stream_direct_chat(self, model, messages, selected_tools=selected_tools, route=resolved_route, persona=persona)
+        return
+
+    if is_simple_direct_chat(user_text, selected_tools, resolved_route):
+        try:
+            data = call_ollama_once(model=model, messages=messages, route=resolved_route, persona=persona, tools=None, stream=False)
+            self._json_response(data)
+        except Exception as e:
+            self._json_response({"model": model, "created_at": now_iso(), "message": {"role": "assistant", "content": f"Error: {e}"}, "done": True})
+        return
+
+    if selected_tools:
+        ack = random.choice(ACKS)
+        write_bridge_status("thinking", ack)
+        speak_ack(ack)
+        result = react_chat(model, messages, selected_tools, route=resolved_route, persona=persona)
+        self._json_response(result)
+        return
+
+
+# -----------------------------------------------------------------------------
+# Local chat call (react_server loopback)
+# -----------------------------------------------------------------------------
+def call_local_chat(payload: dict) -> dict:
+    """Call react_server /api/chat locally — used by WebSocket handler."""
+    REACT_SERVER = os.environ.get("JARVIS_REACT_SERVER", "http://127.0.0.1:7900")
+
+    req = urllib.request.Request(
+        f"{REACT_SERVER}/api/chat",
+        data=json.dumps(payload).encode(),
+        headers={"Content-Type": "application/json"},
+    )
+
+    try:
+        with urllib.request.urlopen(req, timeout=600) as resp:
+            return json.loads(resp.read().decode("utf-8"))
+    except Exception as e:
+        emit_event("warning", "call_local_chat failed", {"error": str(e)})
+        return {"message": {"role": "assistant", "content": f"Error: {e}"}, "done": True}
+
 def build_tool_direct_match(tool_skill_meta: Dict[str, Dict[str, Any]]) -> Dict[str, List[str]]:
     out: Dict[str, List[str]] = {}
     for tool_name, meta in tool_skill_meta.items():
@@ -1013,6 +2247,17 @@ Rules:
             },
         )
         return parsed
+def read_json_body(handler):
+    length = int(handler.headers.get("Content-Length", 0))
+
+    if length <= 0:
+        return {}
+
+    try:
+        raw = handler.rfile.read(length).decode("utf-8")
+        return json.loads(raw)
+    except Exception:
+        return {}
     
 def reload_all_skills() -> Dict[str, Any]:
     global TOOLS, TOOL_MAP, TOOL_KEYWORDS, TOOL_SKILL_META
@@ -2179,31 +3424,11 @@ def speak_ack(text: str) -> None:
     if not ENABLE_TTS_ACK:
         return
 
-    def _speak() -> None:
-        if speak_kokoro(text):
-            return
-
-        # fallback Windows voice
-        try:
-            safe = sanitize_for_tts(text)
-            subprocess.run(
-                [
-                    POWERSHELL,
-                    "-Command",
-                    (
-                        "Add-Type -AssemblyName System.Speech; "
-                        "$s = New-Object System.Speech.Synthesis.SpeechSynthesizer; "
-                        "$s.Rate = 2; "
-                        f"$s.Speak('{safe}')"
-                    ),
-                ],
-                timeout=10,
-                capture_output=True,
-            )
-        except Exception as e:
-            debug(f"Fallback ACK TTS error: {e}")
-
-    threading.Thread(target=_speak, daemon=True).start()
+    emit_event("tts_ack", "TTS ack requested", {
+        "text": text,
+        "engine": "kokoro",
+        "delivery": "websocket_required",
+    })
 
 def write_bridge_status(state: str, text: Optional[str] = None) -> None:
     try:
@@ -2315,11 +3540,11 @@ def run_live_router(user_text: str) -> Dict[str, Any]:
             "num_ctx": 4096,
         },
     }
-    #emit_event("warning", "Live router running", {"error": "Running live router", "payload": payload})
+    emit_event("warning", "Live router running", {"error": "Running live router", "payload": payload})
     try:
         with request_chat_backend(payload, timeout=CHAT_TIMEOUT_SEC, route="live") as resp:
             data = normalize_chat_response(json.loads(resp.read().decode("utf-8")))
-
+        emit_event("warning", "Live router running", {"error": "Running live router", "reponse": data})
         raw = data.get("message", {}).get("content", "")
         parsed = parse_json_object_from_text(raw)
         if isinstance(parsed, dict):
@@ -2328,6 +3553,8 @@ def run_live_router(user_text: str) -> Dict[str, Any]:
             parsed.setdefault("tool", None)
             parsed.setdefault("args", {})
             parsed.setdefault("speak", "")
+            parsed.setdefault("need_memory", "")
+            parsed.setdefault("memory_confidence", "")
             parsed.setdefault("transcript", user_text)
 
             # Backward compatibility with old router schema
@@ -2363,6 +3590,8 @@ def run_live_router(user_text: str) -> Dict[str, Any]:
             "chat_confidence": 0.5,
             "escalation_confidence": 0.0,
             "execute_confidence": 0.0,
+            "need_memory": False,
+            "memory_confidence": 0.0,
             "args": {},
         }
 
@@ -2801,22 +4030,89 @@ def normalized_route(requested_route: Optional[str], selected_tools: List[Dict[s
     if requested_route in VALID_ROUTES:
         return requested_route
     return infer_route_from_tools(selected_tools)
+def request_llama_cpp_chat(
+    payload: Dict[str, Any],
+    timeout: int = CHAT_TIMEOUT_SEC,
+):
+    req = urllib.request.Request(
+        f"{LLAMA_CPP_HOST}/v1/chat/completions",
+        data=json.dumps(payload).encode("utf-8"),
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    return urllib.request.urlopen(req, timeout=timeout)
 
+def call_ollama_once(
+    model: str,
+    messages: List[Dict[str, Any]],
+    route: str,
+    persona: Optional[str] = None,
+    tools: Optional[List[Dict[str, Any]]] = None,
+    stream: bool = False,
+) -> Dict[str, Any]:
+    final_messages = compact_context(
+        normalize_messages(
+            messages,
+            system_prompt=build_system_prompt_for_route(
+                route,
+                persona=persona,
+            ),
+        )
+    )
 
-def call_ollama_once(model: str, messages: List[Dict[str, Any]], route: str, persona: Optional[str] = None, tools: Optional[List[Dict[str, Any]]] = None, stream: bool = False) -> Dict[str, Any]:
+    # llama.cpp path for live/fast
+    if route in LLAMA_CPP_ROUTES:
+        payload: Dict[str, Any] = {
+            "model": model,
+            "messages": final_messages,
+            "stream": False,
+            "temperature": 0.3,
+        }
+
+        with request_llama_cpp_chat(
+            payload,
+            timeout=CHAT_TIMEOUT_SEC,
+        ) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+
+        content = (
+            data.get("choices", [{}])[0]
+            .get("message", {})
+            .get("content", "")
+        )
+
+        return {
+            "model": model,
+            "created_at": now_iso(),
+            "message": {
+                "role": "assistant",
+                "content": content,
+            },
+            "done": True,
+            "route": route,
+            "provider": "llama.cpp",
+            "raw": data,
+        }
+
+    # Ollama path for tools/reason/code/deep
     payload: Dict[str, Any] = {
         "model": model,
-        "messages": compact_context(normalize_messages(messages, system_prompt=build_system_prompt_for_route(route, persona=persona))),
+        "messages": final_messages,
         "stream": stream,
     }
+
     profile_options = get_profile_options(profile_override=persona)
     if profile_options:
         payload["options"] = profile_options
+
     if tools and model not in NO_TOOLS_MODELS and not is_coder_model(model):
         payload["tools"] = tools
-    with request_ollama_chat(payload, timeout=CHAT_TIMEOUT_SEC) as resp:
-        return json.loads(resp.read().decode("utf-8"))
 
+    with request_ollama_chat(
+        payload,
+        timeout=CHAT_TIMEOUT_SEC,
+    ) as resp:
+        return json.loads(resp.read().decode("utf-8"))
 # -----------------------------------------------------------------------------
 # Tool selection
 # -----------------------------------------------------------------------------
@@ -3474,8 +4770,9 @@ def react_chat(model: str, messages: List[Dict[str, Any]], tools: Optional[List[
 
         try:
             emit_event("status", "Calling Ollama", {"request_id": run.request_id, "iteration": iteration, "model": model, "route": route, "persona": persona, "use_tools": use_tools})
-            with request_ollama_chat(body, timeout=CHAT_TIMEOUT_SEC) as resp:
-                data = json.loads(resp.read().decode("utf-8"))
+            with request_chat_backend(body, timeout=CHAT_TIMEOUT_SEC, route=route) as resp:
+                raw = resp.read().decode("utf-8")
+                data = normalize_chat_response(json.loads(raw))
         except urllib.error.HTTPError as e:
             try:
                 error_body = e.read().decode("utf-8", errors="replace")
@@ -3526,7 +4823,6 @@ def react_chat(model: str, messages: List[Dict[str, Any]], tools: Optional[List[
 # Streaming support
 # -----------------------------------------------------------------------------
 
-
 def stream_direct_chat(handler: "ReactHandler", model: str, messages: List[Dict[str, Any]], selected_tools: Optional[List[Dict[str, Any]]] = None, route: str = "reason", persona: Optional[str] = None) -> None:
     user_text = get_last_user_text(messages)
     user_text = clean_telegram_prefix(user_text)
@@ -3556,7 +4852,8 @@ def stream_direct_chat(handler: "ReactHandler", model: str, messages: List[Dict[
     if profile_options:
         body["options"] = profile_options
     try:
-        with request_ollama_chat(body, timeout=CHAT_TIMEOUT_SEC) as resp:
+        
+        with request_chat_backend(body, timeout=CHAT_TIMEOUT_SEC, route=route) as resp:
             for raw_line in resp:
                 if not raw_line:
                     continue
@@ -3577,17 +4874,98 @@ def stream_direct_chat(handler: "ReactHandler", model: str, messages: List[Dict[
 class ReactHandler(BaseHTTPRequestHandler):
     server_version = "JarvisReact/3.0"
 
+# Replace the entire _do_POST_impl with these three functions:
+   # Add this inside class ReactHandler
+
     def do_POST(self) -> None:
-        try:
-            self._do_POST_impl()
-        except Exception as e:
-            error_text = traceback.format_exc(limit=20)
-            print("[REACT] UNHANDLED do_POST ERROR:", error_text)
-            emit_event("warning", "Unhandled do_POST error", {"error": str(e), "traceback": error_text})
+        if self.headers.get("Upgrade", "").lower() == "websocket":
+            self._handle_websocket_upgrade()
+            return
+
+        self._do_POST_impl()
+
+    def handle_live_router(
+        self,
+        body: dict,
+        user_text: str,
+        requested_model: str | None,
+        requested_route: str | None,
+        source: str,
+        messages: list,
+    ) -> tuple[bool, str | None]:
+        return handle_live_router(
+            self,
+            body,
+            user_text,
+            requested_model,
+            requested_route,
+            source,
+            messages,
+        )
+
+    def handle_full_pipeline(
+        self,
+        body: dict,
+        user_text: str,
+        requested_model: str | None,
+        requested_route: str | None,
+        source: str,
+        messages: list,
+        stream: bool,
+    ) -> None:
+        return handle_full_pipeline(
+            self,
+            body,
+            user_text,
+            requested_model,
+            requested_route,
+            source,
+            messages,
+            stream,
+        )
+    
+    def _handle_websocket_upgrade(self) -> None:
+            """Upgrade HTTP connection to WebSocket and hand off to handle_live_ws."""
+
+            import hashlib
+
+            key = self.headers.get("Sec-WebSocket-Key", "")
+            if not key:
+                self.send_error(400, "Missing Sec-WebSocket-Key")
+                return
+
+            accept = base64.b64encode(
+                hashlib.sha1((key + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11").encode()).digest()
+            ).decode()
+
+            self.send_response(101)
+            self.send_header("Upgrade", "websocket")
+            self.send_header("Connection", "Upgrade")
+            self.send_header("Sec-WebSocket-Accept", accept)
+            self.end_headers()
+
+            # Hand off to async WebSocket handler
+            import asyncio
+
+            loop = asyncio.new_event_loop()
             try:
-                self._json_response({"error": "Internal server error", "detail": str(e), "traceback": error_text}, code=500)
-            except Exception:
-                pass
+                loop.run_until_complete(
+                    _run_live_ws(self.rfile, self.wfile)
+                )
+            except Exception as e:
+                debug(f"WebSocket handler error: {e}")
+            finally:
+                loop.close()
+
+    def _parse_request_body(self) -> tuple[dict, str]:
+        """Parse POST body, return (body_dict, error_str)."""
+        try:
+            length = int(self.headers.get("Content-Length", 0))
+            raw_body = self.rfile.read(length).decode("utf-8") if length else "{}"
+            return json.loads(raw_body), ""
+        except Exception as e:
+            return {}, str(e)
+    
 
     def _do_POST_impl(self) -> None:
         path = urlparse(self.path).path
@@ -3595,11 +4973,8 @@ class ReactHandler(BaseHTTPRequestHandler):
             self.send_error(404)
             return
 
-        try:
-            length = int(self.headers.get("Content-Length", 0))
-            raw_body = self.rfile.read(length).decode("utf-8") if length else "{}"
-            body = json.loads(raw_body)
-        except Exception:
+        body, err = self._parse_request_body()
+        if err:
             self._json_response({"error": "Invalid JSON body"}, code=400)
             return
 
@@ -3615,1420 +4990,343 @@ class ReactHandler(BaseHTTPRequestHandler):
 
         user_text = get_last_user_text(messages)
         user_text = clean_telegram_prefix(user_text)
-        #### REMove if needed after testing
-    
 
-        live_result = run_live_router(user_text)
-        live_result = force_correct_common_tool(user_text, live_result)
-        live_action = live_result.get("action")
-        #live_confidence = float(live_result.get("confidence") or 0)
-        chat_confidence = float(
-            live_result.get("chat_confidence", 0)
-        )
-
-        escalation_confidence = float(
-            live_result.get("escalation_confidence", 0)
-)
-        execute_confidence = float(
-            live_result.get("execute_confidence", 0)
-)
-
-        live_speak = str(live_result.get("speak") or "").strip()
-        write_chat_log("assistant", live_speak, route=live_action, model="live")
-        live_transcript = str(live_result.get("transcript") or "").strip()
-        live_tool = str(live_result.get("tool") or "").strip()
-        live_intent = str(live_result.get("intent") or "").strip()
-        live_args = live_result.get("args") or {}
-        emit_event(
-            "Live router",
-            "Reply and confidence",
-            {
-                "speak": live_speak,
-                "tool": live_tool,
-                "escalation_confidence": escalation_confidence,
-                "execute_confidence": execute_confidence,
-                "chat_confidence": chat_confidence,
-                "user_text": user_text[:200],
-            },
-        )
-        if not isinstance(live_args, dict):
-            live_args = {}
-
-        if live_tool == "radio" and live_args.get("action") == "play" and not live_args.get("station"):
-            live_action = "chat_only"
-            live_speak = "Which radio station should I play?"
-        notify_telegram(f"{live_speak}")
-        if live_transcript:
-            user_text = live_transcript
-        #else:
-        ##    user_text_for_routing = user_text
-        if live_action == "chat_only" and (chat_confidence >= 0.70 or escalation_confidence == 0.0) and live_speak:
-            #if source == "telegram":
-            #    notify_telegram(live_speak)
-            
-            self._json_response({
-                "model": "live_router",
-                "created_at": now_iso(),
-                "message": {
-                    "role": "assistant",
-                    "content": live_speak,
-                },
-                "done": True,
-                "route": "live",
-                "live": live_result,
-            })
-            return
-        ##elif source == "telegram":
-        ##    notify_telegram(f"{live_speak}")
-        #if live_action == "direct_tool":
-        live_direct_skill_match = resolve_skill_command(user_text)
-        live_tool_fixed = live_tool
-        
-        if live_direct_skill_match and live_direct_skill_match.get("score", 0) >= 0.88:
-            live_tool_fixed = live_direct_skill_match.get("tool_name")
-        if (
-            live_action == "direct_tool"
-            and execute_confidence >= 0.75
-            and live_tool_fixed
-            and live_tool_fixed in TOOL_MAP
-        ):
-            live_result = complete_tool_args_with_meta(
-            tool_name=live_tool_fixed,
+        # --- live router fast path ---
+        handled, route_override = self.handle_live_router(
+            body=body,
             user_text=user_text,
-            parsed=live_result,
-            )
-            live_args = live_result.get("args") or {}
-            result = execute_tool(live_tool_fixed, live_args)
-            sent_media = False
-            if source == "telegram" and live_tool_fixed == "flux":
-                sent_media = send_flux_result_to_telegram(result)
-                if source == "telegram":
-                    if sent_media:
-                        notify_telegram("Image sent to Telegram!")
-                    else:
-                        notify_telegram("Failed to send image to Telegram.")
-            content = extract_tool_content(result)
-            reply = content or live_speak or f"Done: {live_tool_fixed}"
-            if log_chat_event and reply.strip():
-                try:
-                    write_chat_log("user", user_text, route=route, model=model)
-                    write_chat_log("assistant", reply_text, route=route, model=model)
-                except Exception as e:
-                    print(f"[CHAT_LOG] assistant and user log failed: {e}")
-            ##if source == "telegram":
-            ##    notify_telegram(reply)
-            
-            emit_event(
-                "router",
-                "Live router decision",
-                {
-                    "action": live_result.get("action"),
-                    "route": live_result.get("route"),
-                    "tool": live_tool_fixed,
-                    "chat_confidence": live_result.get("chat_confidence"),
-                    "escalation_confidence": live_result.get("escalation_confidence"),
-                    "execute_confidence": live_result.get("execute_confidence"),
-                    "intent": live_result.get("intent"),
-                    "speak": live_result.get("speak", "")[:300],
-                },
-            )
-            self._json_response({
-                "model": "live_router",
-                "created_at": now_iso(),
-                "message": {
-                    "role": "assistant",
-                    "content": reply,
-                },
-                "done": True,
-                "route": "tools",
-                "format": "direct_tool",
-                "tool": live_tool,
-                "tool_result": result,
-                "live": live_result,
-            })
-            return
-    
-        normalized_user = user_text.strip().lower()
-
-        is_code_request = any(x in normalized_user for x in [
-            "code",
-            "fix",
-            "edit",
-            "patch",
-            "implement",
-            "create script",
-            "save it",
-            "write it",
-            ".py",
-            ".js",
-            ".ts",
-            "tester",
-            "test_",
-            "react_server.py",
-        ])
-
-        if live_action == "code" or live_result.get("route") == "code":
-            requested_route = "code"
-
-        if is_code_request:
-            requested_route = "code"
-
-        # Disable fuzzy skill matching for coder requests
-        if requested_route == "code":
-            direct_skill_match = None
-        else:
-            direct_skill_match = resolve_skill_command(user_text)
-            if direct_skill_match and direct_skill_match.get("score", 0) >= 0.88:
-                live_result.update({
-                    "action": "direct_tool",
-                    "route": "tools",
-                    "tool": direct_skill_match["tool_name"],
-                    "chat_confidence": 0.0,
-                    "escalation_confidence": 1.0,
-                    "execute_confidence": 1.0,
-                    "args": live_result.get("args") or {},
-                })
-                requested_route = "tools"
-
-        live_action = live_result.get("action")
-        if live_action == "chat_only":
-            requested_route = "live"
-        elif live_action == "direct_tool":
-            requested_route = "tools"
-        elif live_action == "planner":
-            requested_route = "reason"
-        elif live_action == "code":
-            requested_route = "code"
-        elif live_action == "deep_agent":
-            requested_route = "deep"
-        if direct_skill_match:
-            requested_route = "tools"
-        workflow_state = load_workflow_state()
-
-        if workflow_state:
-            reply = continue_markdown_workflow(user_text, workflow_state)
-
-            self._json_response({
-                "model": "workflow",
-                "created_at": now_iso(),
-                "message": {"role": "assistant", "content": reply},
-                "done": True,
-            })
+            requested_model=requested_model,
+            requested_route=requested_route,
+            source=source,
+            messages=messages,
+        )
+        if handled:
             return
 
-        md_skill = match_markdown_skill(user_text)
+        # update user_text from transcript if live router rewrote it
+        user_text = body.get("_user_text", user_text)
+        if route_override:
+            requested_route = route_override
 
-        if md_skill:
-            body["markdown_skill"] = md_skill
-            requested_route = md_skill.get("route", requested_route or "reason")
-
-            if md_skill.get("type") == "interview_workflow":
-                state = {
-                    "skill": md_skill.get("name"),
-                    "skill_path": md_skill.get("path"),
-                    "phase": "interview",
-                    "answers": {},
-                }
-
-                save_workflow_state(state)
-
-                question = get_next_workflow_question(state)
-
-                self._json_response({
-                    "model": "workflow",
-                    "created_at": now_iso(),
-                    "message": {
-                        "role": "assistant",
-                        "content": question or "Workflow started.",
-                    },
-                    "done": True,
-                })
-                return
-            if live_action == "chat_only" and requested_route == "live" and live_intent == "chat_history_query":
-                model = resolve_model(requested_model=requested_model, route="live")
-
-                try:
-                    from scripts.chat_context import read_last_chat_log_chars
-                except Exception:
-                    from chat_context import read_last_chat_log_chars
-
-                recent_chat = read_last_chat_log_chars(max_chars=4000)
-
-                history_context = (
-                    "Recent chat log. Use this to answer the user's question about recent discussion. "
-                    "Do not dump the log unless the user asks. Answer concisely.\n\n"
-                    + recent_chat
-                )
-
-                messages.insert(1, {
-                    "role": "system",
-                    "content": history_context,
-                })
-
-                data = call_ollama_once(
-                    model=model,
-                    messages=messages,
-                    route="live",
-                    persona=None,
-                    tools=None,
-                    stream=False,
-                )
-
-                reply_text = (
-                    data.get("message", {}).get("content", "")
-                    if isinstance(data, dict)
-                    else ""
-                )
-                write_chat_log("assistant", reply_text, route=route, model=model)
-                if log_chat_event and reply_text.strip():
-                    try:
-                        write_chat_log("user", user_text, route=route, model=model)
-                        write_chat_log("assistant", reply_text, route=route, model=model)
-                    except Exception as e:
-                        print(f"[CHAT_LOG] assistant log failed: {e}")
-                if source == "telegram" and reply_text.strip():
-                    notify_telegram("test"+reply_text.strip())
-
-                self._json_response({
-                    **data,
-                    "route": "live",
-                    "live": live_result,
-                    "chat_history_used": True,
-                })
-                return
-            if live_result.get("action") == "chat_only" and requested_route == "live":
-                model = resolve_model(requested_model=requested_model, route="live")
-                self_context = build_self_context_prompt(persona=persona, max_tools=20)
-
-                messages.insert(1, {
-                    "role": "system",
-                    "content": (
-                        "JARVIS self-context. Use this to understand who you are and what you can do. "
-                        "Do not over-explain it unless asked.\n\n"
-                        + self_context
-                    )
-                })
-                data = call_ollama_once(
-                    model=model,
-                    messages=messages,
-                    route="live",
-                    persona=None,
-                    tools=None,
-                    stream=False,
-                )
-
-                reply_text = (
-                    data.get("message", {}).get("content", "")
-                    if isinstance(data, dict)
-                    else ""
-                )
-                write_chat_log("assistant", reply_text, route=route, model=model)
-                if source == "telegram" and reply_text.strip():
-                    notify_telegram(reply_text.strip())
-                write_chat_log("assistant", reply_text, route=route, model=model)
-                self._json_response({
-                    **data,
-                    "route": "live",
-                    "live": live_result,
-                })
-                return
-        # ------------------------------------------------------------
-        # Memory context
-        # ------------------------------------------------------------
-        # IMPORTANT:
-        # - user_text stays clean/raw for route detection, command parsing, and tool selection.
-        # - planner_user_text may include memory hints for planning/reasoning only.
-        # - memory must never override the current user command.
-        # ------------------------------------------------------------
-
-        plan_command, plan_command_id = parse_plan_command(user_text)
-        lower_user = user_text.strip().lower()
-
-        active_task_followups = {
-            "proceed",
-            "continue",
-            "save it",
-            "write it",
-            "create it",
-            "do it",
-            "yes",
-            "yes proceed",
-            "show directory",
-            "save it and show directory",
-        }
-        direct_command_prefixes = (
-            "list skills",
-            "show skills",
-            "what skills",
-            "reload skills",
-            "play ",
-            "stop radio",
-            "timer ",
-            "set timer",
-            "health",
+        # --- full pipeline ---
+        self.handle_full_pipeline(
+            body=body,
+            user_text=user_text,
+            requested_model=requested_model,
+            requested_route=requested_route,
+            source=source,
+            messages=messages,
+            stream=stream,
         )
-        normalized_user = user_text.strip().lower()
-
-        is_active_followup = normalized_user in active_task_followups
-        skip_memory = (
-            requested_route == "live"
-            or bool(direct_skill_match)
-            or  is_active_followup
-            or bool(md_skill)
-            or plan_command in {"proceed", "continue", "next", "run", "yes", "cancel"}
-            or lower_user.startswith(direct_command_prefixes)
-        )
-
-        context_pack = ""
-        planner_user_text = user_text
-
-        if not skip_memory:
-            context_pack = build_context_pack(user_text)
-
-            if context_pack:
-                context_system_message = {
-                    "role": "system",
-                    "content": (
-                        "Memory context is optional background only. "
-                        "The current user message is the command. "
-                        "Do not change the user's intent based on memory. "
-                        "If memory conflicts with the current command, ignore memory.\n\n"
-                        + context_pack
-                    ),
-                }
-
-                insert_at = 1 if messages and messages[0].get("role") == "system" else 0
-                messages.insert(insert_at, context_system_message)
-
-                planner_user_text = (
-                    "USER COMMAND:\n"
-                    f"{user_text}\n\n"
-                    "OPTIONAL MEMORY HINTS:\n"
-                    f"{context_pack[:2500]}\n\n"
-                    "Instruction: obey USER COMMAND. Use memory only as supporting context."
-                )
-                emit_event(
-                    "debug",
-                    "Planner text",
-                    {
-                        "chars": len(planner_user_text),
-                        "preview": planner_user_text[:4000],
-                    },
-                )
-        #plan_command, plan_command_id = parse_plan_command(user_text)
-##### planner
-
-        if source == "telegram" and plan_command in {"proceed", "continue", "next", "run", "modify", "cancel","accept"}:
-            requested_route = "code"
-            requested_model = None
-
-        if requested_route not in VALID_ROUTES:
-            requested_route = detect_route(user_text, source)
-
-        selected_tools: List[Dict[str, Any]] = []
-
-        plan_command, plan_command_id = parse_plan_command(user_text)
-        plan_decision = None
-
-        if plan_command in {"proceed", "continue", "next", "run", "yes", "accept"}:
-            plan_decision = {
-                "action": "code",
-                "route": "code",
-                "chat_confidence": 0.0,
-                "execution_confidence": 1.0,
-                "continue_plan": True,
-                "plan_action": "continue",
-            }
-            requested_route = "code"
-            requested_model = None
-
-        elif plan_command == "modify":
-            plan_decision = {
-                "action": "planner",
-                "route": "reason",
-                "chat_confidence": 1.0,
-                "execution_confidence": 0.0,
-                "continue_plan": True,
-                "plan_action": "modify",
-            }
-            requested_route = "code"
-            requested_model = None
-
-        elif plan_command == "cancel":
-            plan_decision = {
-                "action": "code",
-                "route": "code",
-                "chat_confidence": 0.0,
-                "execution_confidence": 1.0,
-                "continue_plan": True,
-                "plan_action": "cancel",
-            }
-            requested_route = "code"
-            requested_model = None
-
-        if direct_skill_match:
-            selected_tools = [direct_skill_match["tool"]]
-        elif plan_command in {"proceed", "continue", "next", "run", "modify", "cancel"}:
-            selected_tools = []
-        elif should_select_tools(user_text, requested_route, requested_model):
-            selected_tools = choose_tools(
-                user_text,
-                requested_route=requested_route,
-                requested_model=requested_model,
-            )
-        emit_event(
-            "router",
-            "Fuzzy skill command match",
-            {
-                "matched": bool(direct_skill_match),
-                "tool": direct_skill_match.get("tool_name") if direct_skill_match else None,
-                "phrase": direct_skill_match.get("phrase") if direct_skill_match else None,
-                "score": direct_skill_match.get("score") if direct_skill_match else None,
-                "user_text": user_text[:200],
-            },
-        )
-
-        resolved_route = normalized_route(requested_route, selected_tools)
-
-        is_code_request = any(x in user_text.lower() for x in [
-            "code", "fix", "edit", "implement", "create script",
-            "save it", ".py", "tester"
-        ])
-
-        if is_code_request or (plan_decision and plan_decision.get("execution_confidence", 0) >= 0.85):
-            resolved_route = "code"
-
-        if resolved_route == "code":
-            requested_model = None
-            model = resolve_model(requested_model=None, route="code")
-            selected_tools = [TOOLS_BY_NAME["code_edit"]] if "code_edit" in TOOLS_BY_NAME else []
-        else:
-            model = resolve_model(requested_model=requested_model, route=resolved_route)
-
-        route = resolved_route
-        if log_chat_event:
-            try:
-                log_chat_event(
-                    role="user",
-                    content=user_text,
-                    route=route,
-                    model=model,
-                )
-            except Exception as e:
-                print(f"[CHAT_LOG] user log failed: {e}")
-        if user_text.lower().startswith("agent: continue"):
-            task = get_active_task(TASK_GRAPH_PATH)
-
-            if task:
-                user_text = (
-                    f"Continue this task.\n\n"
-                    f"Original request:\n{task.get('user_request')}\n\n"
-                    f"Steps:\n{json.dumps(task.get('steps', []), indent=2)}\n\n"
-                    f"Recent events:\n{json.dumps(task.get('events', [])[-10:], indent=2)}"
-                )
-
-                body["task_id"] = task.get("id")
-        # Optional agent executor.
-        # Do NOT hijack code route, because direct coder route below has its own planner/apply flow.
-        agent_requested = (
-            route == "deep" 
-            or user_text.lower().startswith(("agent:", "do task:"))
-        )
-    
-
-        if agent_requested:
-            result = run_agent_loop(
-                user_message=planner_user_text,
-                route=route,
-                model=model,
-                tools_by_name=TOOLS_BY_NAME,
-                tool_map=TOOL_MAP,
-                call_ollama_once=call_ollama_once,
-                execute_tool=execute_tool,
-                emit_event=emit_event,
-                truncate_text=truncate_text,
-                strip_thinking_tags=strip_thinking_tags,
-                now_iso=now_iso,
-                task_graph_path=TASK_GRAPH_PATH,
-                task_id=body.get("task_id"),
-                max_steps=8,
-            )
-            write_chat_log("assistant", reply_text, route=route, model=model)
-            if isinstance(result, dict) and result.get("kind") == "report":
-                report_path = write_analysis_report(
-                    skill_name=tool_name,
-                    plan_id=result.get("plan_id") or plan_id,
-                    result=result,
-                )
-
-                emit_event("artifact", "Analysis report written", {
-                    "plan_id": plan_id,
-                    "skill": tool_name,
-                    "path": str(report_path),
-                })
-
-                return {
-                    "ok": True,
-                    "kind": "report",
-                    "path": str(report_path),
-                    "message": f"Report written to {report_path}",
-                }
-            self._json_response({
-                "model": model,
-                "created_at": now_iso(),
-                "message": {
-                    "role": "assistant",
-                    "content": result.get("answer", ""),
-                },
-                "done": True,
-                "route": route,
-                "format": "agent",
-                "task_id": result.get("task_id"),
-                "agent": {
-                    "trace": result.get("trace", []),
-                    "observations": result.get("observations", []),
-                },
-            })
-            return
-        # ------------------------------------------------------------------
-        # Direct coder route
-        # ------------------------------------------------------------------
-        if resolved_route == "code" and is_coder_model(model):
-            coder_tool = get_coder_tool()
-
-            if coder_tool:
-                selected_tools = [coder_tool]
-
-            tool_names = [
-                t["function"]["name"]
-                for t in selected_tools
-                if isinstance(t, dict) and isinstance(t.get("function"), dict)
-            ]
-
-            runtime_mode = write_runtime_mode(resolved_route, model, selected_tools)
-            persona = runtime_mode.get("persona")
-
-            try:
-                sync_kokoro_for_route(resolved_route, model)
-            except Exception as e:
-                emit_event(
-                    "warning",
-                    "Orpheus sync failed",
-                    {"route": resolved_route, "model": model, "error": str(e)},
-                )
-
-            emit_event(
-                "status",
-                "Incoming coder skill request",
-                {
-                    "requested_model": requested_model,
-                    "requested_route": requested_route,
-                    "source": source,
-                    "resolved_route": resolved_route,
-                    "resolved_model": model,
-                    "tools": tool_names,
-                    "user_preview": user_text[:140],
-                    "runtime_mode": runtime_mode,
-                },
-            )
-
-            if not selected_tools:
-                self._json_response(
-                    {
-                        "model": model,
-                        "created_at": now_iso(),
-                        "message": {
-                            "role": "assistant",
-                            "content": f"Code route selected, but no coder skill was loaded. Expected tool: code_edit. Found: {tool_names}",
-                        },
-                        "done": True,
-                    }
-                )
-                return
-
-            ack = random.choice(ACKS)
-            write_bridge_status("thinking", ack)
-            append_log(f"[{datetime.now().strftime('%H:%M:%S')}] ACK: {ack}")
-            speak_ack(ack)
-
-            tool_name = selected_tools[0]["function"]["name"]
-
-            paths = body.get("paths")
-            if not isinstance(paths, list) or not paths:
-                paths = guess_coding_paths(user_text)
-
-            command, requested_plan_id = parse_plan_command(user_text)
-
-            if requested_plan_id:
-                active_plan = load_plan_by_id(requested_plan_id)
-            else:
-                active_plan = load_active_plan()
-            if requested_plan_id and active_plan:
-                save_active_plan(active_plan)
-           
-            emit_event(
-                "code_phase",
-                "Guessed coding paths",
-                {
-                    "paths": paths,
-                },
-            )
-
-           
-            if command == "cancel":
-
-                if not requested_plan_id:
-                    self._json_response({
-                        "model": model,
-                        "created_at": now_iso(),
-                        "message": {"role": "assistant", "content": "Cancel failed: missing plan id."},
-                        "done": True,
-                    })
-                    return
-
-                plan = load_plan_by_id(requested_plan_id)
-                if not plan:
-                    self._json_response({
-                        "model": model,
-                        "created_at": now_iso(),
-                        "message": {"role": "assistant", "content": f"Plan not found: {requested_plan_id}"},
-                        "done": True,
-                    })
-                    return
-
-                plan["status"] = "cancelled"
-                plan["cancelled_at"] = now_iso()
-                save_json(requested_plan_id, "status.json", plan)
-
-                self._json_response({
-                    "model": model,
-                    "created_at": now_iso(),
-                    "message": {"role": "assistant", "content": f"Cancelled plan {requested_plan_id}."},
-                    "done": True,
-                })
-                return
-            # Modify current plan / create new modified plan
-            if command == "modify" or user_text.strip().lower().startswith("modify this plan:"):
-                active_plan = build_simple_code_plan(planner_user_text, paths)
-                
-                emit_event(
-                    "code_phase",
-                    "Plan modified",
-                    {
-                        "phase": "plan_modified",
-                        "plan_id": active_plan.get("plan_id"),
-                        "steps": active_plan.get("steps", []),
-                    },
-                )
-                save_json(active_plan["plan_id"], "plan.json", active_plan)
-
-                append_event(
-                    "plan.modified",
-                    "Coding plan modified",
-                    plan_id=active_plan.get("plan_id"),
-                    route="code",
-                    model=active_plan.get("planner_model"),
-                    payload={"steps": active_plan.get("steps", [])},
-                )
-                save_active_plan(active_plan)
-                
-                self._json_response(
-                    {
-                        "model": model,
-                        "created_at": now_iso(),
-                        "message": {"role": "assistant", "content": render_plan(active_plan)},
-                        "done": True,
-                    }
-                )
-                return
-
-            # New request creates plan first
-            if command not in {"proceed", "continue", "next", "run", "yes","accept"}:
-                active_plan = build_simple_code_plan(planner_user_text, paths)
-    # ADD HERE
-                plan_files = active_plan.get("files") or []
-                has_plan_file = any("." in str(p).split("/")[-1] for p in plan_files)
-
-                if needs_output_path(user_text, paths) and not has_plan_file:
-                    plan_id = active_plan["plan_id"]
-
-                    active_plan["state"] = "waiting_input"
-                    active_plan["waiting_for"] = "output_path"
-                    save_active_plan(active_plan)
-
-                    self._json_response({
-                        "model": model,
-                        "created_at": now_iso(),
-                        "message": {
-                            "role": "assistant",
-                            "content": (
-                                f"PLAN_ID: {plan_id}\n\n"
-                                "Where should I save the generated file?\n\n"
-                                "Examples:\n"
-                                "- love.html\n"
-                                "- app/page.tsx\n"
-                                "- scripts/test.py"
-                            ),
-                        },
-                        "done": True,
-                        "route": "code",
-                    })
-                    return
-
-                # continue normal planner/coder flow
-                emit_event(
-                    "code_phase",
-                    "Plan created",
-                    {
-                        "phase": "plan_created",
-                        "plan_id": active_plan.get("plan_id"),
-                        "steps": active_plan.get("steps", []),
-                    },
-                )
-                append_event(
-                    "planner.done",
-                    "Planner returned coding plan",
-                    plan_id=active_plan.get("plan_id"),
-                    route="code",
-                    model=active_plan.get("planner_model"),
-                    payload={
-                        "steps": active_plan.get("steps", []),
-                        "paths": active_plan.get("paths", []),
-                    },
-                )
-                save_active_plan(active_plan)
-                self._json_response(
-                    {
-                        "model": model,
-                        "created_at": now_iso(),
-                        "message": {"role": "assistant", "content": render_plan(active_plan)},
-                        "done": True,
-                    }
-                )
-                return
-
-            # Proceed / continue requires active plan
-            if not active_plan:
-                self._json_response(
-                    {
-                        "model": model,
-                        "created_at": now_iso(),
-                        "message": {
-                            "role": "assistant",
-                            "content": "No active coding plan found. Send the coding request first.",
-                        },
-                        "done": True,
-                    }
-                )
-                return
-
-            current_step = int(active_plan.get("current_step", 0))
-            steps = active_plan.get("steps", [])
-
-            if current_step >= len(steps):
-                self._json_response(
-                    {
-                        "model": model,
-                        "created_at": now_iso(),
-                        "message": {"role": "assistant", "content": "Coding plan is already complete."},
-                        "done": True,
-                    }
-                )
-                return
-
-            step = steps[current_step]
-
-            emit_event(
-                "code_phase",
-                f"Running step {step.get('id')}: {step.get('goal')}",
-                {
-                    "phase": "running_step",
-                    "plan_id": active_plan.get("plan_id"),
-                    "step": step,
-                    "paths": paths,
-                },
-            )
-
-            fn_args = {
-                "task": (
-                    active_plan.get("user_request", user_text)
-                    + "\n\nCurrent approved planner step:\n"
-                    + str(step.get("goal", "Make a minimal patch."))
-                    + "\n\nOUTPUT FORMAT STRICT:\n"
-                    + "--- FILE: path/to/file.py\n"
-                    + "@@\n"
-                    + "<only changed function/helper blocks>\n\n"
-                    + "Rules:\n"
-                    + "- Must include --- FILE\n"
-                    + "- Must include @@\n"
-                    + "- No full files unless creating a new file\n"
-                    + "- Minimal patch only\n"
-                    + "- No shell commands\n"
-                ),
-                "path": paths[0] if paths else str(PROJECT_ROOT),
-                "model": model,
-                "mode": "patch",
-            }
-
-            emit_event(
-                "status",
-                "Executing coder skill directly",
-                {
-                    "route": resolved_route,
-                    "model": model,
-                    "tool": tool_name,
-                    "args": fn_args,
-                },
-            )
-            append_event(
-                "coder.start",
-                f"Coder started step {step.get('id')}",
-                plan_id=active_plan.get("plan_id"),
-                task_id=str(step.get("id")),
-                route=resolved_route,
-                model=model,
-                payload={
-                    "tool": tool_name,
-                    "step": step,
-                    "paths": paths,
-                },
-            )
-            result = run_agent_loop(
-                user_message=(
-                    "Execute this approved plan only.\n\n"
-                    f"Plan:\n{json.dumps(active_plan, indent=2)}\n\n"
-                    "Rules:\n"
-                    "- Follow the plan step by step.\n"
-                    "- Do not add new goals.\n"
-                    "- Use code_edit only for file changes.\n"
-                    "- Do not use flux for HTML/CSS animation.\n"
-                    "- Stop when the plan is complete.\n"
-                ),
-                route="code",
-                model=model,
-                tools_by_name={"code_edit": TOOLS_BY_NAME["code_edit"]},
-                tool_map={"code_edit": TOOL_MAP["code_edit"]},
-                call_ollama_once=call_ollama_once,
-                execute_tool=execute_tool,
-                emit_event=emit_event,
-                truncate_text=truncate_text,
-                strip_thinking_tags=strip_thinking_tags,
-                now_iso=now_iso,
-                task_graph_path=TASK_GRAPH_PATH,
-                task_id=active_plan.get("plan_id"),
-                max_steps=len(active_plan.get("steps", [])) + 2,
-            )
-
-            result_dict = result if isinstance(result, dict) else {}
-            result_kind = classify_agent_output_kind(
-                skill_name=tool_name,
-                user_text=user_text,
-                result=result_dict,
-            )
-
-            content = extract_last_patch_from_anything(result)
-            content = normalize_patch_text(content)
-
-            if result_kind == "report":
-                _plan_id = active_plan.get("plan_id") or "report_" + str(uuid.uuid4())[:8]
-
-                markdown = (
-                    result_dict.get("markdown")
-                    or result_dict.get("report")
-                    or result_dict.get("answer")
-                    or result_dict.get("text")
-                    or result_dict.get("content")
-                    or content
-                )
-
-                report_path = write_analysis_report(
-                    skill_name=tool_name,
-                    plan_id=_plan_id,
-                    result={"markdown": markdown},
-                )
-
-                emit_event(
-                    "artifact",
-                    "Analysis report written",
-                    {
-                        "plan_id": _plan_id,
-                        "skill": tool_name,
-                        "path": str(report_path),
-                    },
-                )
-
-                self._json_response(
-                    {
-                        "model": model,
-                        "created_at": now_iso(),
-                        "message": {
-                            "role": "assistant",
-                            "content": markdown,
-                        },
-                        "done": True,
-                        "route": resolved_route,
-                        "format": "report",
-                        "report_path": str(report_path),
-                    }
-                )
-                return
-
-            if "--- FILE:" not in content or "@@" not in content:
-                emit_event(
-                    "warning",
-                    "Coder returned non-patch output",
-                    {
-                        "plan_id": active_plan.get("plan_id"),
-                        "step": step,
-                        "preview": content[:1000],
-                    },
-                )
-
-                content = (
-                    "Coder returned analysis instead of a patch.\n\n"
-                    "This output was rejected.\n\n"
-                    f"Preview:\n{content[:1500]}"
-                )
-
-            patch_file = f"patches/step_{step.get('id')}.patch"
-            (plan_dir(active_plan["plan_id"]) / patch_file).write_text(
-                content,
-                encoding="utf-8",
-            )
-
-            append_event(
-                "coder.done",
-                f"Coder finished step {step.get('id')}",
-                plan_id=active_plan.get("plan_id"),
-                task_id=str(step.get("id")),
-                route=resolved_route,
-                model=model,
-                payload={
-                    "patch_file": patch_file,
-                    "chars": len(content),
-                },
-            )
-
-            if "### PATCH" in content:
-                patch_part = content.split("### PATCH", 1)[1].strip()
-            else:
-                patch_part = content
-
-            validation = validate_coder_output(patch_part)
-
-            emit_event(
-                "code_phase",
-                "Patch returned, validating",
-                {
-                    "phase": "validating_patch",
-                    "plan_id": active_plan.get("plan_id"),
-                    "preview": patch_part[:500],
-                },
-            )
-
-            emit_event(
-                "status",
-                "Coder output validation completed",
-                {
-                    "route": resolved_route,
-                    "model": model,
-                    "tool": tool_name,
-                    "validation": validation,
-                },
-            )
-
-            append_event(
-                "patch.validated",
-                "Coder output validation completed",
-                plan_id=active_plan.get("plan_id"),
-                task_id=str(step.get("id")),
-                route=resolved_route,
-                model=model,
-                payload={"validation": validation},
-            )
-
-            if not validation["ok"]:
-                retry_instruction = (
-                    active_plan.get("user_request", user_text)
-                    + "\n\nYour previous answer was rejected by validation.\n"
-                    + "Problems:\n"
-                    + "\n".join(f"- {p}" for p in validation.get("problems", []))
-                    + "\n\nReturn ONLY this format, no explanation, no markdown fences:\n"
-                    + "--- FILE: path/to/file.py\n"
-                    + "@@\n"
-                    + "<minimal changed function/helper blocks only>\n"
-                )
-
-                retry_args = {
-                    "task": retry_instruction,
-                    "path": paths[0] if paths else str(PROJECT_ROOT),
-                    "model": model,
-                    "mode": "patch",
-                }
-
-                emit_event(
-                    "code_phase",
-                    "Patch failed validation, repairing",
-                    {
-                        "phase": "repairing_patch",
-                        "plan_id": active_plan.get("plan_id"),
-                        "problems": validation.get("problems", []),
-                    },
-                )
-
-                retry_result = execute_tool(tool_name, retry_args)
-                retry_content = extract_tool_content(retry_result)
-                retry_content = normalize_patch_text(retry_content)
-                retry_validation = validate_coder_output(retry_content)
-
-                if retry_validation["ok"]:
-                    content = retry_content
-                    validation = retry_validation
-                else:
-                    content = wrap_invalid_coder_output(retry_content, retry_validation)
-                    validation = retry_validation
-
-            emit_event(
-                "final",
-                "Coder skill response ready",
-                {
-                    "route": resolved_route,
-                    "model": model,
-                    "tool": tool_name,
-                    "validated": validation["ok"],
-                },
-            )
-
-            if validation["ok"]:
-                apply_result = apply_file_patch(content)
-
-                emit_event(
-                    "code_phase",
-                    "Patch applied" if apply_result.get("ok") else "Patch apply failed",
-                    {
-                        "phase": "patch_applied" if apply_result.get("ok") else "patch_apply_failed",
-                        "plan_id": active_plan.get("plan_id"),
-                        "result": apply_result,
-                    },
-                )
-
-                append_event(
-                    "patch.applied" if apply_result.get("ok") else "patch.apply_failed",
-                    "Patch applied" if apply_result.get("ok") else "Patch apply failed",
-                    plan_id=active_plan.get("plan_id"),
-                    task_id=str(step.get("id")),
-                    route=resolved_route,
-                    model=model,
-                    payload={"result": apply_result},
-                )
-
-                if apply_result.get("ok"):
-                    step["status"] = "done"
-                    step["summary"] = summarize_step_result(content)
-                    active_plan["current_step"] = current_step + 1
-                    save_active_plan(active_plan)
-                    save_json(active_plan["plan_id"], "status.json", active_plan)
-
-                    append_event(
-                        "step.done",
-                        f"Step {step.get('id')} completed",
-                        plan_id=active_plan.get("plan_id"),
-                        task_id=str(step.get("id")),
-                        route=resolved_route,
-                        model=model,
-                        payload={
-                            "step": step,
-                            "current_step": active_plan["current_step"],
-                            "remaining": len(steps) - active_plan["current_step"],
-                        },
-                    )
-
-                    emit_event(
-                        "code_step_ready",
-                        f"Step {step.get('id')} complete. Ready for next step.",
-                        {
-                            "plan_id": active_plan.get("plan_id"),
-                            "step": step,
-                            "current_step": active_plan["current_step"],
-                            "remaining": len(steps) - active_plan["current_step"],
-                            "next_step": steps[active_plan["current_step"]]
-                            if active_plan["current_step"] < len(steps)
-                            else None,
-                        },
-                    )
-                else:
-                    content = content + "\n\nAPPLY FAILED:\n" + json.dumps(apply_result, indent=2)
-
-            self._json_response(
-                {
-                    "model": model,
-                    "created_at": now_iso(),
-                    "message": {"role": "assistant", "content": content},
-                    "done": True,
-                    "validation": validation,
-                }
-            )
-            return
-        # ------------------------------------------------------------------
-        # Normal non-direct route
-        # ------------------------------------------------------------------
-        tool_names = [t["function"]["name"] for t in selected_tools]
-
-        runtime_mode = write_runtime_mode(resolved_route, model, selected_tools)
-        persona = runtime_mode.get("persona")
-
-        try:
-            sync_kokoro_for_route(resolved_route, model)
-        except Exception as e:
-            emit_event(
-                "warning",
-                "Orpheus sync failed",
-                {"route": resolved_route, "model": model, "error": str(e)},
-            )
-
-        debug(f"Runtime mode: {runtime_mode}")
-        debug(
-            f"POST /api/chat requested_model={requested_model!r} requested_route={requested_route!r} source={source!r} "
-            f"resolved_route={resolved_route!r} resolved_model={model!r} persona={persona!r} stream={stream} "
-            f"tool_count={len(selected_tools)} user={user_text[:140]!r}"
-        )
-        debug(f"Selected {len(selected_tools)} tools: {tool_names}")
-
-        emit_event(
-            "status",
-            "Incoming chat request",
-            {
-                "requested_model": requested_model,
-                "requested_route": requested_route,
-                "source": source,
-                "resolved_route": resolved_route,
-                "resolved_model": model,
-                "stream": stream,
-                "tool_count": len(selected_tools),
-                "tools": tool_names,
-                "user_preview": user_text[:140],
-                "runtime_mode": runtime_mode,
-            },
-        )
-
-        if stream:
-            self.send_response(200)
-            self.send_header("Content-Type", "application/x-ndjson")
-            self.send_header("Cache-Control", "no-cache")
-            self.send_header("Connection", "keep-alive")
-            self.send_header("Access-Control-Allow-Origin", "*")
-            self.end_headers()
-            stream_direct_chat(
-                self,
-                model,
-                messages,
-                selected_tools=selected_tools,
-                route=resolved_route,
-                persona=persona,
-            )
-            return
-
-        if is_simple_direct_chat(user_text, selected_tools, resolved_route):
-            try:
-                data = call_ollama_once(
-                    model=model,
-                    messages=messages,
-                    route=resolved_route,
-                    persona=persona,
-                    tools=None,
-                    stream=False,
-                )
-                self._json_response(data)
-                return
-            except Exception as e:
-                self._json_response(
-                    {
-                        "model": model,
-                        "created_at": now_iso(),
-                        "message": {"role": "assistant", "content": f"Error calling Ollama: {e}"},
-                        "done": True,
-                    }
-                )
-                return
-        if selected_tools:
-            ack = random.choice(ACKS)
-            write_bridge_status("thinking", ack)
-            append_log(f"[{datetime.now().strftime('%H:%M:%S')}] ACK: {ack}")
-            speak_ack(ack)
-
-            result = react_chat(
-                model,
-                messages,
-                selected_tools,
-                route=resolved_route,
-                persona=persona,
-            )
-
-            self._json_response(result)
-            return
-        
 
     def do_GET(self) -> None:
-        path = urlparse(self.path).path
-        if path == "/api/history/plans":
-            plans_root = VAULT_DIR / ".jarvis" / "history" / "plans"
-            plans = []
-            if plans_root.exists():
-                for p in sorted(plans_root.iterdir(), reverse=True):
-                    if p.is_dir():
-                        plan_file = p / "plan.json"
-                        status_file = p / "status.json"
-                        item = {"plan_id": p.name}
-                        try:
-                            if status_file.exists():
-                                item.update(json.loads(status_file.read_text(encoding="utf-8")))
-                            elif plan_file.exists():
-                                item.update(json.loads(plan_file.read_text(encoding="utf-8")))
-                        except Exception as e:
-                            item["error"] = str(e)
-                        plans.append(item)
-            self._json_response({"plans": plans[:50]})
-            return
-
-        if path.startswith("/api/history/plan/"):
-            plan_id = path.rsplit("/", 1)[-1]
-            d = VAULT_DIR / ".jarvis" / "history" / "plans" / plan_id
-
-            if not d.exists():
-                self._json_response({"error": "Plan not found", "plan_id": plan_id}, code=404)
+            path = urlparse(self.path).path
+            if path == "/api/history/plans":
+                plans_root = VAULT_DIR / ".jarvis" / "history" / "plans"
+                plans = []
+                if plans_root.exists():
+                    for p in sorted(plans_root.iterdir(), reverse=True):
+                        if p.is_dir():
+                            plan_file = p / "plan.json"
+                            status_file = p / "status.json"
+                            item = {"plan_id": p.name}
+                            try:
+                                if status_file.exists():
+                                    item.update(json.loads(status_file.read_text(encoding="utf-8")))
+                                elif plan_file.exists():
+                                    item.update(json.loads(plan_file.read_text(encoding="utf-8")))
+                            except Exception as e:
+                                item["error"] = str(e)
+                            plans.append(item)
+                self._json_response({"plans": plans[:50]})
                 return
 
-            def read_json(name: str):
-                f = d / name
-                if not f.exists():
-                    return None
-                return json.loads(f.read_text(encoding="utf-8"))
+            if path.startswith("/api/history/plan/"):
+                plan_id = path.rsplit("/", 1)[-1]
+                d = VAULT_DIR / ".jarvis" / "history" / "plans" / plan_id
 
-            events = []
-            events_file = d / "events.jsonl"
-            if events_file.exists():
-                for line in events_file.read_text(encoding="utf-8", errors="ignore").splitlines():
-                    if line.strip():
-                        try:
-                            events.append(json.loads(line))
-                        except Exception:
-                            pass
+                if not d.exists():
+                    self._json_response({"error": "Plan not found", "plan_id": plan_id}, code=404)
+                    return
 
-            self._json_response(
-                {
-                    "plan_id": plan_id,
-                    "plan": read_json("plan.json"),
-                    "status": read_json("status.json"),
-                    "events": events,
-                }
-            )
-            return
-        if path == "/api/coding-log":
-            self._json_response({"events": recent_coding_events(120)})
-            return
+                def read_json(name: str):
+                    f = d / name
+                    if not f.exists():
+                        return None
+                    return json.loads(f.read_text(encoding="utf-8"))
 
-        if path == "/api/health":
-            try:
-                tags = request_ollama_tags()
-                ollama_ready = True
-                ollama_models = len(tags.get("models", []))
-            except Exception:
-                ollama_ready = False
-                ollama_models = 0
-            profile = load_active_profile()
-            self._json_response(
-                {
-                    "status": "ok",
-                    "service": "jarvis-react-v3",
-                    "time": now_iso(),
-                    "ollama_host": OLLAMA_HOST,
-                    "ollama_ready": ollama_ready,
-                    "ollama_model_count": ollama_models,
-                    "loaded_skills": len(get_loaded_skills()),
-                    "tool_count": len(TOOL_MAP),
-                    "active_profile": {"id": profile.get("id"), "label": profile.get("label")},
-                    "models": load_model_config().get("models", {}),
-                    "planner_model": get_planner_model(),
-                }
-            )
-            return
+                events = []
+                events_file = d / "events.jsonl"
+                if events_file.exists():
+                    for line in events_file.read_text(encoding="utf-8", errors="ignore").splitlines():
+                        if line.strip():
+                            try:
+                                events.append(json.loads(line))
+                            except Exception:
+                                pass
 
-        if path == "/api/skills":
-            self._json_response(
-                {
-                    "skills": get_loaded_skills(),
-                    "tools": list(TOOL_MAP.keys()),
-                    "tool_keywords": TOOL_KEYWORDS,
-                    "tool_skill_meta": TOOL_SKILL_META,
-                    "intent_tool_candidates": INTENT_TOOL_CANDIDATES,
-                    "tool_route_hints": TOOL_ROUTE_HINTS,
-                    "no_tools_models": sorted(NO_TOOLS_MODELS),
-                }
-            )
-            return
+                self._json_response(
+                    {
+                        "plan_id": plan_id,
+                        "plan": read_json("plan.json"),
+                        "status": read_json("status.json"),
+                        "events": events,
+                    }
+                )
+                return
+            if path == "/api/coding-log":
+                self._json_response({"events": recent_coding_events(120)})
+                return
+            if path == "/ws":
+                self._handle_websocket_upgrade()
+                return
+            if path == "/api/gpu":
+                self._json_response({
+                    "gpus": get_gpu_stats()
+                })
+                return
+            if path == "/api/flux/status":
+                try:
+                    result_file = BRIDGE_DIR / "flux_result.json"
 
-        if path == "/api/models":
-            cfg = load_model_config()
-            self._json_response({"models": cfg.get("models", {}), "planner_model": get_planner_model()})
-            return
+                    if result_file.exists():
+                        with open(result_file, "r", encoding="utf-8") as f:
+                            data = json.load(f)
+                    else:
+                        data = {"status": "idle"}
 
-        if path == "/api/events":
-            self._json_response({"events": recent_events(100)})
-            return
+                    self._json_response(data)
+                except Exception as e:
+                    self._json_response(
+                        {
+                            "status": "error",
+                            "message": str(e),
+                        },
+                        500,
+                    )
+                return
+            if path == "/api/flux":
+                data=read_json_body(self)
+                prompt = str(data.get("prompt", "")).strip()
 
-        if path == "/api/timers":
-            try:
-                from skills.timer import get_active_timers  # type: ignore
-                self._json_response({"timers": get_active_timers()})
-            except ImportError:
-                self._json_response({"timers": []})
-            return
+                if not prompt:
+                    self._json_response({"error": "No prompt"}, 400)
+                    return
 
-        if path == "/api/radio":
-            try:
-                from skills.radio import get_now_playing, get_radio_state, get_stations  # type: ignore
-                self._json_response({**get_radio_state(), "stations": get_stations(), "now_playing": get_now_playing()})
-            except ImportError:
-                self._json_response({"playing": False, "stations": {}})
-            return
+                width = int(data.get("width", 1024) or 1024)
+                height = int(data.get("height", 1024) or 1024)
 
-        if path == "/api/reload":
-            try:
-                result = reload_all_skills()
-                self._json_response(result)
-            except Exception as e:
-                self._json_response({"error": str(e)}, code=500)
-            return
+                result_file = BRIDGE_DIR / "flux_result.json"
+                result_file.parent.mkdir(parents=True, exist_ok=True)
+                result_file.write_text(
+                    json.dumps({"status": "generating"}, ensure_ascii=False),
+                    encoding="utf-8",
+                )
 
-        if path == "/api/network":
-            try:
-                from skills.network import get_topology  # type: ignore
-                self._json_response(get_topology())
-            except ImportError:
-                self._json_response({"devices": [], "gateway": "192.168.0.1"})
-            return
+                def _generate():
+                    try:
+                        emit_event("flux", "FLUX generation started", {
+                            "prompt": prompt[:200],
+                            "width": width,
+                            "height": height,
+                        })
 
-        if path == "/api/self":
-            try:
-                runtime_persona = None
-                if RUNTIME_MODE_PATH.exists():
-                    runtime_persona = json.loads(RUNTIME_MODE_PATH.read_text(encoding="utf-8")).get("persona")
-            except Exception:
-                runtime_persona = None
-            self._json_response(build_self_context(persona=runtime_persona))
-            return
+                        import importlib
+                        flux_mod = importlib.import_module("skills.flux")
 
-        if path == "/api/runtime-mode":
-            try:
-                if RUNTIME_MODE_PATH.exists():
-                    self._json_response(json.loads(RUNTIME_MODE_PATH.read_text(encoding="utf-8")))
-                else:
-                    self._json_response({"mode": "conversation", "persona": "jarvis"})
-            except Exception as e:
-                self._json_response({"error": str(e)}, code=500)
-            return
+                        result = flux_mod.exec_generate_image(
+                            prompt,
+                            enhance="no",
+                        )
 
-        self.send_error(404)
+                        result_file.write_text(
+                            json.dumps(
+                                {
+                                    "status": "done",
+                                    "message": result,
+                                    "prompt": prompt,
+                                    "width": width,
+                                    "height": height,
+                                },
+                                ensure_ascii=False,
+                            ),
+                            encoding="utf-8",
+                        )
+
+                        emit_event("flux", "FLUX generation finished", {
+                            "result": str(result)[:300],
+                        })
+
+                    except Exception as e:
+                        result_file.write_text(
+                            json.dumps(
+                                {
+                                    "status": "error",
+                                    "message": str(e),
+                                },
+                                ensure_ascii=False,
+                            ),
+                            encoding="utf-8",
+                        )
+
+                        emit_event("warning", "FLUX generation failed", {
+                            "error": str(e),
+                        })
+
+                threading.Thread(target=_generate, daemon=True).start()
+
+                self._json_response({
+                    "status": "generating",
+                    "poll": "/api/flux/status",
+                })
+                return
+            if path == "/api/health":
+                try:
+                    tags = request_ollama_tags()
+                    ollama_ready = True
+                    ollama_models = len(tags.get("models", []))
+                except Exception:
+                    ollama_ready = False
+                    ollama_models = 0
+                profile = load_active_profile()
+                self._json_response(
+                    {
+                        "status": "ok",
+                        "service": "jarvis-react-v3",
+                        "time": now_iso(),
+                        "ollama_host": OLLAMA_HOST,
+                        "ollama_ready": ollama_ready,
+                        "ollama_model_count": ollama_models,
+                        "loaded_skills": len(get_loaded_skills()),
+                        "tool_count": len(TOOL_MAP),
+                        "active_profile": {"id": profile.get("id"), "label": profile.get("label")},
+                        "models": load_model_config().get("models", {}),
+                        "planner_model": get_planner_model(),
+                    }
+                )
+                return
+
+            if path == "/api/skills":
+                self._json_response(
+                    {
+                        "skills": get_loaded_skills(),
+                        "tools": list(TOOL_MAP.keys()),
+                        "tool_keywords": TOOL_KEYWORDS,
+                        "tool_skill_meta": TOOL_SKILL_META,
+                        "intent_tool_candidates": INTENT_TOOL_CANDIDATES,
+                        "tool_route_hints": TOOL_ROUTE_HINTS,
+                        "no_tools_models": sorted(NO_TOOLS_MODELS),
+                    }
+                )
+                return
+
+            if path == "/api/models":
+                cfg = load_model_config()
+                self._json_response({"models": cfg.get("models", {}), "planner_model": get_planner_model()})
+                return
+
+            if path == "/api/events":
+                self._json_response({"events": recent_events(100)})
+                return
+
+            if path == "/api/timers":
+                try:
+                    from skills.timer import get_active_timers  # type: ignore
+                    self._json_response({"timers": get_active_timers()})
+                except ImportError:
+                    self._json_response({"timers": []})
+                return
+
+            if path == "/api/radio":
+                try:
+                    from skills.radio import get_now_playing, get_radio_state, get_stations  # type: ignore
+                    self._json_response({**get_radio_state(), "stations": get_stations(), "now_playing": get_now_playing()})
+                except ImportError:
+                    self._json_response({"playing": False, "stations": {}})
+                return
+            
+            if path == "/api/tts/health":
+                try:
+                    with urllib.request.urlopen(
+                        f"{KOKORO_HOST}/tts/health",
+                        timeout=KOKORO_TIMEOUT_SEC,
+                    ) as resp:
+                        data = json.loads(resp.read().decode("utf-8"))
+
+                    self._json_response(data)
+
+                except Exception as e:
+                    self._json_response({
+                        "status": "error",
+                        "error": str(e),
+                        "kokoro_host": KOKORO_HOST,
+                    }, code=500)
+
+                return
+            if path == "/api/tts/test":
+                try:
+                    payload = {
+                        "text": "Systems online. JARVIS is ready.",
+                        "voice": KOKORO_VOICE,
+                    }
+
+                    req = urllib.request.Request(
+                        f"{KOKORO_HOST}/tts/speak",
+                        data=json.dumps(payload).encode("utf-8"),
+                        headers={"Content-Type": "application/json"},
+                        method="POST",
+                    )
+
+                    with urllib.request.urlopen(req, timeout=KOKORO_TIMEOUT_SEC) as resp:
+                        data = json.loads(resp.read().decode("utf-8"))
+
+                    self._json_response(data)
+
+                except Exception as e:
+                    self._json_response({
+                        "status": "error",
+                        "error": str(e),
+                        "kokoro_host": KOKORO_HOST,
+                    }, code=500)
+
+                return
+            if path == "/api/reload":
+                try:
+                    result = reload_all_skills()
+                    self._json_response(result)
+                except Exception as e:
+                    self._json_response({"error": str(e)}, code=500)
+                return
+
+            if path == "/api/network":
+                try:
+                    from skills.network import get_topology  # type: ignore
+                    self._json_response(get_topology())
+                except ImportError:
+                    self._json_response({"devices": [], "gateway": "192.168.0.1"})
+                return
+
+            if path == "/api/self":
+                try:
+                    runtime_persona = None
+                    if RUNTIME_MODE_PATH.exists():
+                        runtime_persona = json.loads(RUNTIME_MODE_PATH.read_text(encoding="utf-8")).get("persona")
+                except Exception:
+                    runtime_persona = None
+                self._json_response(build_self_context(persona=runtime_persona))
+                return
+
+            if path == "/api/runtime-mode":
+                try:
+                    if RUNTIME_MODE_PATH.exists():
+                        self._json_response(json.loads(RUNTIME_MODE_PATH.read_text(encoding="utf-8")))
+                    else:
+                        self._json_response({"mode": "conversation", "persona": "jarvis"})
+                except Exception as e:
+                    self._json_response({"error": str(e)}, code=500)
+                return
+            self.send_error(404)
+
 
     def do_OPTIONS(self) -> None:
         self.send_response(204)
@@ -5095,7 +5393,7 @@ if __name__ == "__main__":
     print(f"[REACT] Tools ({len(TOOL_MAP)}): {', '.join(TOOL_MAP.keys())}")
     print("[REACT] READY")
     emit_event("status", "React server ready", {"port": PORT, "tool_count": len(TOOL_MAP)})
-
+    write_state("JARVIS", task="idle", tools=read_tools())
     try:
         server.serve_forever()
     except KeyboardInterrupt:

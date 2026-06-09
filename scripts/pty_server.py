@@ -11,7 +11,7 @@ from pathlib import Path
 import websockets
 
 HOST = "127.0.0.1"
-PORT = 4010
+PORT =  4010
 DEFAULT_CWD = "/mnt/e/coding/jarvis-os"
 
 
