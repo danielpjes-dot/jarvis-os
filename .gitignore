@@ -28,6 +28,9 @@ certs/
 # Env
 .env
 .env.local
+.env.*.local
+infra/.env.*.local
+infra/.env.local
 exported*
 netum*
 
@@ -46,8 +49,14 @@ mempalace.yaml
 bridge/
 orpheus_env/
 
-# Jarvis OS sqllite data
+# Jarvis OS sqlite data
 data/
+
+# Plan runner staging output (generated files, not source)
+staging/
+
+# Test scripts
+test_plan.sh
 # Next.js
 .next/
 app/.next/

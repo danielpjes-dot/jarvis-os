@@ -1134,25 +1134,54 @@ const getStateColor = useCallback(() => {
     streamSourcesRef.current = [];
     streamNextTimeRef.current = 0;
   }, []);
-  const playAudioBlob = useCallback(async (base64Audio: string, mime = "audio/wav") => {
-    if (mutedRef.current) return;
-
-    stopPlayback();
-    ensureAudioCtx();
-
-  const audio = new Audio(`data:${mime};base64,${base64Audio}`);
+  
+const playAudioBlob = useCallback(async (base64Audio: string, mime = "audio/wav") => {
+  if (mutedRef.current) return;
+ 
+  stopPlayback();
+  ensureAudioCtx();
+ 
+  const ctx = audioCtxRef.current!;
+ 
+  // Resume context if suspended (browser autoplay policy)
+  if (ctx.state === "suspended") await ctx.resume();
+ 
+  // Decode base64 → ArrayBuffer → AudioBuffer
+  const binary = atob(base64Audio);
+  const bytes = new Uint8Array(binary.length);
+  for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+  const audioBuffer = await ctx.decodeAudioData(bytes.buffer.slice(0));
+ 
+  // Build graph: source → analyser → destination
+  // analyserRef already exists (created in ensureAudioCtx, fftSize 256)
+  // Disconnect mic source from analyser while TTS is playing
+  try { micSourceRef.current?.disconnect(analyserRef.current!); } catch {}
+ 
+  const source = ctx.createBufferSource();
+  source.buffer = audioBuffer;
+  source.connect(analyserRef.current!);        // face reads this
+  analyserRef.current!.connect(ctx.destination); // speakers
+  source.start();
+ 
+  streamSourcesRef.current.push(source);
+ 
   waveformModeRef.current = "ai";
   setState("speaking");
   setAiSpeaking(true);
-
-  audio.onended = () => {
+ 
+  source.onended = () => {
+    const idx = streamSourcesRef.current.indexOf(source);
+    if (idx !== -1) streamSourcesRef.current.splice(idx, 1);
+ 
+    // Reconnect mic to analyser
+    try { micSourceRef.current?.connect(analyserRef.current!); } catch {}
+ 
     waveformModeRef.current = "idle";
-    setState("listening");
     setAiSpeaking(false);
   };
-
-  await audio.play();
+ 
 }, [stopPlayback, ensureAudioCtx]);
+ 
   const startStreamPlayback = useCallback((_sampleRate = 24000) => {
     stopPlayback();
     ensureAudioCtx();
@@ -1731,6 +1760,7 @@ const activeModel =
                   emotion={emotion}
                   speaking={state === "speaking"}
                   thinking={state === "thinking"}
+                  analyserRef={analyserRef}
                 />
 
                 <div className="absolute bottom-16 left-1/2 -translate-x-1/2 w-64 h-10 z-10 pointer-events-none">

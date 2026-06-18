@@ -31,6 +31,16 @@ import requests
 from pathlib import Path
 from qdrant_client import QdrantClient
 
+# Redis for recent_chat — optional, degrades gracefully
+try:
+    import redis as _redis_lib
+    _redis_client = _redis_lib.Redis(host="localhost", port=6379, decode_responses=True)
+    _redis_client.ping()
+    _REDIS_OK = True
+except Exception:
+    _redis_client = None
+    _REDIS_OK = False
+
 # ---------------------------------------------------------------------------
 # Config
 # ---------------------------------------------------------------------------
@@ -132,6 +142,13 @@ action       — one of:
                  planner       multi-step plan needed
                  code          write or run code
                  deep_agent    complex autonomous task
+
+IMPORTANT — use action="code" and route="code" when user says:
+  - "build X", "create X", "make X", "write X", "code X", "develop X"
+  - "build a website", "build a game", "build an app", "build a tool"
+  - Any request to generate, write, or produce a file, script, or program
+  - "fix X file", "update X.py", "patch X", "edit X code"
+  Never use chat_only for requests to BUILD or CREATE software/files.
 route        — one of:
                  live          chat / immediate answer
                  tools         tool dispatch
@@ -167,6 +184,18 @@ Set need_memory: true when:
   - Requires personal or project-specific context JARVIS might have stored
   - You would otherwise say "I don't have that information"
 
+─── AMBIGUOUS / FOLLOW-UP REPLIES ──────────────────────────────────────────
+
+ALWAYS set need_memory: true and include recent_chat (and chat_log) when:
+  - The message is a single digit or number ("1", "2", "3" ... "6")
+  - The message is a short follow-up word: "yes", "no", "ok", "more", "next",
+    "continue", "details", "that one", "which one", "the first", etc.
+  - The message is 1-2 words that only make sense with prior context
+  - The message is a bare acknowledgement: "correct", "right", "agreed"
+
+For these, NEVER return chat_only with need_memory: false. The model cannot
+answer without knowing what the user is referring to.
+
 ─── RESPONSE FORMAT ─────────────────────────────────────────────────────────
 
 Respond ONLY with valid JSON, no explanation, no markdown fences:
@@ -193,14 +222,97 @@ If need_memory is false, memory_types must be [].
 """
 
 
+# ---------------------------------------------------------------------------
+# Recent chat fetcher — reads Redis working memory
+# ---------------------------------------------------------------------------
+
+def fetch_recent_chat_from_redis(max_items: int = 8) -> list[dict]:
+    """Pull last N turns from Redis working memory (agent:memory:working)."""
+    if not _REDIS_OK or _redis_client is None:
+        return []
+    try:
+        items = _redis_client.lrange("agent:memory:working", -max_items, -1)
+        results = []
+        for item in items:
+            if item and item.strip():
+                results.append({
+                    "type":   "recent_chat",
+                    "score":  1.0,
+                    "source": "redis:working_memory",
+                    "text":   item[:500],
+                })
+        return results
+    except Exception as e:
+        print(f"[MEMORY] Redis recent_chat error: {e}")
+        return []
+
+
+_GREETINGS = {
+    "hi", "hello", "hey",
+    "good morning", "good afternoon", "good evening",
+    "morning", "evening",
+    "greetings",
+}
+
+_STANDALONE = {
+    * _GREETINGS,
+    "thanks",
+    "thank you",
+    "bye",
+    "goodbye",
+}
+
+_AMBIGUOUS_PATTERNS = {
+    # single digits or short numbers — follow-up selectors
+    "single_digit": lambda t: t.isdigit() and len(t) <= 2,
+
+    # yes/no/ack words
+    "ack": lambda t: t in {
+        "yes", "no", "ok", "okay", "sure", "nope",
+        "yep", "yeah", "correct", "right",
+        "exactly", "indeed", "fine", "agreed",
+    },
+
+    # follow-up words
+    "followup": lambda t: t in {
+        "more", "next", "continue", "go on",
+        "proceed", "expand", "details",
+        "tell me more", "and", "what else",
+        "show me", "which one", "that one",
+        "this one", "the first", "the second",
+        "the third", "the last",
+    },
+
+    # very short messages that are NOT greetings
+    "very_short": lambda t: (
+        len(t.split()) <= 2
+        and len(t) < 20
+        and t not in _STANDALONE
+    ),
+}
+
+
 def classify(user_input: str, recent_turns: list[str] | None = None) -> dict:
     """
     Pass 1 — single LLM call that replaces both live_model and old classify().
     Returns full live_model schema + memory_types.
     """
+    # Always inject Redis working memory so Gemma has conversation context
+    # for every call — short replies, follow-ups, and fresh requests alike.
+    redis_turns = [item["text"] for item in fetch_recent_chat_from_redis(max_items=8)]
+    if redis_turns:
+        combined = redis_turns + (recent_turns or [])
+        seen: set[str] = set()
+        merged: list[str] = []
+        for t in combined:
+            if t not in seen:
+                seen.add(t)
+                merged.append(t)
+        recent_turns = merged
+
     context = ""
     if recent_turns:
-        context = "Recent conversation:\n" + "\n".join(recent_turns[-4:]) + "\n\n"
+        context = "Recent conversation:\n" + "\n".join(recent_turns[-6:]) + "\n\n"
 
     result = _llama(f"{context}User message: {user_input}", CLASSIFY_SYSTEM)
     parsed = _parse_json(result)
@@ -210,7 +322,6 @@ def classify(user_input: str, recent_turns: list[str] | None = None) -> dict:
         fallback["_parse_error"] = result[:200]
         return fallback
 
-    # Ensure all live_model keys exist with safe defaults
     defaults = _empty_live()
     for k, v in defaults.items():
         parsed.setdefault(k, v)
@@ -297,17 +408,35 @@ Respond ONLY with valid JSON. Only include keys for the requested types. Null = 
   "tools":       null
 }
 
-recent_chat and tools are never fetched — always null.
+recent_chat must be fetched when requested. Use {"query": "recent context"}.
+tools are never fetched — always null.
 Keep queries short and semantic, not the user's raw phrasing.
 """
 
 
 def build_fetch_plan(user_input: str, memory_types: list[dict]) -> dict:
     type_names = [m["type"] for m in memory_types]
-    prompt     = f"Memory types needed: {type_names}\nUser message: {user_input}"
-    result     = _llama(prompt, BUILD_QUERY_SYSTEM)
-    parsed     = _parse_json(result)
-    return parsed or {t: {"query": user_input} for t in type_names}
+
+    # Hard rule: recent_chat must be fetched when requested
+    fixed_plan = {}
+    if "recent_chat" in type_names:
+        fixed_plan["recent_chat"] = {"query": user_input}
+
+    if "tools" in type_names:
+        fixed_plan["tools"] = None
+
+    prompt = f"Memory types needed: {type_names}\nUser message: {user_input}"
+    result = _llama(prompt, BUILD_QUERY_SYSTEM)
+    parsed = _parse_json(result) or {}
+
+    # Merge LLM plan, but do not allow it to null recent_chat
+    parsed.update(fixed_plan)
+
+    for t in type_names:
+        if t not in parsed:
+            parsed[t] = {"query": user_input}
+
+    return parsed
 
 # ---------------------------------------------------------------------------
 # Pass 3 — fetchers
@@ -432,7 +561,7 @@ FETCHERS = {
     "chat_log":    lambda plan: fetch_chat_log(plan["query"]),
     "obsidian":    lambda plan: fetch_obsidian(plan["query"]),
     "files":       lambda plan: fetch_files(plan["query"]),
-    "recent_chat": lambda plan: [],
+    "recent_chat": lambda plan: fetch_recent_chat_from_redis(max_items=8),
     "tools":       lambda plan: [],
 }
 

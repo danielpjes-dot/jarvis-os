@@ -1,6 +1,6 @@
 {
   "name": "operation-jarvis",
-  "version": "0.1.0",
+  "version": "2.0.0",
   "description": "Local AI assistant — Claude Code brain, Unreal Engine face, local TTS voice. Zero cloud.",
   "main": "dist/mcp/index.js",
   "scripts": {

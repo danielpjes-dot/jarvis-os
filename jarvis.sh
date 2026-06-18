@@ -30,7 +30,9 @@ touch "$LOG"
 log() {
   echo "[$(date '+%H:%M:%S')] $1" | tee -a "$LOG"
 }
-
+set -a
+source /mnt/e/coding/jarvis-os/.env
+set +a
 LLAMA_SERVER_CMD="$PROJECT_DIR/../llama.cpp/build/bin/llama-server"
 LLAMA_MODEL="/mnt/e/models/gemma4-e4b/gemma-4-E4B-it-UD-Q4_K_XL.gguf"
 LLAMA_MMPROJ="/mnt/e/models/gemma4-e4b/mmproj-BF16.gguf"
@@ -39,8 +41,11 @@ LLAMA_PORT="8081"
 # ── llama-server ──────────────────────────────────────────────────────────────
 
 start_llama_server() {
+  if pgrep -f "llama-server.*--port ${LLAMA_PORT}" >/dev/null 2>&1; then
+    log "llama-server already running on port ${LLAMA_PORT}"
+    return
+  fi
   log "Starting llama-server on port ${LLAMA_PORT}..."
-  pkill -f "llama-server.*--port ${LLAMA_PORT}" 2>/dev/null || true
   nohup ${LLAMA_SERVER_CMD} \
     --model "${LLAMA_MODEL}" \
     --mmproj "${LLAMA_MMPROJ}" \
@@ -102,7 +107,7 @@ start_redis() {
       --name jarvis-redis \
       -p 6379:6379 \
       -v jarvis_redis:/data \
-      redis:7 \
+      docker.io/library/redis:7  \
       redis-server --appendonly yes
   fi
   # Wait for Redis to be ready
@@ -395,7 +400,9 @@ telegram_watcher() {
 
 dictation_daemon() {
   cd "$PROJECT_DIR" || return 1
-  [ -f "$PROJECT_DIR/.env" ] && export $(grep -v '^#' "$PROJECT_DIR/.env" | xargs)
+  set -a
+  [ -f "$PROJECT_DIR/.env" ] && source "$PROJECT_DIR/.env"
+  set +a
   "$PROJECT_DIR/orpheus_env/bin/python" -u \
     "$PROJECT_DIR/services/dictation_daemon.py" \
     --host 127.0.0.1 \
@@ -507,10 +514,7 @@ print(f'[REDIS] Snapshot saved: {fname.name}')
 do_start() {
   load_models_from_config
 
-  stop_named_processes
-  sleep 1
-
-  echo "╔══════════════════════════════════════╗"ls infra
+  echo "╔══════════════════════════════════════╗"
   start_redis                        # ← was never called before
   log "Starting n8n workflow automation"
   n8n_start
@@ -557,7 +561,7 @@ write_task('idle')
 reset_loop()
 print('[REDIS] Agent memory initialised')
 "
-  log "Starting llama.cpp server"
+  log "Starting llama.cpp vision server"
   start_llama_server
   log "Starting Kokoro TTS"
   start_kokoro
