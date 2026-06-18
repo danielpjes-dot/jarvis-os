@@ -54,14 +54,20 @@ PROJECT_ROOT = Path(__file__).parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 import tts
 from difflib import SequenceMatcher
-from memory.redis_memory import *
+from memory.redis_memory import (
+    write_state, read_state, update_state, format_state_block,
+    push_memory, read_memory, read_tools, write_tools, set_tool,
+    increment_loop, read_loop, reset_loop,
+    set_flag, get_flag, clear_flag,
+    ping as redis_ping, snapshot as redis_snapshot,
+)
+import memory.memory_router as memory_router
 from scripts.context_router import build_context_pack
 from scripts.chat_context import today_log_path, log_chat_event
 from scripts.agent_loop_core import run_agent_loop
 from services.communications_gateway import CommunicationsGateway
 from services.telegram_gateway import TelegramGateway
 from scripts.jarvis_history import make_plan_id, save_json, append_event, plan_dir
-import memory.memory_router   
 from skills.loader import (  # type: ignore
     get_all_keywords,
     get_all_skill_meta,
@@ -94,6 +100,11 @@ PORT = (
 TELEGRAM_ENABLED = int(os.environ.get("JARVIS_TELEGRAM_ENABLED", "1"))
 VALID_ROUTES = {"live", "fast", "tools", "reason", "code", "deep"}
 
+# Redis / plan_runner keys — must match plan_runner.py constants
+REDIS_TASKS_KEY   = "jarvis:tasks"
+REDIS_PLANS_KEY   = "jarvis:plans"
+REDIS_STATUS_KEY  = "jarvis:task_status"
+REDIS_RESULTS_KEY = "jarvis:task_results"
 
 MODE_PROFILE_PATH = PROJECT_ROOT / "config" / "mode_profiles.json"
 
@@ -261,9 +272,217 @@ Use deeper reasoning, compare alternatives, and make justified recommendations.
 }
 
 ACKS = ["On it.", "Working.", "Understood.", "Processing now.", "Let me handle that."]
-#------------------------------------------------------------------------------
+
+# -----------------------------------------------------------------------------
+# Redis helpers — graceful fallback if Redis is unavailable
+# -----------------------------------------------------------------------------
+
+def _redis_available() -> bool:
+    try:
+        return redis_ping()
+    except Exception:
+        return False
+
+
+def _safe_update_state(**kwargs) -> None:
+    """Update Redis agent state, silently skip if Redis is down."""
+    try:
+        if _redis_available():
+            update_state(**kwargs)
+    except Exception as e:
+        debug(f"Redis state update failed: {e}")
+
+
+def _safe_push_memory(item: str) -> None:
+    try:
+        if _redis_available():
+            push_memory(item)
+    except Exception as e:
+        debug(f"Redis push_memory failed: {e}")
+
+
+def _safe_increment_loop() -> int:
+    try:
+        if _redis_available():
+            return increment_loop()
+    except Exception:
+        pass
+    return 0
+
+
+# -----------------------------------------------------------------------------
+# plan_runner bridge — queue approved plans to Redis instead of running inline
+# -----------------------------------------------------------------------------
+
+def _get_redis():
+    """Get a raw redis.Redis connection for plan_runner operations."""
+    try:
+        import redis as redis_lib
+        r = redis_lib.Redis(host="localhost", port=6379, decode_responses=True)
+        r.ping()
+        return r
+    except Exception:
+        return None
+
+
+def queue_plan_to_redis(plan: Dict[str, Any]) -> bool:
+    """
+    Push each step of an approved plan onto the jarvis:tasks Redis queue
+    so plan_runner picks them up for execution.
+
+    Also stores the full plan in jarvis:plans under plan_id.
+
+    Returns True on success, False if Redis is unavailable (caller falls
+    back to inline agent_loop execution).
+    """
+    r = _get_redis()
+    if not r:
+        debug("plan_runner: Redis unavailable — will execute inline")
+        return False
+
+    plan_id = plan.get("plan_id")
+    steps   = plan.get("steps", [])
+
+    if not plan_id or not steps:
+        return False
+
+    # Store the full plan so plan_runner can publish completion events
+    r.hset(REDIS_PLANS_KEY, plan_id, json.dumps({
+        "plan_id": plan_id,
+        "goal":    plan.get("user_request", ""),
+        "tasks":   [
+            {
+                "plan_id":    plan_id,
+                "task_id":    step.get("id", i),
+                "task":       step.get("goal", ""),
+                "skill":      step.get("tool", "coding"),
+                "tool":       step.get("tool", "code_edit"),
+                "args":       step.get("args", {}),
+                "depends_on": [step["id"] - 1] if step.get("id", 1) > 1 else [],
+            }
+            for i, step in enumerate(steps)
+        ],
+    }))
+
+    # Push tasks in order; depends_on ensures serial execution
+    for i, step in enumerate(steps):
+        step_tool = step.get("tool", "coding")
+        tfiles    = step.get("target_files", [])
+        # First target file as primary path, fallback to plan paths
+        primary_path = tfiles[0] if tfiles else (plan.get("paths") or ["."])[0]
+        task = {
+            "plan_id":      plan_id,
+            "task_id":      step.get("id", i + 1),
+            "task":         step.get("goal", ""),
+            "skill":        step_tool,
+            "tool":         "code_edit" if step_tool in ("coding", "code_edit") else step_tool,
+            "target_files": tfiles,
+            "args":         {
+                "task":   step.get("goal", ""),
+                "path":   primary_path,
+                "model":  plan.get("planner_model", ""),
+                "mode":   "generate",
+                **(step.get("args") or {}),
+            },
+            "depends_on": [step["id"] - 1] if step.get("id", 1) > 1 else [],
+        }
+        r.rpush(REDIS_TASKS_KEY, json.dumps(task))
+
+    emit_event("plan_runner", f"Queued {len(steps)} tasks to Redis", {
+        "plan_id":   plan_id,
+        "task_count": len(steps),
+    })
+
+    return True
+
+
+def poll_plan_runner_result(plan_id: str, timeout_sec: int = 300) -> Optional[str]:
+    """
+    Subscribe to the plan completion channel and wait for plan_runner
+    to publish the final summary.  Returns the summary string or None.
+    """
+    try:
+        import redis as redis_lib
+        r = redis_lib.Redis(host="localhost", port=6379, decode_responses=True)
+        pubsub = r.pubsub()
+        channel = f"jarvis:plan:{plan_id}:done"
+        pubsub.subscribe(channel)
+
+        deadline = time.time() + timeout_sec
+        for msg in pubsub.listen():
+            if time.time() > deadline:
+                break
+            if msg["type"] == "message":
+                data = json.loads(msg["data"])
+                pubsub.unsubscribe(channel)
+                return data.get("summary", "Plan complete.")
+    except Exception as e:
+        debug(f"poll_plan_runner_result failed: {e}")
+    return None
+
+
+# -----------------------------------------------------------------------------
+# memory_router adapter — consistent interface for both HTTP and WS paths
+# -----------------------------------------------------------------------------
+
+def run_memory_router(user_text: str, messages: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """
+    Call memory_router.route() with the correct signature and normalise the
+    return value into the live_model dict shape the rest of the server expects.
+
+    memory_router.route() returns (result: dict, meta: dict).
+    The result dict already matches the live_model schema.
+
+    Also injects memory_context into the message list when present.
+    """
+    # Build recent_turns from the last few user/assistant messages
+    recent_turns: List[str] = []
+    for m in messages[-8:]:
+        role    = m.get("role", "")
+        content = m.get("content", "")
+        if role in ("user", "assistant") and isinstance(content, str) and content.strip():
+            recent_turns.append(f"{role.upper()}: {content.strip()[:300]}")
+
+    try:
+        result, meta = memory_router.route(user_text, recent_turns or None)
+    except Exception as e:
+        emit_event("warning", "memory_router.route() failed", {"error": str(e)})
+        result = {
+            "speak":                  "",
+            "transcript":             user_text,
+            "intent":                 "fallback",
+            "action":                 "chat_only",
+            "route":                  "live",
+            "tool":                   None,
+            "chat_confidence":        0.0,
+            "escalation_confidence":  0.0,
+            "execute_confidence":     0.0,
+            "need_memory":            False,
+            "memory_confidence":      0.0,
+            "args":                   {},
+            "memory_context":         "",
+        }
+        meta = {"error": str(e)}
+
+    emit_event("memory_router", "Routing result", {
+        "intent":     result.get("intent"),
+        "action":     result.get("action"),
+        "route":      result.get("route"),
+        "need_memory": result.get("need_memory"),
+        "tool":       result.get("tool"),
+        "meta":       meta,
+    })
+
+    # Update Redis working memory with current user turn
+    _safe_push_memory(f"user: {user_text[:400]}")
+    _safe_update_state(task=f"routing: {result.get('intent', 'unknown')}")
+
+    return result
+
+
+# -----------------------------------------------------------------------------
 # Kokoro
-#------------------------------------------------------------------------------
+# -----------------------------------------------------------------------------
 def _inline_chat(body: dict) -> dict:
     captured: dict = {}
 
@@ -286,6 +505,11 @@ def _inline_chat(body: dict) -> dict:
     requested_route = body.get("route")
     source = body.get("source", "voice")
     messages = body.get("messages", [])
+
+    # Support top-level user_text shorthand (normalise into messages)
+    top_level_text = body.get("user_text", "")
+    if top_level_text and not messages:
+        messages = [{"role": "user", "content": top_level_text}]
 
     user_text = get_last_user_text(messages)
     user_text = clean_telegram_prefix(user_text)
@@ -545,7 +769,6 @@ async def _run_live_ws(rfile, wfile) -> None:
 
     def reader_thread():
         while running[0]:
-            ##raw = _ws_read_frame(rfile)
             raw = _ws_read_message(rfile)
             if raw is None:
                 loop.call_soon_threadsafe(msg_queue.put_nowait, None)
@@ -623,17 +846,6 @@ async def _run_live_ws(rfile, wfile) -> None:
                 "content": system_content,
             })
 
-            context_pack = build_context_pack(transcript)
-            if context_pack:
-                messages.append({
-                    "role": "system",
-                    "content": (
-                        "Memory context — optional background only. "
-                        "Do not change user intent based on memory.\n\n"
-                        + context_pack
-                    ),
-                })
-
             if image_b64:
                 messages.append({
                     "role": "system",
@@ -651,46 +863,53 @@ async def _run_live_ws(rfile, wfile) -> None:
             if interrupted.is_set():
                 continue
 
-            body = {
-                "source": "voice",
-                "route": "live",
-                "messages": messages,
-                "stream": False,
-            }
-            n = increment_loop()
-            push_memory(f"[{n}] user: {transcript}")
-            print("[LIVE] calling inline chat", flush=True)
+            # ── Use memory_router for the WS path (correct signature) ──
+            n = _safe_increment_loop()
+            _safe_push_memory(f"[{n}] user: {transcript}")
+
             messages.insert(0, {
                 "role": "system",
                 "content": format_state_block(),
             })
-            #chat_result = await loop.run_in_executor(
-            #    None,
-            #    lambda b=body: _inline_chat(b),
-            #)
-            chat_result=memory_router.route(body)
-            reply = chat_result.get("message", {}).get("content", "") or ""
-            route = chat_result.get("route", "live")
-            tool = chat_result.get("tool")
-            live = chat_result.get("live") or {}
-            live_memory = chat_result.get("need_memory")
-            live_memory_conf = chat_result.get("memory_confidence")
-            live_action = live.get("action")
-            live_speak = str(live.get("speak") or "").strip()
 
-            write_chat_log("user", transcript, route=route, model="voice")
-            write_chat_log("assistant", reply, route=route, model="voice")
+            live_result = run_memory_router(transcript, messages)
+
+            # Inject memory context into system if present
+            memory_ctx = live_result.get("memory_context", "")
+            if memory_ctx and memory_ctx.strip():
+                messages.insert(1, {
+                    "role": "system",
+                    "content": (
+                        "Memory context — optional background only. "
+                        "Do not change user intent based on memory.\n\n"
+                        + memory_ctx
+                    ),
+                })
+
+            reply = live_result.get("speak", "") or ""
+            route = live_result.get("route", "live")
+            tool  = live_result.get("tool")
+            live_action   = live_result.get("action", "chat_only")
+            live_speak    = str(live_result.get("speak") or "").strip()
+            live_memory       = live_result.get("need_memory")
+            live_memory_conf  = live_result.get("memory_confidence")
+
+            write_chat_log("user",      transcript, route=route, model="voice")
+            write_chat_log("assistant", reply,      route=route, model="voice")
+
+            # Push assistant reply to Redis working memory
+            _safe_push_memory(f"[{n}] assistant: {reply[:300]}")
 
             if interrupted.is_set():
                 continue
 
             _ws_send_json(wfile, {
-                "type": "text",
-                "text": reply,
-                "route": route,
-                "tool": tool,
-                "transcription": transcript,
-                "live_memory": live_memory,
+                "type":           "text",
+                "text":           reply,
+                "route":          route,
+                "tool":           tool,
+                "transcription":  transcript,
+                "live_memory":    live_memory,
                 "live_memory_conf": live_memory_conf,
             })
 
@@ -825,8 +1044,21 @@ def clean_tool_result_for_telegram(result: Any) -> str:
 
     return truncate_text(result, limit=1200)
 
+_CODE_VERBS = {
+    "build", "create", "make", "write", "code", "develop", "generate",
+    "scaffold", "implement", "program", "design", "fix", "patch", "update",
+    "edit", "refactor", "add", "modify", "change",
+}
+_CODE_NOUNS = {
+    "website", "site", "webpage", "app", "application", "game", "script",
+    "tool", "api", "server", "bot", "widget", "component", "function",
+    "class", "module", "plugin", "extension", "dashboard", "ui", "feature",
+    "file", "html", "css", "js", "py", "ts", "tsx", "json", "yaml",
+}
+
 def force_correct_common_tool(user_text: str, live_result: dict) -> dict:
     text = (user_text or "").lower()
+    words = set(text.split())
 
     if "news" in text or "headlines" in text or "day's news" in text or "days news" in text:
         live_result["action"] = "direct_tool"
@@ -839,6 +1071,14 @@ def force_correct_common_tool(user_text: str, live_result: dict) -> dict:
             "limit": 6,
         }
         return live_result
+
+    # Force code route when user asks to build/create/write something
+    if (words & _CODE_VERBS) and (words & _CODE_NOUNS):
+        if live_result.get("action") not in ("code", "direct_tool"):
+            live_result["action"] = "code"
+            live_result["route"] = "code"
+            live_result["tool"] = None
+            live_result["args"] = {}
 
     return live_result
 
@@ -975,6 +1215,20 @@ def create_task(title: str, user_request: str, route: str, model: str) -> dict:
     return task
 
 def load_active_plan() -> Dict[str, Any]:
+    # Try Redis first
+    try:
+        r = _get_redis()
+        if r:
+            active_id = r.get("jarvis:active_plan_id")
+            if active_id:
+                raw = r.hget(REDIS_PLANS_KEY, active_id)
+                if raw:
+                    data = json.loads(raw)
+                    if isinstance(data, dict):
+                        return data
+    except Exception:
+        pass
+    # Fall back to file
     if not PLANNER_STATE_PATH.exists():
         return {}
     try:
@@ -982,24 +1236,45 @@ def load_active_plan() -> Dict[str, Any]:
         return data if isinstance(data, dict) else {}
     except Exception:
         return {}
-def load_plan_by_id(plan_id: str) -> Dict[str, Any]:
-    plan_root = VAULT_DIR / ".jarvis" / "history" / "plans" / plan_id
 
+def load_plan_by_id(plan_id: str) -> Dict[str, Any]:
+    # Try Redis first
+    try:
+        r = _get_redis()
+        if r:
+            raw = r.hget(REDIS_PLANS_KEY, plan_id)
+            if raw:
+                data = json.loads(raw)
+                if isinstance(data, dict):
+                    return data
+    except Exception:
+        pass
+    # Fall back to files
+    plan_root = VAULT_DIR / ".jarvis" / "history" / "plans" / plan_id
     for filename in ["status.json", "plan.json"]:
         path = plan_root / filename
         if not path.exists():
             continue
-
         try:
             data = json.loads(path.read_text(encoding="utf-8"))
             if isinstance(data, dict):
                 return data
         except Exception:
             pass
-
     return {}
 
 def save_active_plan(plan: Dict[str, Any]) -> None:
+    plan_id = plan.get("plan_id", "")
+    # Persist to Redis
+    try:
+        r = _get_redis()
+        if r and plan_id:
+            r.hset(REDIS_PLANS_KEY, plan_id, json.dumps(plan, ensure_ascii=False))
+            r.set("jarvis:active_plan_id", plan_id)
+            r.expire("jarvis:active_plan_id", 86400)  # 24h TTL
+    except Exception:
+        pass
+    # Also write to file as backup
     PLANNER_STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
     PLANNER_STATE_PATH.write_text(json.dumps(plan, ensure_ascii=False, indent=2), encoding="utf-8")
 
@@ -1065,11 +1340,15 @@ def extract_planner_steps(answer: str) -> List[Dict[str, Any]]:
 def build_simple_code_plan(user_text: str, paths: List[str]) -> Dict[str, Any]:
     planner_model = get_planner_model()
 
+    staging_hint = f"Staging root: /mnt/e/coding/staging/dev/<PLAN_ID>/"
+
     prompt = (
+    "/no_think\n"
     "Create a concrete coding implementation plan.\n"
-    "Return ONLY valid JSON with this exact shape:\n"
+    "Return ONLY valid JSON — no markdown, no explanations, no code fences.\n\n"
+    "Required JSON shape:\n"
     "{\n"
-    '  "speak": "short summary of the plan",\n'
+    '  "speak": "1-sentence summary of what will be built",\n'
     '  "intent": "code_plan_create",\n'
     '  "action": "code",\n'
     '  "route": "code",\n'
@@ -1080,32 +1359,30 @@ def build_simple_code_plan(user_text: str, paths: List[str]) -> Dict[str, Any]:
     '  "plan_action": "create",\n'
     '  "tool": null,\n'
     '  "args": {},\n'
-    '  "path": ["/mnt/e/coding/projectx"],\n'
+    '  "files": ["staging/dev/<PLAN_ID>/index.html", "staging/dev/<PLAN_ID>/style.css"],\n'
     '  "steps": [\n'
     '    {\n'
     '      "id": 1,\n'
-    '      "goal": "specific implementation step",\n'
-    '      "target_files": ["relative/path.ext"]\n'
+    '      "goal": "detailed description of exactly what to implement in this step",\n'
+    '      "tool": "coding",\n'
+    '      "target_files": ["staging/dev/<PLAN_ID>/index.html"]\n'
     '    }\n'
     "  ]\n"
     "}\n\n"
     "Rules:\n"
-    "- Return JSON only. No markdown. No explanations.\n"
-    "- Extract exact file names from the user request when present.\n"
-    "- If the user says save/write/create to a filename, include that exact filename in files.\n"
-    "- For single-file tasks, files must contain exactly that one file.\n"
-    "- For multi-file tasks, files must list every file the implementation will create or modify.\n"
-    "- Every step must include target_files.\n"
-    "- Every target_files entry must also exist in files.\n"
-    "- Do not use directories as files. For example, use love.html, not skills.\n"
-    "- Split work into small executable steps.\n"
-    "- Avoid generic steps like inspect/analyze unless debugging requires inspection.\n"
-    "- Keep 3–10 steps.\n"
-    "- Each step must be concrete enough for an executor agent to implement directly.\n"
-    "- For debugging tasks, include steps to identify the failure point and verify the fix.\n"
-    "- The final step must verify or complete the requested file/code change.\n"
-    "- Do not create a plan with only setup/directory steps.\n\n"
-    "- Coding is also done to staging folder not to production code directly, so include staging file paths when relevant. after testing move files to tested and make directory plan-id\n\n"
+    "- Return JSON ONLY. No prose before or after.\n"
+    "- All file paths use staging: /mnt/e/coding/staging/dev/<PLAN_ID>/filename.ext\n"
+    "- Use <PLAN_ID> as a literal placeholder in paths — it gets replaced at runtime.\n"
+    "- List every file that will be created or modified in top-level 'files' array.\n"
+    "- Every step MUST have 'target_files' listing which files it touches.\n"
+    "- Do not use directory names as files (use index.html not src/).\n"
+    "- Write 5-10 steps. Each step implements one specific, concrete piece.\n"
+    "- Step goals must be detailed: describe WHAT to implement, not just 'create file'.\n"
+    "- For new projects: separate HTML structure, CSS, JS logic, animations into distinct steps.\n"
+    "- For skill fixes: include read-file step, patch step, test step, deliver step.\n"
+    "- Second-to-last step: run tests or verify the implementation works.\n"
+    "- Last step: copy files from staging/dev to staging/tested/<PLAN_ID>/ for review.\n"
+    "- tool field: 'coding' for code generation, 'shell' for tests/shell commands, 'podman' for containerized tests.\n\n"
     "Examples:\n"
     "{\n"
     '  "speak": "I will create a small HTML file with the requested page.",\n'
@@ -1119,29 +1396,33 @@ def build_simple_code_plan(user_text: str, paths: List[str]) -> Dict[str, Any]:
     '  "plan_action": "create",\n'
     '  "tool": null,\n'
     '  "args": {},\n'
-    '  "path": ["/mnt/e/coding/projectx"],\n'
+    '  "files": ["staging/dev/<PLAN_ID>/love.html"],\n'
     '  "steps": [\n'
-    '    {"id": 1, "goal": "Create the HTML structure for the page.", "tool":"coding","target_files": ["love.html"]},\n'
-    '    {"id": 2, "goal": "Add CSS for the animated pulsing red heart.", "tool":"coding", "target_files": ["love.html"]},\n'
-    '    {"id": 3, "goal": "Add the visible text requested by the user and ensure the file is complete.", "tool":"coding", "target_files": ["love.html"]}\n'
-    '    {"id": 3, "goal": "test code with pytest in podmman.", "tool":"podman", "target_files": ["love.html"]}\n'
+    '    {"id": 1, "goal": "Create HTML skeleton: DOCTYPE, head with viewport meta and link to style.css, body with a centered .container div holding an h1 title and empty #heart div.", "tool":"coding","target_files": ["staging/dev/<PLAN_ID>/love.html"]},\n'
+    '    {"id": 2, "goal": "Add CSS: full-page flexbox centering, #heart as a 200px red div with heart clip-path, @keyframes pulse animation scaling 1.0-1.15 on a 1s loop.", "tool":"coding", "target_files": ["staging/dev/<PLAN_ID>/love.html"]},\n'
+    '    {"id": 3, "goal": "Add the visible message text inside .container, style the h1 with a romantic font and color, ensure file is complete and valid HTML.", "tool":"coding", "target_files": ["staging/dev/<PLAN_ID>/love.html"]},\n'
+    '    {"id": 4, "goal": "Open the file in a headless browser or validate HTML structure. Confirm animation classes are present.", "tool":"shell", "target_files": ["staging/dev/<PLAN_ID>/love.html"]},\n'
+    '    {"id": 5, "goal": "Copy staging/dev/<PLAN_ID>/ to staging/tested/<PLAN_ID>/ for human review.", "tool":"shell", "target_files": ["staging/tested/<PLAN_ID>/love.html"]}\n'
     "  ]\n"
     "}\n\n"
     f"User request:\n{user_text}\n\n"
     f"Likely paths:\n{json.dumps(paths, ensure_ascii=False)}\n"
+    f"{staging_hint}\n"
     )
 
     payload = {
         "model": planner_model,
         "messages": [{"role": "user", "content": prompt}],
         "stream": False,
+        "think": False,
         "options": {
-    "temperature": 0,
-    "num_predict": 1400,
-    "num_ctx": 8192,
-},
+            "temperature": 0,
+            "num_predict": 2400,
+            "num_ctx": 8192,
+        },
     }
     plan_files: List[str] = []
+    parsed_plan: Dict[str, Any] = {}
     try:
         answer = ""
         raw_steps = []
@@ -1173,7 +1454,8 @@ def build_simple_code_plan(user_text: str, paths: List[str]) -> Dict[str, Any]:
 
             if not answer and raw_content:
                 answer = raw_content.strip()
-            raw_steps = extract_planner_steps(answer)
+            if not raw_steps:
+                raw_steps = extract_planner_steps(answer)
 
             emit_event(
                 "code_phase",
@@ -1192,8 +1474,15 @@ def build_simple_code_plan(user_text: str, paths: List[str]) -> Dict[str, Any]:
             goal = str(raw_step.get("goal", "")).strip()
             if not goal:
                 continue
-            steps.append({"id": i, "status": "pending", "goal": goal})
-       
+            step: Dict[str, Any] = {"id": i, "status": "pending", "goal": goal}
+            tfiles = raw_step.get("target_files", [])
+            if isinstance(tfiles, list) and tfiles:
+                step["target_files"] = tfiles
+            tool_field = raw_step.get("tool", "")
+            if tool_field:
+                step["tool"] = tool_field
+            steps.append(step)
+
         if not steps:
             raise ValueError(f"planner returned no usable steps. Raw answer: {answer[:500]}")
 
@@ -1208,6 +1497,20 @@ def build_simple_code_plan(user_text: str, paths: List[str]) -> Dict[str, Any]:
             ]
 
     plan_id = make_plan_id()
+
+    def _subst(val: Any) -> Any:
+        """Replace <PLAN_ID> placeholder with actual plan_id in strings/lists."""
+        if isinstance(val, str):
+            return val.replace("<PLAN_ID>", plan_id)
+        if isinstance(val, list):
+            return [_subst(v) for v in val]
+        return val
+
+    plan_files = [_subst(f) for f in plan_files]
+    for step in steps:
+        if "target_files" in step:
+            step["target_files"] = _subst(step["target_files"])
+        step["goal"] = _subst(step["goal"])
 
     plan = {
         "plan_id": plan_id,
@@ -1308,11 +1611,34 @@ def build_simple_code_plan(user_text: str, paths: List[str]) -> Dict[str, Any]:
     return plan
 
 def render_plan(plan: Dict[str, Any]) -> str:
-    lines = [f"PLAN_ID: {plan.get('plan_id')}", ""]
-    for step in plan.get("steps", []):
-        lines.append(f"{step.get('id')}. [{step.get('status')}] {step.get('goal')}")
+    plan_id = plan.get("plan_id", "?")
+    speak   = plan.get("speak", "").strip()
+    files   = plan.get("files", [])
+
+    lines = [f"PLAN_ID: {plan_id}"]
+    if speak:
+        lines.append(f"Summary: {speak}")
+    if files:
+        lines.append(f"Files:   {', '.join(files)}")
     lines.append("")
-    lines.append("WAITING_FOR: proceed / modify step / cancel")
+
+    for step in plan.get("steps", []):
+        status = step.get("status", "pending")
+        goal   = step.get("goal", "")
+        sid    = step.get("id", "?")
+        tfiles = step.get("target_files", [])
+        tool   = step.get("tool", "")
+
+        marker = "✓" if status == "done" else "•"
+        line = f"  {marker} {sid}. {goal}"
+        if tfiles:
+            line += f"\n       files: {', '.join(tfiles)}"
+        if tool and tool not in ("coding", "code_edit"):
+            line += f"  [{tool}]"
+        lines.append(line)
+
+    lines.append("")
+    lines.append("Reply:  proceed | modify <change> | cancel")
     return "\n".join(lines)
 
 def build_tool_hints(tool_skill_meta: Dict[str, Dict[str, Any]]) -> Dict[str, List[str]]:
@@ -1393,7 +1719,6 @@ def transcribe_audio_b64(audio_b64: str) -> str:
             with urllib.request.urlopen(req, timeout=60) as resp:
                 data = json.loads(resp.read().decode("utf-8"))
                 raw = data.get("choices", [{}])[0].get("message", {}).get("content", "")
-                # Strip thinking tags and prompt echo
                 raw = strip_thinking_tags(raw).strip()
                 if "<channel|>" in raw:
                     raw = raw.split("<channel|>")[-1].strip()
@@ -1404,6 +1729,9 @@ def transcribe_audio_b64(audio_b64: str) -> str:
             return ""
 
 
+# -----------------------------------------------------------------------------
+# handle_live_router — now uses memory_router for the HTTP path
+# -----------------------------------------------------------------------------
 
 def handle_live_router(
     self,
@@ -1415,44 +1743,69 @@ def handle_live_router(
     messages: list,
 ) -> tuple[bool, str | None]:
     """
-    Fast path: live router, direct tool execution, chat_only responses.
+    Fast path: memory_router classify + direct tool execution + chat_only responses.
+
+    Now uses memory_router.route() for both HTTP and WS paths so routing,
+    memory fetch, and Redis state are consistent everywhere.
 
     Returns (handled, requested_route_override).
     If handled=True, response has already been sent.
     If handled=False, caller should proceed to handle_full_pipeline.
     requested_route_override may override requested_route for the full pipeline.
     """
-    live_result = run_live_router(user_text)
+    # ── Plan command short-circuit (bypasses memory_router entirely) ──────
+    # "proceed PLAN-ID", "cancel PLAN-ID", "modify ...", bare "proceed" etc.
+    # must always go straight to the code route without memory_router interference.
+    _plan_cmd_words = (user_text or "").strip().lower().split()
+    _plan_cmd = _plan_cmd_words[0] if _plan_cmd_words else ""
+    if _plan_cmd in {"proceed", "continue", "run", "yes", "accept", "cancel"}:
+        return False, "code"
+    if _plan_cmd == "modify" and len(_plan_cmd_words) > 1:
+        return False, "code"
+
+    # ── Pass 1-4 via memory_router ────────────────────────────────────────
+    live_result = run_memory_router(user_text, messages)
     live_result = force_correct_common_tool(user_text, live_result)
 
-    live_action = live_result.get("action")
-    chat_confidence = float(live_result.get("chat_confidence", 0))
-    escalation_confidence = float(live_result.get("escalation_confidence", 0))
-    execute_confidence = float(live_result.get("execute_confidence", 0))
-    memory_confidence = float(live_result.get("memory_confidence", 0))
-    need_memory = bool(live_result.get("need_memory", False))
-    live_speak = str(live_result.get("speak") or "").strip()
-    live_transcript = str(live_result.get("transcript") or "").strip()
-    live_tool = str(live_result.get("tool") or "").strip()
-    live_intent = str(live_result.get("intent") or "").strip()
-    live_args = live_result.get("args") or {}
+    # Inject memory context into messages when present so full pipeline sees it
+    memory_ctx = live_result.get("memory_context", "")
+    if memory_ctx and memory_ctx.strip():
+        insert_at = 1 if messages and messages[0].get("role") == "system" else 0
+        messages.insert(insert_at, {
+            "role": "system",
+            "content": (
+                "Memory context — optional background only. "
+                "Do not change user intent based on memory.\n\n"
+                + memory_ctx
+            ),
+        })
 
+    live_action             = live_result.get("action")
+    chat_confidence         = float(live_result.get("chat_confidence", 0))
+    escalation_confidence   = float(live_result.get("escalation_confidence", 0))
+    execute_confidence      = float(live_result.get("execute_confidence", 0))
+    memory_confidence       = float(live_result.get("memory_confidence", 0))
+    need_memory             = bool(live_result.get("need_memory", False))
+    live_speak              = str(live_result.get("speak") or "").strip()
+    live_transcript         = str(live_result.get("transcript") or "").strip()
+    live_tool               = str(live_result.get("tool") or "").strip()
+    live_intent             = str(live_result.get("intent") or "").strip()
+    live_args               = live_result.get("args") or {}
 
-
-    write_chat_log("assistant", live_speak, route=live_action, model="live")
+    write_chat_log("assistant", live_speak, route=live_action or "live", model="memory_router")
 
     emit_event(
-        "Live router",
+        "memory_router",
         "Reply and confidence",
         {
-            "speak": live_speak,
-            "tool": live_tool,
-            "escalation_confidence": escalation_confidence,
-            "execute_confidence": execute_confidence,
-            "chat_confidence": chat_confidence,
-            "need_memory": need_memory,
-            "memory_confidence": memory_confidence,
-            "user_text": user_text[:200],
+            "speak":                  live_speak,
+            "tool":                   live_tool,
+            "escalation_confidence":  escalation_confidence,
+            "execute_confidence":     execute_confidence,
+            "chat_confidence":        chat_confidence,
+            "need_memory":            need_memory,
+            "memory_confidence":      memory_confidence,
+            "user_text":              user_text[:200],
         },
     )
 
@@ -1465,21 +1818,22 @@ def handle_live_router(
 
     if live_transcript:
         user_text = live_transcript
-        # Patch messages in-place so full pipeline sees clean transcript
         for i in range(len(messages) - 1, -1, -1):
             if messages[i].get("role") == "user":
                 messages[i] = {**messages[i], "content": user_text}
                 break
 
     # --- chat_only fast return ---
-    if live_action == "chat_only" and (chat_confidence >= 0.70 or escalation_confidence == 0.0) and live_speak:
+    # Don't intercept if the caller explicitly set a non-live route
+    _explicit_route_set = requested_route and requested_route not in ("live", None)
+    if live_action == "chat_only" and not _explicit_route_set and (chat_confidence >= 0.70 or escalation_confidence == 0.0) and live_speak:
         self._json_response({
-            "model": "live_router",
+            "model":      "memory_router",
             "created_at": now_iso(),
-            "message": {"role": "assistant", "content": live_speak},
-            "done": True,
-            "route": "live",
-            "live": live_result,
+            "message":    {"role": "assistant", "content": live_speak},
+            "done":       True,
+            "route":      "live",
+            "live":       live_result,
         })
         return True, None
 
@@ -1511,41 +1865,45 @@ def handle_live_router(
         content = extract_tool_content(result)
         reply = content or live_speak or f"Done: {live_tool_fixed}"
 
+        # Update Redis: tool executed
+        _safe_update_state(task=f"tool:{live_tool_fixed}", confidence="high")
+        _safe_push_memory(f"assistant: executed {live_tool_fixed} → {reply[:200]}")
+
         try:
-            write_chat_log("user", user_text, route="tools", model="live_router")
-            write_chat_log("assistant", reply, route="tools", model="live_router")
+            write_chat_log("user",      user_text, route="tools", model="memory_router")
+            write_chat_log("assistant", reply,     route="tools", model="memory_router")
         except Exception as e:
             print(f"[CHAT_LOG] direct tool log failed: {e}")
 
         emit_event(
             "router",
-            "Live router decision",
+            "Memory router decision",
             {
-                "action": live_result.get("action"),
-                "route": live_result.get("route"),
-                "tool": live_tool_fixed,
-                "chat_confidence": live_result.get("chat_confidence"),
-                "escalation_confidence": live_result.get("escalation_confidence"),
-                "execute_confidence": live_result.get("execute_confidence"),
-                "intent": live_result.get("intent"),
-                "speak": live_result.get("speak", "")[:300],
+                "action":                 live_result.get("action"),
+                "route":                  live_result.get("route"),
+                "tool":                   live_tool_fixed,
+                "chat_confidence":        live_result.get("chat_confidence"),
+                "escalation_confidence":  live_result.get("escalation_confidence"),
+                "execute_confidence":     live_result.get("execute_confidence"),
+                "intent":                 live_result.get("intent"),
+                "speak":                  live_result.get("speak", "")[:300],
             },
         )
 
         self._json_response({
-            "model": "live_router",
-            "created_at": now_iso(),
-            "message": {"role": "assistant", "content": reply},
-            "done": True,
-            "route": "tools",
-            "format": "direct_tool",
-            "tool": live_tool_fixed,
+            "model":       "memory_router",
+            "created_at":  now_iso(),
+            "message":     {"role": "assistant", "content": reply},
+            "done":        True,
+            "route":       "tools",
+            "format":      "direct_tool",
+            "tool":        live_tool_fixed,
             "tool_result": result,
-            "live": live_result,
+            "live":        live_result,
         })
         return True, None
 
-       # --- chat_history_query shortcut ---
+    # --- chat_history_query shortcut ---
     if live_result.get("action") == "chat_only" and requested_route == "live" and live_intent == "chat_history_query":
         model = resolve_model(requested_model=requested_model, route="live")
         try:
@@ -1567,7 +1925,7 @@ def handle_live_router(
         if source == "telegram" and reply_text.strip():
             notify_telegram(reply_text.strip())
         self._json_response({**data, "route": "live", "live": live_result, "chat_history_used": True})
-        return
+        return True, None
 
     # --- live chat_only with self context ---
     if live_result.get("action") == "chat_only" and requested_route == "live":
@@ -1583,8 +1941,9 @@ def handle_live_router(
         if source == "telegram" and reply_text.strip():
             notify_telegram(reply_text.strip())
         self._json_response({**data, "route": "live", "live": live_result})
-        return
-     # --- not handled, determine route override for full pipeline ---
+        return True, None
+
+    # --- not handled: determine route override for full pipeline ---
     route_override = None
     if live_action == "chat_only":
         route_override = "live"
@@ -1600,7 +1959,7 @@ def handle_live_router(
     # Store live_result on body so full pipeline can use it
     body["_live_result"] = live_result
     body["_live_intent"] = live_intent
-    body["_user_text"] = user_text  # updated with transcript if any
+    body["_user_text"]   = user_text  # updated with transcript if any
 
     return False, route_override
 
@@ -1617,6 +1976,10 @@ def handle_full_pipeline(
 ) -> None:
     """
     Full pipeline: workflow, memory, tool selection, code route, agent, react chat.
+
+    When an approved coding plan is submitted:
+      1. Try to queue tasks to plan_runner via Redis.
+      2. If Redis unavailable, fall back to inline agent_loop.
     """
     live_result = body.get("_live_result", {})
     live_intent = body.get("_live_intent", "")
@@ -1646,13 +2009,13 @@ def handle_full_pipeline(
         direct_skill_match = resolve_skill_command(user_text)
         if direct_skill_match and direct_skill_match.get("score", 0) >= 0.88:
             live_result.update({
-                "action": "direct_tool",
-                "route": "tools",
-                "tool": direct_skill_match["tool_name"],
-                "chat_confidence": 0.0,
+                "action":               "direct_tool",
+                "route":                "tools",
+                "tool":                 direct_skill_match["tool_name"],
+                "chat_confidence":      0.0,
                 "escalation_confidence": 1.0,
-                "execute_confidence": 1.0,
-                "args": live_result.get("args") or {},
+                "execute_confidence":   1.0,
+                "args":                 live_result.get("args") or {},
             })
             requested_route = "tools"
 
@@ -1664,10 +2027,10 @@ def handle_full_pipeline(
     if workflow_state:
         reply = continue_markdown_workflow(user_text, workflow_state)
         self._json_response({
-            "model": "workflow",
+            "model":      "workflow",
             "created_at": now_iso(),
-            "message": {"role": "assistant", "content": reply},
-            "done": True,
+            "message":    {"role": "assistant", "content": reply},
+            "done":       True,
         })
         return
 
@@ -1678,24 +2041,22 @@ def handle_full_pipeline(
 
         if md_skill.get("type") == "interview_workflow":
             state = {
-                "skill": md_skill.get("name"),
+                "skill":      md_skill.get("name"),
                 "skill_path": md_skill.get("path"),
-                "phase": "interview",
-                "answers": {},
+                "phase":      "interview",
+                "answers":    {},
             }
             save_workflow_state(state)
             question = get_next_workflow_question(state)
             self._json_response({
-                "model": "workflow",
+                "model":      "workflow",
                 "created_at": now_iso(),
-                "message": {"role": "assistant", "content": question or "Workflow started."},
-                "done": True,
+                "message":    {"role": "assistant", "content": question or "Workflow started."},
+                "done":       True,
             })
             return
 
-
-
-    # --- memory context ---
+    # --- memory context (already injected by handle_live_router; skip if present) ---
     plan_command, plan_command_id = parse_plan_command(user_text)
     lower_user = user_text.strip().lower()
 
@@ -1709,37 +2070,18 @@ def handle_full_pipeline(
     )
 
     is_active_followup = normalized_user in active_task_followups
-    skip_memory = (
-        requested_route == "live"
-        or bool(direct_skill_match)
-        or is_active_followup
-        or bool(md_skill)
-        or plan_command in {"proceed", "continue", "next", "run", "yes", "cancel"}
-        or lower_user.startswith(direct_command_prefixes)
-    )
+    # Memory context already injected from memory_router result — skip re-fetch
+    skip_memory = True
 
-    context_pack = ""
     planner_user_text = user_text
-
-    if not skip_memory:
-        context_pack = build_context_pack(user_text)
-        if context_pack:
-            insert_at = 1 if messages and messages[0].get("role") == "system" else 0
-            messages.insert(insert_at, {
-                "role": "system",
-                "content": (
-                    "Memory context is optional background only. "
-                    "The current user message is the command. "
-                    "Do not change the user's intent based on memory. "
-                    "If memory conflicts with the current command, ignore memory.\n\n"
-                    + context_pack
-                ),
-            })
-            planner_user_text = (
-                f"USER COMMAND:\n{user_text}\n\n"
-                f"OPTIONAL MEMORY HINTS:\n{context_pack[:2500]}\n\n"
-                "Instruction: obey USER COMMAND. Use memory only as supporting context."
-            )
+    # If memory_router found relevant context, prepend it to planner_user_text
+    existing_memory_ctx = live_result.get("memory_context", "")
+    if existing_memory_ctx and existing_memory_ctx.strip():
+        planner_user_text = (
+            f"USER COMMAND:\n{user_text}\n\n"
+            f"OPTIONAL MEMORY HINTS:\n{existing_memory_ctx[:2500]}\n\n"
+            "Instruction: obey USER COMMAND. Use memory only as supporting context."
+        )
 
     # --- telegram plan commands ---
     if source == "telegram" and plan_command in {"proceed", "continue", "next", "run", "modify", "cancel", "accept"}:
@@ -1774,9 +2116,9 @@ def handle_full_pipeline(
         selected_tools = choose_tools(user_text, requested_route=requested_route, requested_model=requested_model)
 
     emit_event("router", "Fuzzy skill command match", {
-        "matched": bool(direct_skill_match),
-        "tool": direct_skill_match.get("tool_name") if direct_skill_match else None,
-        "score": direct_skill_match.get("score") if direct_skill_match else None,
+        "matched":   bool(direct_skill_match),
+        "tool":      direct_skill_match.get("tool_name") if direct_skill_match else None,
+        "score":     direct_skill_match.get("score") if direct_skill_match else None,
         "user_text": user_text[:200],
     })
 
@@ -1793,6 +2135,9 @@ def handle_full_pipeline(
         model = resolve_model(requested_model=requested_model, route=resolved_route)
 
     route = resolved_route
+
+    # Update Redis state for this request
+    _safe_update_state(task=f"{route}:{live_intent or 'chat'}", confidence="high")
 
     if log_chat_event:
         try:
@@ -1814,6 +2159,7 @@ def handle_full_pipeline(
     agent_requested = route == "deep" or user_text.lower().startswith(("agent:", "do task:"))
 
     if agent_requested:
+        _safe_update_state(task="deep_agent", confidence="high")
         result = run_agent_loop(
             user_message=planner_user_text,
             route=route,
@@ -1847,13 +2193,14 @@ def handle_full_pipeline(
         else:
             answer = result.get("answer", "") if isinstance(result, dict) else ""
             write_chat_log("assistant", answer, route=route, model=model)
+            _safe_push_memory(f"assistant: {answer[:300]}")
             self._json_response({
                 "model": model, "created_at": now_iso(),
                 "message": {"role": "assistant", "content": answer},
                 "done": True, "route": route, "format": "agent",
                 "task_id": result.get("task_id") if isinstance(result, dict) else None,
                 "agent": {
-                    "trace": result.get("trace", []) if isinstance(result, dict) else [],
+                    "trace":        result.get("trace", []) if isinstance(result, dict) else [],
                     "observations": result.get("observations", []) if isinstance(result, dict) else [],
                 },
             })
@@ -1963,6 +2310,40 @@ def handle_full_pipeline(
             "phase": "running_step", "plan_id": active_plan.get("plan_id"), "step": step, "paths": paths,
         })
 
+        # ── Try plan_runner (Redis) first; fall back to inline agent_loop ──
+        plan_id_str = active_plan.get("plan_id", "")
+        queued_to_runner = queue_plan_to_redis(active_plan)
+
+        if queued_to_runner:
+            emit_event("plan_runner", "Plan queued to Redis plan_runner", {
+                "plan_id":    plan_id_str,
+                "step_count": len(steps),
+            })
+            # Return immediately — plan_runner handles execution asynchronously.
+            # Client can poll /api/plan-status/<plan_id> or listen to Telegram.
+            self._json_response({
+                "model":      model,
+                "created_at": now_iso(),
+                "message":    {
+                    "role":    "assistant",
+                    "content": (
+                        f"Plan {plan_id_str} queued to plan_runner ({len(steps)} steps).\n"
+                        "Execution is running in the background.\n"
+                        f"You'll be notified on Telegram when it completes."
+                    ),
+                },
+                "done":     True,
+                "route":    "code",
+                "format":   "plan_runner",
+                "plan_id":  plan_id_str,
+            })
+            return
+
+        # ── Fallback: inline agent_loop (Redis unavailable) ───────────────
+        emit_event("plan_runner", "Redis unavailable — running inline agent_loop", {
+            "plan_id": plan_id_str,
+        })
+
         result = run_agent_loop(
             user_message=(
                 "Execute this approved plan only.\n\n"
@@ -2013,7 +2394,7 @@ def handle_full_pipeline(
                     + "\n".join(f"- {p}" for p in validation.get("problems", []))
                     + "\n\nReturn ONLY:\n--- FILE: path/to/file.py\n@@\n<minimal patch>\n"
                 ),
-                "path": paths[0] if paths else str(PROJECT_ROOT),
+                "path":  paths[0] if paths else str(PROJECT_ROOT),
                 "model": model, "mode": "patch",
             }
             retry_result = execute_tool(tool_name, retry_args)
@@ -2037,10 +2418,10 @@ def handle_full_pipeline(
                 save_active_plan(active_plan)
                 save_json(active_plan["plan_id"], "status.json", active_plan)
                 emit_event("code_step_ready", f"Step {step.get('id')} complete.", {
-                    "plan_id": active_plan.get("plan_id"), "step": step,
+                    "plan_id":      active_plan.get("plan_id"), "step": step,
                     "current_step": active_plan["current_step"],
-                    "remaining": len(steps) - active_plan["current_step"],
-                    "next_step": steps[active_plan["current_step"]] if active_plan["current_step"] < len(steps) else None,
+                    "remaining":    len(steps) - active_plan["current_step"],
+                    "next_step":    steps[active_plan["current_step"]] if active_plan["current_step"] < len(steps) else None,
                 })
             else:
                 content = content + "\n\nAPPLY FAILED:\n" + json.dumps(apply_result, indent=2)
@@ -2077,6 +2458,9 @@ def handle_full_pipeline(
     if is_simple_direct_chat(user_text, selected_tools, resolved_route):
         try:
             data = call_ollama_once(model=model, messages=messages, route=resolved_route, persona=persona, tools=None, stream=False)
+            reply_text = data.get("message", {}).get("content", "") if isinstance(data, dict) else ""
+            write_chat_log("assistant", reply_text, route=resolved_route, model=model)
+            _safe_push_memory(f"assistant: {reply_text[:300]}")
             self._json_response(data)
         except Exception as e:
             self._json_response({"model": model, "created_at": now_iso(), "message": {"role": "assistant", "content": f"Error: {e}"}, "done": True})
@@ -2087,6 +2471,8 @@ def handle_full_pipeline(
         write_bridge_status("thinking", ack)
         speak_ack(ack)
         result = react_chat(model, messages, selected_tools, route=resolved_route, persona=persona)
+        reply_text = result.get("message", {}).get("content", "") if isinstance(result, dict) else ""
+        _safe_push_memory(f"assistant: {reply_text[:300]}")
         self._json_response(result)
         return
 
@@ -2242,7 +2628,7 @@ Rules:
             "warning",
             "Tool arg completion failed",
             {
-                "tool": tool_name,
+                "tool":  tool_name,
                 "error": str(e),
             },
         )
@@ -2275,6 +2661,13 @@ def reload_all_skills() -> Dict[str, Any]:
     TOOL_HINTS = build_tool_hints(TOOL_SKILL_META)
     TOOL_DIRECT_MATCH = build_tool_direct_match(TOOL_SKILL_META)
     TOOL_ROUTE_HINTS = build_tool_route_hints(TOOL_SKILL_META)
+
+    # Refresh tool health in Redis
+    try:
+        if _redis_available():
+            write_tools({name: True for name in TOOL_MAP.keys()})
+    except Exception:
+        pass
 
     return {"status": "ok", "tool_count": len(TOOLS), "tools": list(TOOL_MAP.keys())}
 
@@ -2478,15 +2871,11 @@ def continue_markdown_workflow(user_text: str, state: Dict[str, Any]) -> str:
     answers = state.setdefault("answers", {})
     category = int(state.get("category", 1))
 
-    # Save previous answer
     last_question = state.get("last_question")
 
     if last_question:
         answers[last_question] = user_text.strip()
 
-    # ------------------------------------------------------------------
-    # CATEGORY 1
-    # ------------------------------------------------------------------
     if category == 1:
         questions = [
             "project_name",
@@ -2509,9 +2898,6 @@ def continue_markdown_workflow(user_text: str, state: Dict[str, Any]) -> str:
 
         state["category"] = 2
 
-    # ------------------------------------------------------------------
-    # CATEGORY 2
-    # ------------------------------------------------------------------
     if state["category"] == 2:
         questions = [
             "frontend",
@@ -2534,9 +2920,6 @@ def continue_markdown_workflow(user_text: str, state: Dict[str, Any]) -> str:
 
         state["category"] = 3
 
-    # ------------------------------------------------------------------
-    # CATEGORY 3
-    # ------------------------------------------------------------------
     if state["category"] == 3:
         questions = [
             "authentication",
@@ -2557,9 +2940,6 @@ def continue_markdown_workflow(user_text: str, state: Dict[str, Any]) -> str:
 
                 return prompts[q]
 
-    # ------------------------------------------------------------------
-    # COMPLETE
-    # ------------------------------------------------------------------
     state["phase"] = "complete"
     save_workflow_state(state)
 
@@ -2767,7 +3147,6 @@ def parse_file_patch(content: str) -> Optional[Dict[str, str]]:
     if "@@" in rest:
         rest = rest.split("@@", 1)[1].strip()
 
-    # Remove unified diff + prefixes if model returned diff format
     cleaned_lines = []
     for line in rest.splitlines():
         if line.startswith("@@"):
@@ -2834,7 +3213,6 @@ def validate_coder_output(content: str) -> Dict[str, Any]:
         if pattern in lower:
             problems.append(f"dangerous pattern detected: {pattern}")
 
-    # Detect full-file rewrite tendency
     code_fence_count = text.count("```")
     line_count = len(text.splitlines())
 
@@ -2844,7 +3222,6 @@ def validate_coder_output(content: str) -> Dict[str, Any]:
     if code_fence_count >= 6:
         problems.append("too many code blocks; likely not a minimal patch")
 
-    # Prefer scoped patch/diff output
     has_patch_marker = (
         "--- FILE:" in text
         or "diff --git" in text
@@ -3078,7 +3455,6 @@ def looks_like_markdown_report(text: str) -> bool:
         or len(text) > 800
     )
 
-# Replace classify_agent_output_kind to also handle analyze_code
 def classify_agent_output_kind(skill_name, user_text, result=None):
     result = result or {}
     name = (skill_name or "").lower().strip()
@@ -3142,11 +3518,9 @@ def classify_skill_task(skill_name: str, user_text: str, result: dict | None = N
     name = skill_name.lower()
     text = user_text.lower()
 
-    # Analysis is always report mode, including code analysis
     if name.startswith("analyze") or text.startswith("analyze"):
         return "report"
 
-    # Only explicit modification/coding actions are patch mode
     if name in {"code_edit", "apply_patch", "coder", "fix_file", "refactor_file"}:
         return "patch"
 
@@ -3165,11 +3539,11 @@ def emit_event(
         ensure_dirs()
 
         payload = {
-            "ts": time.time(),
-            "time": now_iso(),
-            "type": event_type,
+            "ts":      time.time(),
+            "time":    now_iso(),
+            "type":    event_type,
             "message": message,
-            "data": data or {},
+            "data":    data or {},
         }
         stage_text = character_stage_message(event_type, message, data)
 
@@ -3183,6 +3557,7 @@ def emit_event(
         typing_events = {
         "plan",
         "router",
+        "memory_router",
         "code_phase",
         "tool_start",
         "status",
@@ -3193,18 +3568,14 @@ def emit_event(
         if TELEGRAM_ENABLED and event_type in typing_events:
             telegram_chat_action("typing")
 
-        # ------------------------------------------------------------------
-        # Telegram notifications
-        # ------------------------------------------------------------------
         if event_type in {"planner.start", "coder.start", "tool_start", "agent_start", "agent_step"}:
             stage_id = str((data or {}).get("stage_id") or event_type)
             TELEGRAM_GATEWAY.start_typing_stage(TELEGRAM_NOTIFY_CHAT_ID, stage_id)
 
-
-
         if event_type in {"planner.done", "coder.done", "tool_result", "agent_final", "final", "warning"}:
             stage_id = str((data or {}).get("stage_id") or event_type.replace(".done", ".start"))
             TELEGRAM_GATEWAY.stop_typing_stage(stage_id)
+
         important_events = {
             "critical",
             "warning",
@@ -3214,11 +3585,18 @@ def emit_event(
             "code_step_ready",
             "Coding planner full response",
             "Live router decision",
+            "memory_router",
             "agent_start",
             "agent_step",
             "agent_final",
             "code_edit_output",
+            "plan_runner",
         }
+        model = str(
+            (data or {}).get("model")
+            or (data or {}).get("resolved_model")
+            or ""
+        )
         if "coder" in model:
             emoji = "💻"
         elif "planner" in model:
@@ -3228,12 +3606,7 @@ def emit_event(
         if event_type == "warning":
             emoji = "⚠️"
         if TELEGRAM_ENABLED and event_type in important_events:
-            route = str(payload["data"].get("route", ""))
-            model = str(
-                payload["data"].get("model")
-                or payload["data"].get("resolved_model")
-                or ""
-            )
+            route = str((data or {}).get("route", ""))
 
             telegram_text = (
                 f"{emoji} JARVIS EVENT\n\n"
@@ -3247,7 +3620,6 @@ def emit_event(
             if model:
                 telegram_text += f"Model: {model}\n"
 
-            # Do not send raw payload JSON to Telegram
             notify_telegram(telegram_text)
 
     except Exception:
@@ -3261,15 +3633,12 @@ def save_report(
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
     safe_skill = (skill_name or "unknown").replace("/", "_").replace(" ", "_")
 
-    # --- Aggregate full agent trace into one markdown document ---
     sections: List[str] = []
 
-    # Pull each observation (one per agent step)
     observations = result.get("observations") or []
     for obs in observations:
         raw = obs.get("observation") or obs.get("content") or ""
 
-        # observations may be JSON-wrapped tool results
         if isinstance(raw, str):
             try:
                 data = json.loads(raw)
@@ -3289,7 +3658,6 @@ def save_report(
         if raw and raw.strip():
             sections.append(raw.strip())
 
-    # Final answer is the synthesis — always append last
     final_answer = (
         result.get("answer")
         or result.get("markdown")
@@ -3299,8 +3667,6 @@ def save_report(
         or ""
     ).strip()
 
-    # If final_answer is already a superset of all sections (agent summarized),
-    # use it alone. Otherwise prepend the observations for full context.
     if final_answer and all(
         section[:120] in final_answer for section in sections if section
     ):
@@ -3312,7 +3678,6 @@ def save_report(
     if not markdown:
         markdown = json.dumps(result, indent=2, ensure_ascii=False)
 
-    # Prepend a header
     header = f"# Report: {safe_skill}\n\n_Plan: {plan_id} — {ts}_\n\n"
     markdown = header + markdown
 
@@ -3324,12 +3689,12 @@ def save_report(
     path.write_text(markdown, encoding="utf-8")
 
     emit_event("artifact", "Report saved", {
-        "plan_id": plan_id,
-        "skill": skill_name,
-        "path": str(path),
-        "chars": len(markdown),
+        "plan_id":  plan_id,
+        "skill":    skill_name,
+        "path":     str(path),
+        "chars":    len(markdown),
         "sections": len(sections),
-        "route": route,
+        "route":    route,
     })
 
     append_event(
@@ -3339,16 +3704,16 @@ def save_report(
         route=route,
         model="",
         payload={
-            "path": str(path),
-            "chars": len(markdown),
+            "path":     str(path),
+            "chars":    len(markdown),
             "sections": len(sections),
         },
     )
 
     return {
-        "ok": True,
-        "kind": "report",
-        "path": str(path),
+        "ok":      True,
+        "kind":    "report",
+        "path":    str(path),
         "markdown": markdown,
         "message": f"Report written to {path}",
     }
@@ -3414,8 +3779,6 @@ def http_get_ok_simple(url: str, timeout: int = 2) -> bool:
         return False
 
 
-
-
 def sanitize_for_tts(text: str) -> str:
     return text.replace("'", "''").replace("JARVIS", "Jarvis").replace("FRIDAY", "Friday").replace("EDITH", "Edith").replace("HAL", "Hal")
 
@@ -3425,8 +3788,8 @@ def speak_ack(text: str) -> None:
         return
 
     emit_event("tts_ack", "TTS ack requested", {
-        "text": text,
-        "engine": "kokoro",
+        "text":     text,
+        "engine":   "kokoro",
         "delivery": "websocket_required",
     })
 
@@ -3500,115 +3863,6 @@ def parse_json_object_from_text(text: str) -> Optional[Dict[str, Any]]:
     return None
 
 
-def run_live_router(user_text: str) -> Dict[str, Any]:
-    prompt = load_named_prompt(
-       LIVE_ROUTER_PROMPT_PATH,
-       fallback=(
-           "You are JARVIS Live Router. Return ONLY valid JSON with fields: "
-            "speak, transcript, intent, action, route, tool, confidence, args. "
-            "Default action is chat_only and route live."
-        ),
-    )
- 
-
-    prompt = prompt.replace(
-        "{{TOOL_CATALOG}}",
-        build_live_tool_catalog()
-    )
-    self_hint = build_self_context_prompt(
-        persona=None,
-        max_tools=8,
-    )
-
-    prompt = (
-        prompt
-        + "\n\nJARVIS SELF-CONTEXT HINT:\n"
-        + self_hint[:2500]
-    )
-    model = resolve_model(requested_model=None, route="live")
-
-    payload = {
-        "model": model,
-        "messages": [
-            {"role": "system", "content": prompt},
-            {"role": "user", "content": user_text},
-        ],
-        "stream": False,
-        "options": {
-            "temperature": 0.1,
-            "top_p": 0.7,
-            "num_ctx": 4096,
-        },
-    }
-    emit_event("warning", "Live router running", {"error": "Running live router", "payload": payload})
-    try:
-        with request_chat_backend(payload, timeout=CHAT_TIMEOUT_SEC, route="live") as resp:
-            data = normalize_chat_response(json.loads(resp.read().decode("utf-8")))
-        emit_event("warning", "Live router running", {"error": "Running live router", "reponse": data})
-        raw = data.get("message", {}).get("content", "")
-        parsed = parse_json_object_from_text(raw)
-        if isinstance(parsed, dict):
-            parsed.setdefault("action", "chat_only")
-            parsed.setdefault("route", "live")
-            parsed.setdefault("tool", None)
-            parsed.setdefault("args", {})
-            parsed.setdefault("speak", "")
-            parsed.setdefault("need_memory", "")
-            parsed.setdefault("memory_confidence", "")
-            parsed.setdefault("transcript", user_text)
-
-            # Backward compatibility with old router schema
-            old_conf = parsed.get("confidence")
-
-            if "chat_confidence" not in parsed:
-                if parsed.get("action") == "chat_only":
-                    parsed["chat_confidence"] = float(old_conf or 0.85)
-                else:
-                    parsed["chat_confidence"] = 0.0
-
-            if "escalation_confidence" not in parsed:
-                if parsed.get("action") in {"direct_tool", "planner", "code", "deep_agent"}:
-                    parsed["escalation_confidence"] = float(old_conf or 0.85)
-                else:
-                    parsed["escalation_confidence"] = 0.0
-
-            if "execute_confidence" not in parsed:
-                if parsed.get("action") in {"direct_tool", "planner", "code", "deep_agent"}:
-                    parsed["execute_confidence"] = float(old_conf or 0.85)
-                else:
-                    parsed["execute_confidence"] = 0.0
-
-            return parsed
-
-        return {
-            "speak": raw.strip() or "I can discuss that.",
-            "transcript": user_text,
-            "intent": "chat",
-            "action": "chat_only",
-            "route": "live",
-            "tool": None,
-            "chat_confidence": 0.5,
-            "escalation_confidence": 0.0,
-            "execute_confidence": 0.0,
-            "need_memory": False,
-            "memory_confidence": 0.0,
-            "args": {},
-        }
-
-    except Exception as e:
-        emit_event("warning", "Live router failed", {"error": str(e)})
-        return {
-            "speak": "",
-            "transcript": user_text,
-            "intent": "fallback",
-            "action": "chat_only",
-            "route": "live",
-            "tool": None,
-            "chat_confidence": 0.0,
-            "escalation_confidence": 0.0,
-            "execute_confidence": 0.0,
-            "args": {},
-        }
 def load_mode_profiles() -> Dict[str, Any]:
     try:
         if MODE_PROFILE_PATH.exists():
@@ -3661,6 +3915,7 @@ def get_profile_options(profile_override: Optional[str] = None) -> Dict[str, Any
     if isinstance(top_p, (int, float)):
         options["top_p"] = top_p
     return options
+
 def return_chat_response(self, payload: dict, user_text: str, reply_text: str, route: str, model: str):
     write_chat_log("user", user_text, route=route, model=model)
     write_chat_log("assistant", reply_text, route=route, model=model)
@@ -3684,17 +3939,17 @@ def resolve_runtime_mode(route: str, selected_tools: List[Dict[str, Any]]) -> Di
         tools_any = set(override.get("tools_any", []))
         if tools_any and (tool_names & tools_any):
             return {
-                "mode": override.get("mode", "conversation"),
-                "persona": override.get("persona", "jarvis"),
-                "tts_engine": override.get("tts_engine", "kokoro"),
+                "mode":        override.get("mode", "conversation"),
+                "persona":     override.get("persona", "jarvis"),
+                "tts_engine":  override.get("tts_engine", "kokoro"),
                 "tts_enabled": bool(override.get("tts_enabled", True)),
             }
 
     base = defaults.get(route, defaults.get("fast", {}))
     return {
-        "mode": base.get("mode", "conversation"),
-        "persona": base.get("persona", "jarvis"),
-        "tts_engine": base.get("tts_engine", "kokoro"),
+        "mode":        base.get("mode", "conversation"),
+        "persona":     base.get("persona", "jarvis"),
+        "tts_engine":  base.get("tts_engine", "kokoro"),
         "tts_enabled": bool(base.get("tts_enabled", True)),
     }
 
@@ -3703,8 +3958,8 @@ def write_runtime_mode(route: str, model: str, selected_tools: List[Dict[str, An
     runtime = resolve_runtime_mode(route, selected_tools)
     payload = {
         **runtime,
-        "route": route,
-        "brain": model,
+        "route":      route,
+        "brain":      model,
         "updated_at": now_iso(),
         "tools": [
             t["function"]["name"]
@@ -3726,9 +3981,9 @@ def build_self_context(persona: Optional[str] = None) -> Dict[str, Any]:
 
     return {
         "identity": {"id": profile.get("id"), "label": profile.get("label"), "systemPrompt": profile.get("systemPrompt")},
-        "models": {"routes": cfg.get("models", {}), "planner_model": cfg.get("planner_model")},
-        "tool_count": len(TOOL_MAP),
-        "available_routes": list(MODE_PROMPTS.keys()),
+        "models":   {"routes": cfg.get("models", {}), "planner_model": cfg.get("planner_model")},
+        "tool_count":        len(TOOL_MAP),
+        "available_routes":  list(MODE_PROMPTS.keys()),
     }
 def build_last_exchange_context() -> str:
     try:
@@ -3764,8 +4019,8 @@ def build_last_exchange_context() -> str:
 
 def build_self_context_prompt(persona: Optional[str] = None, max_tools: int = 20) -> str:
     ctx = build_self_context(persona=persona)
-    identity = ctx.get("identity", {})
-    models = ctx.get("models", {})
+    identity     = ctx.get("identity", {})
+    models       = ctx.get("models", {})
     capabilities = ctx.get("capabilities", [])
     parts = ["Runtime self-context:"]
     parts.append(f"- Persona: {identity.get('label') or identity.get('id') or 'JARVIS'}")
@@ -3788,10 +4043,10 @@ def build_system_prompt_for_route(route: str, persona: Optional[str] = None) -> 
     ).strip() or "You are JARVIS, a capable local assistant."
 
     external_prompt_by_route = {
-        "live": LIVE_CHAT_PROMPT_PATH,
-        "fast": LIVE_CHAT_PROMPT_PATH,
+        "live":   LIVE_CHAT_PROMPT_PATH,
+        "fast":   LIVE_CHAT_PROMPT_PATH,
         "reason": PLANNER_PROMPT_PATH,
-        "code": CODER_PROMPT_PATH,
+        "code":   CODER_PROMPT_PATH,
     }
 
     external_route_prompt = ""
@@ -3866,7 +4121,7 @@ def normalize_messages(messages: List[Dict[str, Any]], system_prompt: Optional[s
 
 def compact_context(messages: List[Dict[str, Any]], max_messages: int = MAX_CONTEXT_MESSAGES) -> List[Dict[str, Any]]:
     systems = [m for m in messages if m.get("role") == "system"]
-    others = [m for m in messages if m.get("role") != "system"]
+    others  = [m for m in messages if m.get("role") != "system"]
     if len(others) <= max_messages:
         trimmed = others
     else:
@@ -3913,11 +4168,11 @@ def sync_kokoro_for_route(route: str, model: str) -> None:
         "status",
         "Syncing Kokoro policy",
         {
-            "route": route,
-            "model": model,
-            "use_kokoro": use_kokoro,
+            "route":          route,
+            "model":          model,
+            "use_kokoro":     use_kokoro,
             "kokoro_running": is_kokoro_running(),
-            "kokoro_host": KOKORO_HOST,
+            "kokoro_host":    KOKORO_HOST,
         },
     )
 
@@ -3942,7 +4197,6 @@ def guess_coding_paths(user_text: str) -> List[str]:
     text = user_text or ""
     lower = text.lower()
 
-    # 1. Explicit filename always wins
     explicit_file_patterns = [
         r"(?:save it to|save as|write to|create|make|to)\s+([A-Za-z0-9_.\-/]+\.(?:html|py|js|ts|tsx|jsx|css|json|md|txt))",
         r"\b([A-Za-z0-9_.\-/]+\.(?:html|py|js|ts|tsx|jsx|css|json|md|txt))\b",
@@ -3953,7 +4207,6 @@ def guess_coding_paths(user_text: str) -> List[str]:
         if match:
             return [match.group(1).strip()]
 
-    # 2. Known project files
     known_files = [
         "skills/news.py",
         "skills/radio.py",
@@ -3981,15 +4234,12 @@ def guess_coding_paths(user_text: str) -> List[str]:
     if "radio" in lower and "skills/radio.py" not in paths:
         paths.append("skills/radio.py")
 
-    # 3. Only fallback to skills for actual skill work
     if "skill" in lower and not paths:
         paths.append("skills")
 
-    # 4. Default project root, not skills
     return paths or ["."]
 
 def extract_tool_content(result: Any) -> str:
-    # Already string
     if isinstance(result, str):
         try:
             data = json.loads(result)
@@ -4018,7 +4268,6 @@ def extract_tool_content(result: Any) -> str:
         except Exception:
             return result
 
-    # Dict/list/object fallback
     return json.dumps(
         result,
         ensure_ascii=False,
@@ -4030,6 +4279,7 @@ def normalized_route(requested_route: Optional[str], selected_tools: List[Dict[s
     if requested_route in VALID_ROUTES:
         return requested_route
     return infer_route_from_tools(selected_tools)
+
 def request_llama_cpp_chat(
     payload: Dict[str, Any],
     timeout: int = CHAT_TIMEOUT_SEC,
@@ -4060,12 +4310,11 @@ def call_ollama_once(
         )
     )
 
-    # llama.cpp path for live/fast
     if route in LLAMA_CPP_ROUTES:
         payload: Dict[str, Any] = {
-            "model": model,
-            "messages": final_messages,
-            "stream": False,
+            "model":       model,
+            "messages":    final_messages,
+            "stream":      False,
             "temperature": 0.3,
         }
 
@@ -4082,23 +4331,22 @@ def call_ollama_once(
         )
 
         return {
-            "model": model,
+            "model":      model,
             "created_at": now_iso(),
-            "message": {
-                "role": "assistant",
+            "message":    {
+                "role":    "assistant",
                 "content": content,
             },
-            "done": True,
-            "route": route,
+            "done":     True,
+            "route":    route,
             "provider": "llama.cpp",
-            "raw": data,
+            "raw":      data,
         }
 
-    # Ollama path for tools/reason/code/deep
     payload: Dict[str, Any] = {
-        "model": model,
+        "model":    model,
         "messages": final_messages,
-        "stream": stream,
+        "stream":   stream,
     }
 
     profile_options = get_profile_options(profile_override=persona)
@@ -4113,6 +4361,7 @@ def call_ollama_once(
         timeout=CHAT_TIMEOUT_SEC,
     ) as resp:
         return json.loads(resp.read().decode("utf-8"))
+
 # -----------------------------------------------------------------------------
 # Tool selection
 # -----------------------------------------------------------------------------
@@ -4166,8 +4415,6 @@ def telegram_chat_action(action: str = "typing") -> None:
 
     now = time.time()
 
-    # Telegram typing indicator lasts a few seconds.
-    # Do not send more often than every 4 seconds.
     if now - LAST_TELEGRAM_ACTION_AT < 4.0:
         return
 
@@ -4192,19 +4439,19 @@ def build_planner_catalog() -> List[Dict[str, Any]]:
     catalog: List[Dict[str, Any]] = []
     for tool in TOOLS:
         try:
-            name = tool["function"]["name"]
+            name        = tool["function"]["name"]
             description = tool["function"].get("description", "")
         except Exception:
             continue
         meta = TOOL_SKILL_META.get(name, {})
         catalog.append(
             {
-                "name": name,
-                "description": description,
+                "name":           name,
+                "description":    description,
                 "intent_aliases": meta.get("intent_aliases", []),
-                "keywords": meta.get("keywords", []),
-                "direct_match": meta.get("direct_match", []),
-                "route": meta.get("route", "reason"),
+                "keywords":       meta.get("keywords", []),
+                "direct_match":   meta.get("direct_match", []),
+                "route":          meta.get("route", "reason"),
             }
         )
     return catalog
@@ -4215,11 +4462,11 @@ def build_planner_prompt(user_text: str) -> str:
     for item in build_planner_catalog():
         compact_catalog.append(
             {
-                "name": item["name"],
+                "name":        item["name"],
                 "description": item.get("description", ""),
-                "aliases": item.get("intent_aliases", []),
-                "route": item.get("route", "reason"),
-                "keywords": item.get("keywords", [])[:12],
+                "aliases":     item.get("intent_aliases", []),
+                "route":       item.get("route", "reason"),
+                "keywords":    item.get("keywords", [])[:12],
             }
         )
     return (
@@ -4308,20 +4555,21 @@ def direct_tools_for_text(user_text: str) -> List[Dict[str, Any]]:
         if intent_alias in text:
             matched_tool_names.extend(tool_names)
     return dedupe_tools([TOOLS_BY_NAME[name] for name in matched_tool_names if name in TOOLS_BY_NAME])
+
 def build_live_tool_catalog(max_tools: int = 40) -> str:
     catalog = []
 
     for tool_name, tool in sorted(TOOLS_BY_NAME.items()):
-        fn = tool.get("function", {})
+        fn   = tool.get("function", {})
         meta = TOOL_SKILL_META.get(tool_name, {})
 
         catalog.append({
-            "name": tool_name,
-            "description": fn.get("description", "")[:300],
-            "parameters": fn.get("parameters", {}),
+            "name":           tool_name,
+            "description":    fn.get("description", "")[:300],
+            "parameters":     fn.get("parameters", {}),
             "intent_aliases": meta.get("intent_aliases", []),
-            "keywords": meta.get("keywords", []),
-            "direct_match": meta.get("direct_match", []),
+            "keywords":       meta.get("keywords", []),
+            "direct_match":   meta.get("direct_match", []),
         })
 
     return json.dumps(catalog[:max_tools], ensure_ascii=False)
@@ -4365,27 +4613,26 @@ def get_effective_planner_model(user_text: str, requested_route: Optional[str], 
     return get_planner_model()
 
 def get_active_task(task_graph_path: Path) -> Optional[dict]:
-    graph = load_task_graph(task_graph_path)
-
+    graph = load_task_graph()
     active_id = graph.get("active_task_id")
     if not active_id:
         return None
-
     return graph.get("tasks", {}).get(active_id)
 
 
 def get_task_by_id(task_graph_path: Path, task_id: str) -> Optional[dict]:
-    graph = load_task_graph(task_graph_path)
+    graph = load_task_graph()
     return graph.get("tasks", {}).get(task_id)
 
 def select_tools_via_llm(user_text: str, requested_route: Optional[str] = None, requested_model: Optional[str] = None) -> List[Dict[str, Any]]:
     planner_model = get_effective_planner_model(user_text=user_text, requested_route=requested_route, requested_model=requested_model)
     prompt = build_planner_prompt(user_text)
     payload = {
-        "model": planner_model,
+        "model":    planner_model,
         "messages": [{"role": "user", "content": prompt}],
-        "stream": False,
-        "options": {"num_predict": 192, "temperature": 0},
+        "stream":   False,
+        "think":    False,
+        "options":  {"num_predict": 192, "temperature": 0},
     }
     try:
         emit_event("plan", "Selecting tools", {"planner_model": planner_model})
@@ -4394,10 +4641,10 @@ def select_tools_via_llm(user_text: str, requested_route: Optional[str] = None, 
             emit_event(
                 "code_phase",
                 "Coding planner full response",
-                {"route": "code",
-                    "model": planner_model,
-                    "planner_model": planner_model,
-                    "data": data,
+                {"route":          "code",
+                 "model":          planner_model,
+                 "planner_model":  planner_model,
+                 "data":           data,
                 },
             )
         answer = strip_thinking_tags(data.get("message", {}).get("content", "")).strip()
@@ -4446,8 +4693,6 @@ def select_tools_via_llm(user_text: str, requested_route: Optional[str] = None, 
 
 
 def choose_tools(user_text: str, requested_route: Optional[str] = None, requested_model: Optional[str] = None) -> List[Dict[str, Any]]:
-    # Code route must be deterministic.
-    # Do not use planner/hints/keywords for coding tasks.
     if requested_route == "code":
         coder_tool = get_coder_tool()
         return [coder_tool] if coder_tool else []
@@ -4482,7 +4727,6 @@ def should_select_tools(user_text: str, requested_route: Optional[str], requeste
     lower = text.lower()
     if not text:
         return False
-    # For code route, direct coder-skill switching handles tool choice later.
     if requested_route == "code" and "coder" in (requested_model or "").lower():
         return False
     if len(text.split()) <= 12 and not likely_needs_tools(lower):
@@ -4494,7 +4738,6 @@ def should_select_tools(user_text: str, requested_route: Optional[str], requeste
 def extract_last_patch_from_anything(value: Any) -> str:
     text = extract_tool_content(value)
 
-    # If full agent JSON contains observations, parse and take last code_edit ui.content
     try:
         data = json.loads(text)
         observations = data.get("observations", [])
@@ -4561,8 +4804,11 @@ def infer_route_from_tools(selected_tools: List[Dict[str, Any]]) -> str:
     return "tools"
 
 
-def make_tool_message(name: str, result: Any) -> Dict[str, Any]:
-    return {"role": "tool", "name": name, "content": truncate_text(result)}
+def make_tool_message(name: str, result: Any, call_id: str = "") -> Dict[str, Any]:
+    msg: Dict[str, Any] = {"role": "tool", "name": name, "content": truncate_text(result)}
+    if call_id:
+        msg["tool_call_id"] = call_id
+    return msg
 
 
 def normalize_tool_calls(assistant_msg: Dict[str, Any]) -> List[Dict[str, Any]]:
@@ -4610,10 +4856,10 @@ def execute_tool(fn_name: str, fn_args: Dict[str, Any]) -> str:
                 "code_edit_output",
                 "Coder tool returned output",
                 {
-                    "tool": fn_name,
+                    "tool":           fn_name,
                     "result_preview": truncate_text(result, 4000),
-                    "path": fn_args.get("path"),
-                    "mode": fn_args.get("mode"),
+                    "path":           fn_args.get("path"),
+                    "mode":           fn_args.get("mode"),
                 },
             )
 
@@ -4626,8 +4872,8 @@ def execute_tool(fn_name: str, fn_args: Dict[str, Any]) -> str:
             "tool_result",
             f"Tool {fn_name} completed",
             {
-                "tool": fn_name,
-                "elapsed_sec": round(elapsed, 3),
+                "tool":           fn_name,
+                "elapsed_sec":    round(elapsed, 3),
                 "result_preview": preview,
             },
         )
@@ -4649,14 +4895,14 @@ def execute_tool(fn_name: str, fn_args: Dict[str, Any]) -> str:
             "warning",
             f"Tool {fn_name} failed",
             {
-                "tool": fn_name,
+                "tool":        fn_name,
                 "elapsed_sec": round(elapsed, 3),
-                "error": str(e),
+                "error":       str(e),
             },
         )
         return truncate_text({
-            "error": str(e),
-            "tool": fn_name,
+            "error":     str(e),
+            "tool":      fn_name,
             "traceback": traceback.format_exc(limit=3),
         })
     
@@ -4750,7 +4996,6 @@ def react_chat(model: str, messages: List[Dict[str, Any]], tools: Optional[List[
     system_prompt = build_system_prompt_for_route(route, persona=persona)
     normalized_messages = compact_context(normalize_messages(messages, system_prompt=system_prompt))
 
-    # Critical: qwen coder models do not receive native Ollama tools.
     use_tools = (not is_coder_model(model)) and model not in NO_TOOLS_MODELS and len(tools) > 0
 
     run = ChatRun(request_id=str(uuid.uuid4())[:8], model=model, selected_tools=[t["function"]["name"] for t in tools])
@@ -4810,10 +5055,20 @@ def react_chat(model: str, messages: List[Dict[str, Any]], tools: Optional[List[
         for call in tool_calls:
             fn_name = call["function"]["name"]
             fn_args = call["function"]["arguments"]
+            call_id = call.get("id", f"call_{fn_name}_{iteration}")
+            # Skip re-executing a tool that already returned a result this run
+            already_ran = any(
+                m.get("role") == "tool" and m.get("name") == fn_name
+                for m in normalized_messages
+            )
+            if already_ran:
+                emit_event("warning", f"Tool {fn_name} already ran this turn — skipping duplicate", {"call_id": call_id})
+                normalized_messages.append(make_tool_message(fn_name, "Already executed this turn. Use the result already provided.", call_id=call_id))
+                continue
             debug(f"run={run.request_id} tool={fn_name} args={safe_json_dumps(fn_args)[:180]}")
             result = execute_tool(fn_name, fn_args)
             debug(f"run={run.request_id} tool={fn_name} result={result[:180]!r}")
-            normalized_messages.append(make_tool_message(fn_name, result))
+            normalized_messages.append(make_tool_message(fn_name, result, call_id=call_id))
 
     append_log(f"[{datetime.now().strftime('%H:%M:%S')}] run={run.request_id} max_iterations model={model} route={route} persona={persona} iterations={run.iterations} duration_ms={run.duration_ms()}")
     emit_event("warning", "Max iterations reached", {"request_id": run.request_id, "duration_ms": run.duration_ms(), "route": route, "model": model})
@@ -4844,9 +5099,9 @@ def stream_direct_chat(handler: "ReactHandler", model: str, messages: List[Dict[
         return
 
     body = {
-        "model": model,
+        "model":    model,
         "messages": compact_context(normalize_messages(messages, system_prompt=build_system_prompt_for_route(route, persona=persona))),
-        "stream": True,
+        "stream":   True,
     }
     profile_options = get_profile_options(profile_override=persona)
     if profile_options:
@@ -4873,9 +5128,6 @@ def stream_direct_chat(handler: "ReactHandler", model: str, messages: List[Dict[
 
 class ReactHandler(BaseHTTPRequestHandler):
     server_version = "JarvisReact/3.0"
-
-# Replace the entire _do_POST_impl with these three functions:
-   # Add this inside class ReactHandler
 
     def do_POST(self) -> None:
         if self.headers.get("Upgrade", "").lower() == "websocket":
@@ -4925,37 +5177,33 @@ class ReactHandler(BaseHTTPRequestHandler):
         )
     
     def _handle_websocket_upgrade(self) -> None:
-            """Upgrade HTTP connection to WebSocket and hand off to handle_live_ws."""
+        """Upgrade HTTP connection to WebSocket and hand off to _run_live_ws."""
+        import hashlib
 
-            import hashlib
+        key = self.headers.get("Sec-WebSocket-Key", "")
+        if not key:
+            self.send_error(400, "Missing Sec-WebSocket-Key")
+            return
 
-            key = self.headers.get("Sec-WebSocket-Key", "")
-            if not key:
-                self.send_error(400, "Missing Sec-WebSocket-Key")
-                return
+        accept = base64.b64encode(
+            hashlib.sha1((key + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11").encode()).digest()
+        ).decode()
 
-            accept = base64.b64encode(
-                hashlib.sha1((key + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11").encode()).digest()
-            ).decode()
+        self.send_response(101)
+        self.send_header("Upgrade", "websocket")
+        self.send_header("Connection", "Upgrade")
+        self.send_header("Sec-WebSocket-Accept", accept)
+        self.end_headers()
 
-            self.send_response(101)
-            self.send_header("Upgrade", "websocket")
-            self.send_header("Connection", "Upgrade")
-            self.send_header("Sec-WebSocket-Accept", accept)
-            self.end_headers()
-
-            # Hand off to async WebSocket handler
-            import asyncio
-
-            loop = asyncio.new_event_loop()
-            try:
-                loop.run_until_complete(
-                    _run_live_ws(self.rfile, self.wfile)
-                )
-            except Exception as e:
-                debug(f"WebSocket handler error: {e}")
-            finally:
-                loop.close()
+        loop = asyncio.new_event_loop()
+        try:
+            loop.run_until_complete(
+                _run_live_ws(self.rfile, self.wfile)
+            )
+        except Exception as e:
+            debug(f"WebSocket handler error: {e}")
+        finally:
+            loop.close()
 
     def _parse_request_body(self) -> tuple[dict, str]:
         """Parse POST body, return (body_dict, error_str)."""
@@ -4969,6 +5217,66 @@ class ReactHandler(BaseHTTPRequestHandler):
 
     def _do_POST_impl(self) -> None:
         path = urlparse(self.path).path
+
+        # ── n8n inbound webhook: POST /api/events ────────────────────────────
+        # n8n calls this to push events, completed workflow results, or tasks
+        # back into Jarvis. Events are logged and optionally queued as tasks.
+        if path == "/api/events":
+            body, err = self._parse_request_body()
+            if err:
+                self._json_response({"error": "Invalid JSON"}, code=400)
+                return
+            event_type = body.get("type", "n8n_event")
+            source      = body.get("source", "n8n")
+            message     = body.get("message", "")
+            data        = body.get("data", {})
+            task_text   = body.get("task") or body.get("goal") or body.get("description", "")
+
+            # Log to events file
+            log_event(event_type, message or task_text, data={
+                "source": source, **data,
+                **({"task": task_text} if task_text else {}),
+            })
+
+            # If n8n sends a task/goal, queue it directly to Jarvis plan queue
+            if task_text:
+                r = _get_redis()
+                if r:
+                    import uuid as _uuid
+                    task_payload = json.dumps({
+                        "id":     str(_uuid.uuid4())[:8],
+                        "task":   task_text,
+                        "skill":  body.get("skill", "coding"),
+                        "tool":   body.get("tool", "code_edit"),
+                        "source": source,
+                        "args":   data,
+                    })
+                    r.rpush("jarvis:tasks", task_payload)
+                    self._json_response({"ok": True, "queued": True, "task": task_text})
+                    return
+
+            self._json_response({"ok": True, "logged": event_type})
+            return
+
+        # ── Plan approve endpoint ─────────────────────────────────────────────
+        if path.startswith("/api/plans/") and path.endswith("/approve"):
+            import shutil
+            pid = path[len("/api/plans/"):-len("/approve")]
+            staging_root = Path("/mnt/e/coding/staging")
+            src  = staging_root / "tested"   / pid
+            dest = staging_root / "approved" / pid
+            if not src.exists():
+                self._json_response({"error": f"staging/tested/{pid} not found"}, code=404)
+                return
+            try:
+                if dest.exists():
+                    shutil.rmtree(dest)
+                shutil.copytree(src, dest)
+                self._json_response({"ok": True, "approved": str(dest), "plan_id": pid})
+            except Exception as e:
+                self._json_response({"error": str(e)}, code=500)
+            return
+
         if path != "/api/chat":
             self.send_error(404)
             return
@@ -4988,10 +5296,15 @@ class ReactHandler(BaseHTTPRequestHandler):
             self._json_response({"error": "messages must be a list"}, code=400)
             return
 
+        # Support top-level user_text shorthand (normalise into messages)
+        top_level_text = body.get("user_text", "")
+        if top_level_text and not messages:
+            messages = [{"role": "user", "content": top_level_text}]
+
         user_text = get_last_user_text(messages)
         user_text = clean_telegram_prefix(user_text)
 
-        # --- live router fast path ---
+        # --- memory_router fast path (replaces old live_router) ---
         handled, route_override = self.handle_live_router(
             body=body,
             user_text=user_text,
@@ -5003,7 +5316,7 @@ class ReactHandler(BaseHTTPRequestHandler):
         if handled:
             return
 
-        # update user_text from transcript if live router rewrote it
+        # update user_text from transcript if memory_router rewrote it
         user_text = body.get("_user_text", user_text)
         if route_override:
             requested_route = route_override
@@ -5021,6 +5334,130 @@ class ReactHandler(BaseHTTPRequestHandler):
 
     def do_GET(self) -> None:
             path = urlparse(self.path).path
+
+            if path == "/api/plan-status":
+                # GET /api/plan-status?plan_id=xxx
+                from urllib.parse import urlparse as _up, parse_qs
+                qs = parse_qs(_up(self.path).query)
+                plan_id = (qs.get("plan_id") or [None])[0]
+                if not plan_id:
+                    self._json_response({"error": "plan_id required"}, code=400)
+                    return
+                r = _get_redis()
+                if not r:
+                    self._json_response({"error": "Redis unavailable"}, code=503)
+                    return
+                tasks_raw = r.hget(REDIS_PLANS_KEY, plan_id)
+                if not tasks_raw:
+                    self._json_response({"error": "plan not found"}, code=404)
+                    return
+                plan  = json.loads(tasks_raw)
+                tasks = plan.get("tasks", [])
+                task_statuses = []
+                done = 0
+                for t in tasks:
+                    uid    = f"{plan_id}:{t.get('task_id', 0)}"
+                    status = r.hget(REDIS_STATUS_KEY, uid)
+                    result = r.hget(REDIS_RESULTS_KEY, uid)
+                    st     = json.loads(status) if status else {"status": "queued"}
+                    task_statuses.append({
+                        "task_id": t.get("task_id"),
+                        "task":    t.get("task", "")[:80],
+                        "status":  st.get("status", "queued"),
+                        "result":  result[:200] if result else None,
+                    })
+                    if st.get("status") == "done":
+                        done += 1
+                self._json_response({
+                    "plan_id":    plan_id,
+                    "total":      len(tasks),
+                    "done":       done,
+                    "complete":   done == len(tasks),
+                    "tasks":      task_statuses,
+                })
+                return
+
+            if path == "/api/plans":
+                # List all plans from Redis task_status, grouped by plan_id
+                r = _get_redis()
+                if not r:
+                    self._json_response({"plans": []})
+                    return
+                all_statuses = r.hgetall(REDIS_STATUS_KEY) or {}
+                all_plans_raw = r.hgetall(REDIS_PLANS_KEY) or {}
+                # Group task keys by plan_id
+                plan_map: dict = {}
+                for key, val in all_statuses.items():
+                    parts = key.rsplit(":", 1)
+                    if len(parts) != 2:
+                        continue
+                    pid, _ = parts
+                    if not pid.startswith("PLAN-"):
+                        continue
+                    if pid not in plan_map:
+                        plan_map[pid] = {"plan_id": pid, "steps": [], "done": 0, "failed": 0, "total": 0, "summary": ""}
+                    try:
+                        st = json.loads(val)
+                    except Exception:
+                        st = {}
+                    plan_map[pid]["steps"].append(st)
+                    plan_map[pid]["total"] += 1
+                    if st.get("status") == "done":
+                        plan_map[pid]["done"] += 1
+                    elif st.get("status") == "failed":
+                        plan_map[pid]["failed"] += 1
+                # Enrich with plan summary from jarvis:plans
+                for pid, pdata in plan_map.items():
+                    raw = all_plans_raw.get(pid)
+                    if raw:
+                        try:
+                            p = json.loads(raw)
+                            pdata["summary"] = p.get("summary", "")[:80]
+                            pdata["goal"] = p.get("goal", "")[:80]
+                        except Exception:
+                            pass
+                    # Check staging dirs
+                    staging_root = Path("/mnt/e/coding/staging")
+                    pdata["has_dev"]    = (staging_root / "dev"      / pid).exists()
+                    pdata["has_tested"] = (staging_root / "tested"   / pid).exists()
+                    pdata["has_approved"]= (staging_root / "approved" / pid).exists()
+                plans_list = sorted(plan_map.values(), key=lambda x: x["plan_id"], reverse=True)
+                self._json_response({"plans": plans_list[:30]})
+                return
+
+            if path.startswith("/api/plans/") and path.endswith("/files"):
+                # GET /api/plans/{id}/files — list staging files
+                pid = path[len("/api/plans/"):-len("/files")]
+                staging_root = Path("/mnt/e/coding/staging")
+                result: dict = {"plan_id": pid, "dev": [], "tested": [], "approved": []}
+                for stage in ("dev", "tested", "approved"):
+                    d = staging_root / stage / pid
+                    if d.exists():
+                        result[stage] = sorted(str(f.relative_to(d)) for f in d.rglob("*") if f.is_file())
+                self._json_response(result)
+                return
+
+            if path.startswith("/api/plans/") and path.endswith("/read"):
+                # GET /api/plans/{id}/read?file=relative/path
+                from urllib.parse import urlparse as _up2, parse_qs as _pqs2
+                qs2 = _pqs2(_up2(self.path).query)
+                pid = path[len("/api/plans/"):-len("/read")]
+                rel = (qs2.get("file") or [None])[0]
+                if not rel:
+                    self._json_response({"error": "file param required"}, code=400)
+                    return
+                stage = (qs2.get("stage") or ["dev"])[0]
+                fpath = Path("/mnt/e/coding/staging") / stage / pid / rel
+                if not fpath.exists():
+                    self._json_response({"error": "File not found"}, code=404)
+                    return
+                try:
+                    content = fpath.read_text(encoding="utf-8", errors="replace")
+                    self._json_response({"ok": True, "content": content, "path": str(fpath)})
+                except Exception as e:
+                    self._json_response({"error": str(e)}, code=500)
+                return
+
             if path == "/api/history/plans":
                 plans_root = VAULT_DIR / ".jarvis" / "history" / "plans"
                 plans = []
@@ -5068,9 +5505,9 @@ class ReactHandler(BaseHTTPRequestHandler):
                 self._json_response(
                     {
                         "plan_id": plan_id,
-                        "plan": read_json("plan.json"),
-                        "status": read_json("status.json"),
-                        "events": events,
+                        "plan":    read_json("plan.json"),
+                        "status":  read_json("status.json"),
+                        "events":  events,
                     }
                 )
                 return
@@ -5099,7 +5536,7 @@ class ReactHandler(BaseHTTPRequestHandler):
                 except Exception as e:
                     self._json_response(
                         {
-                            "status": "error",
+                            "status":  "error",
                             "message": str(e),
                         },
                         500,
@@ -5113,7 +5550,7 @@ class ReactHandler(BaseHTTPRequestHandler):
                     self._json_response({"error": "No prompt"}, 400)
                     return
 
-                width = int(data.get("width", 1024) or 1024)
+                width  = int(data.get("width", 1024) or 1024)
                 height = int(data.get("height", 1024) or 1024)
 
                 result_file = BRIDGE_DIR / "flux_result.json"
@@ -5127,7 +5564,7 @@ class ReactHandler(BaseHTTPRequestHandler):
                     try:
                         emit_event("flux", "FLUX generation started", {
                             "prompt": prompt[:200],
-                            "width": width,
+                            "width":  width,
                             "height": height,
                         })
 
@@ -5142,11 +5579,11 @@ class ReactHandler(BaseHTTPRequestHandler):
                         result_file.write_text(
                             json.dumps(
                                 {
-                                    "status": "done",
+                                    "status":  "done",
                                     "message": result,
-                                    "prompt": prompt,
-                                    "width": width,
-                                    "height": height,
+                                    "prompt":  prompt,
+                                    "width":   width,
+                                    "height":  height,
                                 },
                                 ensure_ascii=False,
                             ),
@@ -5161,7 +5598,7 @@ class ReactHandler(BaseHTTPRequestHandler):
                         result_file.write_text(
                             json.dumps(
                                 {
-                                    "status": "error",
+                                    "status":  "error",
                                     "message": str(e),
                                 },
                                 ensure_ascii=False,
@@ -5177,7 +5614,7 @@ class ReactHandler(BaseHTTPRequestHandler):
 
                 self._json_response({
                     "status": "generating",
-                    "poll": "/api/flux/status",
+                    "poll":   "/api/flux/status",
                 })
                 return
             if path == "/api/health":
@@ -5189,19 +5626,24 @@ class ReactHandler(BaseHTTPRequestHandler):
                     ollama_ready = False
                     ollama_models = 0
                 profile = load_active_profile()
+                redis_ok = _redis_available()
+                redis_state = read_state() if redis_ok else {}
                 self._json_response(
                     {
-                        "status": "ok",
-                        "service": "jarvis-react-v3",
-                        "time": now_iso(),
-                        "ollama_host": OLLAMA_HOST,
-                        "ollama_ready": ollama_ready,
-                        "ollama_model_count": ollama_models,
-                        "loaded_skills": len(get_loaded_skills()),
-                        "tool_count": len(TOOL_MAP),
-                        "active_profile": {"id": profile.get("id"), "label": profile.get("label")},
-                        "models": load_model_config().get("models", {}),
-                        "planner_model": get_planner_model(),
+                        "status":              "ok",
+                        "service":             "jarvis-react-v3",
+                        "time":                now_iso(),
+                        "ollama_host":         OLLAMA_HOST,
+                        "ollama_ready":        ollama_ready,
+                        "ollama_model_count":  ollama_models,
+                        "loaded_skills":       len(get_loaded_skills()),
+                        "tool_count":          len(TOOL_MAP),
+                        "active_profile":      {"id": profile.get("id"), "label": profile.get("label")},
+                        "models":              load_model_config().get("models", {}),
+                        "planner_model":       get_planner_model(),
+                        "redis_ok":            redis_ok,
+                        "redis_loop_count":    redis_state.get("loop_count", 0),
+                        "redis_task":          redis_state.get("task", ""),
                     }
                 )
                 return
@@ -5209,13 +5651,13 @@ class ReactHandler(BaseHTTPRequestHandler):
             if path == "/api/skills":
                 self._json_response(
                     {
-                        "skills": get_loaded_skills(),
-                        "tools": list(TOOL_MAP.keys()),
-                        "tool_keywords": TOOL_KEYWORDS,
-                        "tool_skill_meta": TOOL_SKILL_META,
+                        "skills":                get_loaded_skills(),
+                        "tools":                 list(TOOL_MAP.keys()),
+                        "tool_keywords":         TOOL_KEYWORDS,
+                        "tool_skill_meta":       TOOL_SKILL_META,
                         "intent_tool_candidates": INTENT_TOOL_CANDIDATES,
-                        "tool_route_hints": TOOL_ROUTE_HINTS,
-                        "no_tools_models": sorted(NO_TOOLS_MODELS),
+                        "tool_route_hints":      TOOL_ROUTE_HINTS,
+                        "no_tools_models":       sorted(NO_TOOLS_MODELS),
                     }
                 )
                 return
@@ -5257,8 +5699,8 @@ class ReactHandler(BaseHTTPRequestHandler):
 
                 except Exception as e:
                     self._json_response({
-                        "status": "error",
-                        "error": str(e),
+                        "status":     "error",
+                        "error":      str(e),
                         "kokoro_host": KOKORO_HOST,
                     }, code=500)
 
@@ -5266,7 +5708,7 @@ class ReactHandler(BaseHTTPRequestHandler):
             if path == "/api/tts/test":
                 try:
                     payload = {
-                        "text": "Systems online. JARVIS is ready.",
+                        "text":  "Systems online. JARVIS is ready.",
                         "voice": KOKORO_VOICE,
                     }
 
@@ -5284,8 +5726,8 @@ class ReactHandler(BaseHTTPRequestHandler):
 
                 except Exception as e:
                     self._json_response({
-                        "status": "error",
-                        "error": str(e),
+                        "status":     "error",
+                        "error":      str(e),
                         "kokoro_host": KOKORO_HOST,
                     }, code=500)
 
@@ -5325,6 +5767,24 @@ class ReactHandler(BaseHTTPRequestHandler):
                 except Exception as e:
                     self._json_response({"error": str(e)}, code=500)
                 return
+
+            if path == "/api/redis":
+                try:
+                    redis_ok = _redis_available()
+                    state    = read_state() if redis_ok else {}
+                    memory   = read_memory() if redis_ok else []
+                    tools_h  = read_tools() if redis_ok else {}
+                    self._json_response({
+                        "redis_ok":      redis_ok,
+                        "state":         state,
+                        "working_memory": memory[-20:],
+                        "tools":         tools_h,
+                        "loop_count":    read_loop() if redis_ok else 0,
+                    })
+                except Exception as e:
+                    self._json_response({"error": str(e)}, code=500)
+                return
+
             self.send_error(404)
 
 
@@ -5382,6 +5842,23 @@ if __name__ == "__main__":
         except Exception as e:
             emit_event("warning", "Initial Kokoro warm start failed", {"error": str(e)})
 
+    # Initialise Redis agent state
+    try:
+        if _redis_available():
+            write_state(
+                "JARVIS",
+                task="idle",
+                tools={name: True for name in (read_tools() or {}).keys()},
+                confidence="high",
+                notes="react_server startup",
+            )
+            write_tools({name: True for name in TOOL_MAP.keys()})
+            emit_event("status", "Redis state initialised", {"tool_count": len(TOOL_MAP)})
+        else:
+            emit_event("warning", "Redis unavailable at startup — state persistence disabled", {})
+    except Exception as e:
+        emit_event("warning", "Redis init failed", {"error": str(e)})
+
     server = ThreadingHTTPServer(("127.0.0.1", PORT), ReactHandler)
     print(f"[REACT] ReAct server v3 on http://127.0.0.1:{PORT}")
     print(f"[REACT] Ollama backend: {OLLAMA_HOST}")
@@ -5391,9 +5868,9 @@ if __name__ == "__main__":
     print(f"[REACT] Profiles dir: {PROFILES_DIR}")
     print(f"[REACT] Runtime mode path: {RUNTIME_MODE_PATH}")
     print(f"[REACT] Tools ({len(TOOL_MAP)}): {', '.join(TOOL_MAP.keys())}")
+    print(f"[REACT] Redis: {'✓' if _redis_available() else '✗ (degraded mode)'}")
     print("[REACT] READY")
     emit_event("status", "React server ready", {"port": PORT, "tool_count": len(TOOL_MAP)})
-    write_state("JARVIS", task="idle", tools=read_tools())
     try:
         server.serve_forever()
     except KeyboardInterrupt:

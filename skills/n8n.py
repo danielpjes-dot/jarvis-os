@@ -31,6 +31,9 @@ SKILL_CAPABILITIES = [
     "run_webhook",
     "list_executions",
     "get_execution",
+    "add_task",
+    "create_task",
+    "send_event",
 ]
 
 SKILL_META = {
@@ -47,9 +50,9 @@ SKILL_META = {
     "network_access": True,
     "entrypoint": "exec_n8n",
     "route": "tools",
-    "intent_aliases": ["n8n", "workflow", "automation", "run workflow"],
-    "keywords": ["n8n", "workflow", "automation", "webhook", "trigger workflow"],
-    "direct_match": ["n8n", "run workflow", "trigger workflow"],
+    "intent_aliases": ["n8n", "workflow", "automation", "run workflow", "add task", "create task", "send task to n8n"],
+    "keywords": ["n8n", "workflow", "automation", "webhook", "trigger workflow", "add task", "create task", "n8n task"],
+    "direct_match": ["n8n", "run workflow", "trigger workflow", "add task to n8n", "create n8n task"],
     "response_style": {
         "default": "structured_status_ui",
         "avoid_raw_dump": True,
@@ -63,6 +66,13 @@ N8N_BASE_URL = (
     or os.environ.get("N8N_BASE_URL")
     or "http://127.0.0.1:5678"
 ).rstrip("/")
+
+# Jarvis events API — n8n calls this to push tasks/events back into Jarvis
+JARVIS_EVENTS_URL = os.environ.get("JARVIS_API_URL", "http://127.0.0.1:7900")
+
+# Default webhook paths for common task flows (override in .env.n8n.local)
+N8N_TASK_WEBHOOK   = os.environ.get("N8N_TASK_WEBHOOK",   "/webhook/jarvis-task")
+N8N_EVENT_WEBHOOK  = os.environ.get("N8N_EVENT_WEBHOOK",  "/webhook/jarvis-event")
 
 N8N_WEBHOOK_URL = (
     os.environ.get("N8N_WEBHOOK_URL")
@@ -265,6 +275,43 @@ def exec_n8n(
             result,
         )
 
+    # ── Add task: trigger n8n task workflow, then n8n calls back Jarvis ──────
+    if action in ("add_task", "create_task"):
+        task_text = (payload or {}).get("task") or (payload or {}).get("goal") or ""
+        if not task_text:
+            return _status_result("n8n task", "Missing task/goal in payload.", False)
+
+        wh_path = webhook_path or N8N_TASK_WEBHOOK
+        task_payload = {
+            "task":        task_text,
+            "source":      "jarvis",
+            "callback_url": f"{JARVIS_EVENTS_URL}/api/events",
+            **(payload or {}),
+        }
+        result = _request("POST", wh_path, payload=task_payload)
+        return _status_result(
+            "n8n task",
+            f"Task sent to n8n: {task_text[:60]}" if result.get("ok") else f"Failed to send task to n8n: {result.get('error', '')}",
+            bool(result.get("ok")),
+            result,
+        )
+
+    # ── Send event to n8n (notify n8n of Jarvis events) ──────────────────────
+    if action == "send_event":
+        event_type = (payload or {}).get("type", "jarvis_event")
+        wh_path    = webhook_path or N8N_EVENT_WEBHOOK
+        result = _request("POST", wh_path, payload={
+            "type":    event_type,
+            "source":  "jarvis",
+            **(payload or {}),
+        })
+        return _status_result(
+            "n8n event",
+            "Event sent to n8n." if result.get("ok") else f"Failed: {result.get('error', '')}",
+            bool(result.get("ok")),
+            result,
+        )
+
     return _status_result(
         "n8n",
         "Unknown action. Use health, list_workflows, get_workflow, run_webhook, list_executions, or get_execution.",
@@ -290,7 +337,11 @@ TOOLS = [
                             "run_webhook",
                             "list_executions",
                             "get_execution",
+                            "add_task",
+                            "create_task",
+                            "send_event",
                         ],
+                        "description": "add_task/create_task: send a task to n8n task workflow (n8n calls back /api/events when done). send_event: push a Jarvis event to n8n.",
                     },
                     "workflow_id": {"type": "string"},
                     "execution_id": {"type": "string"},

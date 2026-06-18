@@ -256,9 +256,6 @@ def _build_news_result(
 
     plain = _plain_digest(title, ui_items)
 
-    # Telegram push — after building ui_items, before returning
-    _push_to_telegram(title, ui_items)
-
     return {
         "ok": True,
         "speech": {
@@ -355,40 +352,48 @@ def exec_news(
                 })
                 url   = f"{GOOGLE_NEWS_SEARCH}?{query}"
                 items = _rss_fetch(url)
-                return _build_news_result(f"Top news for {location}", items, limit=limit)
+                result = _build_news_result(f"Top news for {location}", items, limit=limit)
+            else:
+                query = urllib.parse.urlencode({
+                    "hl":   lang,
+                    "gl":   lang.split("-")[-1],
+                    "ceid": ceid,
+                })
+                url   = f"{GOOGLE_NEWS_TOP}?{query}"
+                items = _rss_fetch(url)
+                result = _build_news_result("Top news", items, limit=limit)
 
+        else:
+            # action == "search"
+            if not topic:
+                return _error_result(
+                    "News search",
+                    "A topic is required for news search.",
+                    "topic_required",
+                )
+
+            query_text = f"{topic} {location}".strip() if location else topic
             query = urllib.parse.urlencode({
+                "q":    query_text,
                 "hl":   lang,
                 "gl":   lang.split("-")[-1],
                 "ceid": ceid,
             })
-            url   = f"{GOOGLE_NEWS_TOP}?{query}"
+            url   = f"{GOOGLE_NEWS_SEARCH}?{query}"
             items = _rss_fetch(url)
-            return _build_news_result("Top news", items, limit=limit)
 
-        # action == "search"
-        if not topic:
-            return _error_result(
-                "News search",
-                "A topic is required for news search.",
-                "topic_required",
-            )
+            result_title = f"News for {topic}"
+            if location:
+                result_title += f" in {location}"
 
-        query_text = f"{topic} {location}".strip() if location else topic
-        query = urllib.parse.urlencode({
-            "q":    query_text,
-            "hl":   lang,
-            "gl":   lang.split("-")[-1],
-            "ceid": ceid,
-        })
-        url   = f"{GOOGLE_NEWS_SEARCH}?{query}"
-        items = _rss_fetch(url)
+            result = _build_news_result(result_title, items, limit=limit)
 
-        result_title = f"News for {topic}"
-        if location:
-            result_title += f" in {location}"
+        # Push to Telegram once, only on success
+        if result.get("ok"):
+            ui = result.get("ui", {})
+            _push_to_telegram(ui.get("title", "News"), result.get("data", {}).get("items", []))
 
-        return _build_news_result(result_title, items, limit=limit)
+        return result
 
     except Exception as e:
         return _error_result(

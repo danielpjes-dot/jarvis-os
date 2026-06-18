@@ -10,18 +10,20 @@ interface JarvisSceneProps {
   emotion: string;
   speaking: boolean;
   thinking: boolean;
+  analyserRef?: React.RefObject<AnalyserNode | null>;
 }
 
-function Scene({ emotion, speaking, thinking }: JarvisSceneProps) {
+function Scene({ emotion, speaking, thinking, analyserRef }: JarvisSceneProps) {
   return (
     <>
       <color attach="background" args={["#06060b"]} />
       <fog attach="fog" args={["#06060b", 3, 8]} />
 
-      <LatticeFace
+       <LatticeFace
         emotion={emotion}
         speaking={speaking}
         thinking={thinking}
+        analyserRef={analyserRef}  
       />
       <AmbientParticles />
       <DataGrid />

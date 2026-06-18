@@ -14,6 +14,7 @@ interface LatticeFaceProps {
   emotion: string;
   speaking: boolean;
   thinking: boolean;
+  analyserRef?: React.RefObject<AnalyserNode | null>;  // ← add this
 }
 
 function lerpVertices(
@@ -26,9 +27,11 @@ function lerpVertices(
   }
 }
 
-export function LatticeFace({ emotion, speaking, thinking }: LatticeFaceProps) {
-  const timeRef = useRef(0);
+export function LatticeFace({ emotion, speaking, thinking, analyserRef }: LatticeFaceProps) {
+  const timeRef       = useRef(0);
   const speakPhaseRef = useRef(0);
+  const amplitudeRef  = useRef(0);
+  const analyserBuf   = useRef<Uint8Array | null>(null);
 
   // Positions
   const basePositions = useMemo(() => {
@@ -79,10 +82,36 @@ export function LatticeFace({ emotion, speaking, thinking }: LatticeFaceProps) {
   }, [currentPositions]);
 
   const groupRef = useRef<THREE.Group>(null);
+  const ringRef  = useRef<THREE.Mesh>(null);
 
   useFrame((_, delta) => {
     timeRef.current += delta;
     const t = timeRef.current;
+
+    // Compute mouth amplitude from audio analyser (or fallback sine wave)
+    if (speaking) {
+      if (analyserRef?.current) {
+        const analyser = analyserRef.current;
+        if (!analyserBuf.current || analyserBuf.current.length !== analyser.fftSize) {
+          analyserBuf.current = new Uint8Array(analyser.fftSize);
+        }
+        analyser.getByteTimeDomainData(analyserBuf.current);
+        let sum = 0;
+        for (let k = 0; k < analyserBuf.current.length; k++) {
+          sum += Math.abs(analyserBuf.current[k] - 128);
+        }
+        const raw = sum / analyserBuf.current.length / 30;
+        // Smooth amplitude to avoid jitter
+        amplitudeRef.current += (Math.min(1, raw) - amplitudeRef.current) * 0.3;
+      } else {
+        // No analyser — use sine fallback
+        speakPhaseRef.current += delta * 7;
+        amplitudeRef.current = Math.sin(speakPhaseRef.current) * 0.5 + 0.5;
+      }
+    } else {
+      // Decay to zero when not speaking
+      amplitudeRef.current *= 0.85;
+    }
 
     // Compute target positions
     const offsets: EmotionOffsets = EMOTION_OFFSETS[emotion] || {};
@@ -98,13 +127,11 @@ export function LatticeFace({ emotion, speaking, thinking }: LatticeFaceProps) {
       }
 
       if (speaking) {
-        speakPhaseRef.current += delta * 8;
         const speakOffsets = EMOTION_OFFSETS.speaking || {};
         if (speakOffsets[i]) {
-          const wave = Math.sin(speakPhaseRef.current) * 0.5 + 0.5;
-          tx += speakOffsets[i][0] * wave;
-          ty += speakOffsets[i][1] * wave;
-          tz += speakOffsets[i][2] * wave;
+          tx += speakOffsets[i][0] * amplitudeRef.current;
+          ty += speakOffsets[i][1] * amplitudeRef.current;
+          tz += speakOffsets[i][2] * amplitudeRef.current;
         }
       }
 
@@ -143,10 +170,31 @@ export function LatticeFace({ emotion, speaking, thinking }: LatticeFaceProps) {
     if (groupRef.current) {
       groupRef.current.rotation.y = Math.sin(t * 0.3) * 0.05;
     }
+
+    // Amplitude ring — scale and opacity driven by mouth amplitude
+    if (ringRef.current) {
+      const amp = amplitudeRef.current;
+      const ringScale = 0.9 + amp * 0.18;
+      ringRef.current.scale.setScalar(ringScale);
+      const mat = ringRef.current.material as THREE.MeshBasicMaterial;
+      mat.opacity = amp * 0.55;
+    }
   });
 
   return (
     <group ref={groupRef} position={[0, -0.3, 0]}>
+      {/* Amplitude ring — pulses with voice */}
+      <mesh ref={ringRef} position={[0, 0, -0.1]}>
+        <ringGeometry args={[0.82, 0.86, 64]} />
+        <meshBasicMaterial
+          color="#40a0f0"
+          transparent
+          opacity={0}
+          depthWrite={false}
+          blending={THREE.AdditiveBlending}
+        />
+      </mesh>
+
       {/* Glow layer */}
       <points geometry={glowGeo}>
         <pointsMaterial
