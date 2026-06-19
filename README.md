@@ -24,6 +24,8 @@ Built by [Sami Porokka](https://poro-it.com) / Poro-IT OÜ
 - **AI Image Gen** — FLUX text-to-image with Qwen3 prompt enhancement + VRAM auto-swap
 - **Phone / SMS / Email** — Twilio calls + SMS, SMTP/IMAP email
 - **Telegram Gateway** — Mobile control, plan approvals, and Telegram-triggered tasks
+- **Unreal Engine 5.8 MCP** — Native MCP plugin connects Claude Code directly to the UE editor: spawn actors, drive MetaHuman expressions, control lighting, trigger animations — replaces the file bridge with live tool calls
+- **Android Testing** — Build and test React Native / Expo apps on an Android emulator via Gradle + Playwright/Podman, wired into the plan system
 
 ---
 
@@ -63,7 +65,65 @@ User Input (Voice / HUD / Telegram / API)
     │  ├ GPU monitor, system log      │
     │  └ Approval panel               │  SSE-streamed approval requests
     └────────────────────────────────┘
+          │
+    ┌─────▼──────────────────────────┐
+    │  Unreal Engine 5.8  (MCP)      │
+    │  ├ HTTP JSON-RPC :3000/mcp     │  built-in UE MCP plugin
+    │  ├ TCP bridge :55557           │  custom MetaHuman tools
+    │  ├ MetaHuman face control      │  emotion presets + morph targets
+    │  ├ Actor / lighting / material │  scene manipulation
+    │  └ Automation test runner      │  UE test framework
+    └────────────────────────────────┘
 ```
+
+---
+
+## Unreal Engine 5.8 Integration
+
+UE 5.8 ships a native **Model Context Protocol (MCP) plugin** that embeds an MCP server inside the editor process. Jarvis connects to it over local HTTP and drives the editor directly — no file polling, no bridge scripts.
+
+```
+Agent loop says: "set Jarvis emotion to thinking"
+          │
+    skills/unreal.py
+          │
+          ├── HTTP POST localhost:3000/mcp  (built-in UE plugin)
+          │   spawn_actor, set_transform, lighting, materials, automation tests
+          │
+          └── TCP :55557  (custom C++ bridge for MetaHuman)
+              set_morph_target("CTRL_expressions_browInnerUp_L", 0.6)
+              set_morph_target("CTRL_expressions_eyeLookUp_L", 0.3)
+```
+
+### UE Side Setup
+
+1. `Edit → Plugins` → search **Unreal MCP** → enable → restart editor
+2. Console: `ModelContextProtocol.GenerateClientConfig` — note the port from Output Log
+3. Optionally add to Claude Code directly: `claude mcp add unreal --transport http http://localhost:3000/mcp`
+
+### What the Skill Can Do
+
+| Category | Tools |
+|----------|-------|
+| **Actors** | `spawn_actor`, `set_transform`, `get_actors`, `delete_actor` |
+| **Scene** | `set_lighting`, `set_material` |
+| **MetaHuman** | `set_emotion` (6 presets), `set_morph` (individual CTRL targets), `set_amplitude` (TTS mouth sync) |
+| **Animation** | `play_animation` — trigger named sequences on the MetaHuman |
+| **Automation** | `run_test` — execute UE automation tests from the agent loop |
+| **Raw** | `mcp_call`, `tcp_call` — pass-through for any UE tool |
+
+### Emotion Presets
+
+```python
+"set Jarvis emotion to happy"     → mouthSmile + cheekSquint morphs
+"set Jarvis emotion to thinking"  → browInnerUp + eyeLookUp morphs
+"set Jarvis emotion to focused"   → browDown + eyeSquint morphs
+"set Jarvis emotion to surprised" → browOuterUp + eyeWide morphs
+```
+
+TTS amplitude is piped directly: every audio frame the Kokoro TTS produces feeds `set_amplitude` so the MetaHuman mouth moves in real time with speech — same signal drives both the Three.js lattice face in the HUD and the UE MetaHuman.
+
+**Full docs:** [docs/skills/unreal.md](docs/skills/unreal.md)
 
 ---
 
@@ -145,6 +205,8 @@ JARVIS uses a modular skill system. Each skill is a self-contained Python module
 | **volume** | `set_volume` | Windows system volume |
 | **timer** | `set_timer` | Countdown timers with voice alerts |
 | **network** | `scan_network` | Network scan + topology map |
+| **unreal** | `unreal` | Unreal Engine 5.8 MCP — spawn actors, MetaHuman emotions, lighting, animations |
+| **android** | `android` | Android emulator — build Expo/Gradle, run tests, screenshot, deploy APK |
 | **claude_skills** | `use_skill` | Load 34 Claude Code skills on demand |
 
 **Full skill docs:** [docs/SKILLS.md](docs/SKILLS.md)
