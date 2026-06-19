@@ -1,86 +1,153 @@
 # J.A.R.V.I.S OS
 
-**Just A Rather Very Intelligent System** — A fully local AI assistant with modular skill architecture.
+**Just A Rather Very Intelligent System** — A fully local AI assistant with modular skill architecture, agentic plan execution, and a holographic HUD.
 
 Built by [Sami Porokka](https://poro-it.com) / Poro-IT OÜ
 
 ---
 
-![JARVIS HUD](docs/images/hud.png)
-
 ## Features
 
-- **Multi-Model Routing** — Queries routed to the best local model (fast / reason / code / deep / cloud)
-- **ReAct Agent Loop** — Think → Tool → Observe → Repeat until task complete
-- **Modular Skills** — 20 plug-and-play skill modules with 35+ tools, enable/disable via config
-- **Voice I/O** — Wake word "Hey JARVIS", Whisper STT, Orpheus TTS with 5.1 center-channel output
-- **Persistent Memory** — [MemPalace](https://github.com/milla-jovovich/mempalace) vector DB + Obsidian vault (2000+ memories)
-- **Stark Industries HUD** — Next.js holographic dashboard with GPU monitor, live system log
+- **4-Pass Memory Router** — Ambiguity, memory, tool selection, and route classification in one fast Gemma4 pass
+- **Agentic Plan System** — `build X` → structured 8-10 step plan → human approval → plan_runner executes → staging pipeline
+- **Staging Pipeline** — `staging/dev/` → Playwright/Podman testing → `staging/tested/` → human approval → `staging/approved/`
+- **Codex UI** — In-browser coding workspace with plan picker, step status, file browser, PTY terminal, and approve button
+- **ReAct Agent Loop** — Think → Tool → Observe → Repeat until task complete (max 8 iterations)
+- **Modular Skills** — 35+ plug-and-play skill modules, enable/disable via config, drop a file in and restart
+- **Multi-Model Routing** — Fast (8b) / Reason (30b) / Code (qwen3-coder:30b) / Deep / Cloud per request
+- **Voice I/O** — Wake word "Hey JARVIS", Whisper STT, Kokoro/Orpheus TTS with 5.1 center-channel output
+- **Persistent Memory** — MemPalace vector DB + Obsidian vault (2000+ memories), working memory in Redis
+- **Stark Industries HUD** — Next.js holographic dashboard with GPU monitor, lattice face, live system log
 - **Home Automation** — Denon AVR, NVIDIA Shield, LG TV, Panasonic Blu-ray, Philips Hue, internet radio
-- **Cloud LLMs** — Claude, GPT-4, Gemini, Groq, Mistral, OpenRouter via unified API skill
+- **n8n Integration** — Bidirectional: Jarvis triggers n8n workflows, n8n pushes tasks/events back to Jarvis
+- **Cloud LLMs** — Claude, GPT-4, Gemini, Groq, Mistral, OpenRouter via unified skill
 - **AI Image Gen** — FLUX text-to-image with Qwen3 prompt enhancement + VRAM auto-swap
-- **Phone Assistant** — Answer calls, take messages, send SMS, read/send email via Twilio
-- **34 Claude Skills** — Frontend design, SEO, Playwright, React, and more loaded on demand
+- **Phone / SMS / Email** — Twilio calls + SMS, SMTP/IMAP email
+- **Telegram Gateway** — Mobile control, plan approvals, and Telegram-triggered tasks
 
 ---
 
 ## Architecture
 
 ```
-Voice / Browser / Text
-        │
-   ┌────▼────┐
-   │ Watcher  │──── input.txt ──── server.py (:4000)
-   └────┬────┘                     Browser UI
-        │
-   ┌────▼────────┐
-   �� Router       │ Keywords → fast / reason / code / deep / claude
-   └────┬────────┘
-        │
-   ┌────▼──────────────┐
-   │ ReAct Server :7900 │ Tool-augmented Ollama proxy
-   │  ├ Planner (8b)    │ Picks which tools are needed
-   │  ├ Skill Loader    │ Loads skills/*.py dynamically
-   │  └ Loop (max 5)    │ Repeat until final answer
-   └────┬──────────────┘
-        │
-   ┌────▼────┐    ┌──────────┐
-   │ Ollama   │    │ Claude   │
-   │ :11434   │    │ --print  │
-   └─────────┘    └────��─────┘
+User Input (Voice / HUD / Telegram / API)
+          │
+    ┌─────▼──────────┐
+    │ Memory Router   │  4-pass Gemma4:4b classifier
+    │  Pass 1: Ambi   │  → is this ambiguous / follow-up?
+    │  Pass 2: Memory │  → fetch relevant memory context
+    │  Pass 3: Tool   │  → which skill/tool is needed?
+    │  Pass 4: Route  │  → fast / reason / code / tools / chat
+    └─────┬──────────┘
+          │
+    ┌─────▼──────────────────────────┐
+    │  react_server.py  :7900         │
+    │  ├ handle_live_router            │  fast path (plan cmds bypass router)
+    │  ├ handle_full_pipeline          │  full ReAct loop
+    │  ├ build_simple_code_plan        │  qwen3:14b plan generator
+    │  └ queue_plan_to_redis           │  push steps to jarvis:tasks
+    └─────┬──────────────────────────┘
+          │                    │
+    ┌─────▼──────┐     ┌──────▼──────────────┐
+    │   Ollama    │     │  plan_runner.py       │
+    │   :11434    │     │  ├ exec_code_step     │  qwen3-coder:30b → writes files
+    │  qwen3 fam. │     │  ├ Playwright tests   │  simple sites
+    └────────────┘     │  ├ Podman tests       │  complex projects
+                       │  └ staging pipeline    │  dev → tested → approved
+                       └──────────────────────┘
+          │
+    ┌─────▼──────────────────────────┐
+    │  Stark HUD  :3000  (Next.js)   │
+    │  ├ Lattice face (Three.js)      │  amplitude-driven mouth
+    │  ├ Codex UI + plan picker       │  approve/reject staging
+    │  ├ GPU monitor, system log      │
+    │  └ Approval panel               │  SSE-streamed approval requests
+    └────────────────────────────────┘
 ```
+
+---
+
+## Plan System
+
+The plan system lets Jarvis execute multi-step coding projects autonomously with human gates.
+
+```
+User: "build a lottery website with 7x7 grid"
+          │
+   build_simple_code_plan()  ← qwen3:14b
+          │
+   PLAN-20260619-001 displayed (8-10 steps, filenames, tool tags)
+          │
+   User: "proceed"  ← bypasses memory_router entirely → code route
+          │
+   queue_plan_to_redis()  → jarvis:tasks Redis list
+          │
+   plan_runner.py consumes tasks:
+     Step 1-6:  exec_code_step() → qwen3-coder:30b → writes to staging/dev/
+     Step 7-8:  _build_test_cmd() → Playwright (simple) or Podman (complex)
+     Step 9:    exec_code_step() → adds features
+     Step 10:   cp staging/dev/ → staging/tested/
+          │
+   Human approval (HUD or Telegram)
+          │
+   staging/tested/ → staging/approved/
+```
+
+### Staging Directories
+
+| Path | Stage | Meaning |
+|------|-------|---------|
+| `staging/dev/PLAN-ID/` | Development | Files written by plan_runner |
+| `staging/tested/PLAN-ID/` | Tested | Passed automated tests |
+| `staging/approved/PLAN-ID/` | Approved | Human-reviewed, ready for deploy |
 
 ---
 
 ## Skills
 
-JARVIS uses a modular skill system. Each skill is a self-contained Python module in `skills/` that registers its own tools, keywords, and executors. Drop a file in → restart → it's live.
+JARVIS uses a modular skill system. Each skill is a self-contained Python module in `skills/` that registers its own tools, keywords, and executors.
 
-| Skill | Tools | Description | Docs |
-|-------|-------|-------------|------|
-| **denon** | `denon_input` `denon_volume` `denon_preset` `denon_surround` `denon_power` | Denon AVR-X4100W receiver control | [Guide](docs/skills/denon.md) |
-| **shield** | `room_command` `scan_network` | NVIDIA Shield TV per-room control | [Guide](docs/skills/shield.md) |
-| **radio** | `play_radio` | Internet radio streaming via mpv | [Guide](docs/skills/radio.md) |
-| **volume** | `set_volume` | Windows system volume control | [Guide](docs/skills/volume.md) |
-| **timer** | `set_timer` | Countdown timers with voice alerts | [Guide](docs/skills/timer.md) |
-| **memory** | `memory_search` `memory_add` `memory_status` | MemPalace long-term memory | [Guide](docs/skills/memory.md) |
-| **vault** | `read_vault_file` `list_vault_dir` | Obsidian vault file access | [Guide](docs/skills/vault.md) |
-| **web** | `web_search` `open_url` | DuckDuckGo search + browser | [Guide](docs/skills/web.md) |
-| **shell** | `shell_command` `read_file` | Safe shell execution + file reading | [Guide](docs/skills/shell.md) |
-| **claude_skills** | `list_skills` `use_skill` | Browse/load 34 Claude Code skills | [Guide](docs/skills/claude_skills.md) |
-| **lg_tv** | `lg_tv` | LG webOS TV — power, volume, inputs, apps | [Guide](docs/skills/lg_tv.md) |
-| **panasonic_bd** | `bluray` | Panasonic UB9000 4K Blu-ray — play, pause, chapters | [Guide](docs/skills/panasonic_bd.md) |
-| **network** | `scan_network` | Network scan with device identification + topology map | [Guide](docs/skills/network.md) |
-| **git** | `git` | Git repo management — status, diff, commit, push, pull, branch | [Guide](docs/skills/git.md) |
-| **flux** | `flux` | FLUX AI image generation with prompt enhancement | [Guide](docs/skills/flux.md) |
-| **plex** | `plex` | Plex Media Server — browse, search, playback control | [Guide](docs/skills/plex.md) |
-| **hue** | `hue` | Philips Hue lighting — on/off, brightness, colors, scenes | [Guide](docs/skills/hue.md) |
-| **cloud_llm** | `cloud_llm` | Cloud LLM APIs — Claude, GPT-4, Gemini, Groq, Mistral | [Guide](docs/skills/cloud_llm.md) |
-| **phone** | `phone` | Phone calls via Twilio — make/receive calls, voicemail | [Guide](docs/skills/phone.md) |
-| **sms** | `sms` | SMS text messages via Twilio | [Guide](docs/skills/sms.md) |
-| **email** | `email` | Email — send, inbox, search via SMTP/IMAP | [Guide](docs/skills/email.md) |
+| Skill | Key Tools | Description |
+|-------|-----------|-------------|
+| **coding** | `coding`, `code_edit` | Code generation via qwen3-coder:30b — plans, diffs, file writes |
+| **plan** | `plan_create`, `plan_proceed` | Agentic multi-step plan creation and execution |
+| **n8n** | `n8n` | n8n workflow control — trigger webhooks, list executions, add tasks |
+| **shell** | `shell_command`, `read_file` | Safe shell execution + file reading |
+| **git** | `git` | Git — status, diff, commit, push, pull, branch |
+| **web** | `web_search`, `open_url` | DuckDuckGo search + browser open |
+| **news** | `get_news` | Live news headlines via RSS/newsapi |
+| **weather** | `weather` | Current weather and forecasts |
+| **memory** | `memory_search`, `memory_add` | MemPalace long-term vector memory |
+| **memory_core** | `remember`, `recall` | Working memory in Redis |
+| **vault** | `read_vault_file`, `list_vault_dir` | Obsidian vault file access |
+| **notes** | `create_note`, `search_notes` | Quick note creation in vault |
+| **mindmap** | `mindmap` | Generate mind maps from topics |
+| **document_editor** | `edit_document` | Edit structured documents |
+| **accounting** | `accounting` | Financial queries and calculations |
+| **chat_log** | `chat_log` | Read/search conversation history |
+| **dictate** | `dictate` | Continuous dictation mode |
+| **cloud_llm** | `cloud_llm` | Claude, GPT-4, Gemini, Groq, Mistral |
+| **flux** | `flux` | FLUX AI image generation |
+| **model_skill** | `switch_model` | Switch active model at runtime |
+| **project_ops** | `project_ops` | Project management operations |
+| **podman** | `podman` | Podman container management |
+| **app_scaff_skill** | `scaffold_app` | Scaffold new projects from templates |
+| **email** | `email` | Send, read, search email via SMTP/IMAP |
+| **phone** | `phone` | Twilio calls — make/receive, voicemail |
+| **sms** | `sms` | Twilio SMS text messages |
+| **denon** | `denon_input`, `denon_volume`, `denon_preset` | Denon AVR-X4100W receiver |
+| **shield** | `room_command` | NVIDIA Shield per-room control |
+| **lg_tv** | `lg_tv` | LG webOS TV — power, inputs, apps |
+| **panasonic_bd** | `bluray` | Panasonic UB9000 4K Blu-ray |
+| **hue** | `hue` | Philips Hue lighting — scenes, colors |
+| **plex** | `plex` | Plex Media Server — browse, playback |
+| **radio** | `play_radio` | Internet radio via mpv |
+| **volume** | `set_volume` | Windows system volume |
+| **timer** | `set_timer` | Countdown timers with voice alerts |
+| **network** | `scan_network` | Network scan + topology map |
+| **claude_skills** | `use_skill` | Load 34 Claude Code skills on demand |
 
-**Full skill system documentation:** [docs/SKILLS.md](docs/SKILLS.md)
+**Full skill docs:** [docs/SKILLS.md](docs/SKILLS.md)
 
 ---
 
@@ -88,20 +155,23 @@ JARVIS uses a modular skill system. Each skill is a self-contained Python module
 
 | Slot | Model | Size | Use Case |
 |------|-------|------|----------|
+| Router | gemma4:4b | 2.5 GB | Memory routing (llama.cpp :8081) |
 | Fast | qwen3:8b | 5 GB | Casual chat, quick answers |
-| Reason | qwen3:30b-a3b | 18 GB | Analysis, research, tool use |
-| Code | qwen3-coder:30b | 18 GB | Code tasks, debugging |
+| Reason | qwen3:14b | 9 GB | Planning, analysis, tool use |
+| Code | qwen3-coder:30b | 18 GB | Code generation, file writing |
 | Deep | qwen3:30b-a3b | 18 GB | Strategy, deep analysis |
-| Cloud | Claude Code | API | Complex code tasks |
+| Cloud | Claude Sonnet | API | Complex code, multi-step tasks |
 
 ---
 
 ## Prerequisites
 
 - **NVIDIA GPU** with CUDA (tested on RTX 3090 24GB)
+- **Windows 11 + WSL2** (recommended) or Ubuntu 22.04+
 - **Node.js 20+**
 - **Python 3.12+**
-- **Ollama**
+- **Ollama** with models pulled
+- **Redis** (for plan queue, working memory, task status)
 
 ---
 
@@ -123,17 +193,18 @@ cd jarvis-os
 bash install-linux.sh
 ```
 
-Both installers handle: system packages, Python deps, Ollama + model pulls, Next.js app, MemPalace, vault setup.
-
 ### Post-Install
 
 ```bash
-# Start backend
+# Start all services
 bash jarvis.sh start
 
 # Start HUD (separate terminal)
 cd app && npm run dev
 # Open http://localhost:3000
+
+# Optional: TTS server (Kokoro)
+python3 tts/server.py   # :5100
 ```
 
 ---
@@ -143,10 +214,19 @@ cd app && npm run dev
 ### Start / Stop / Status
 
 ```bash
-bash jarvis.sh start     # Boot everything
+bash jarvis.sh start     # Boot everything (react_server, plan_runner, watcher)
 bash jarvis.sh stop      # Shut down
-bash jarvis.sh status    # Health check
+bash jarvis.sh status    # Health check all services
 bash jarvis.sh restart   # Restart all services
+```
+
+### Plan Commands
+
+```
+"build a todo app with local storage"   → creates plan → awaits approval
+"proceed PLAN-20260619-001"             → queues to plan_runner
+"cancel PLAN-20260619-001"             → cancels active plan
+"modify plan — add dark mode"          → updates plan before execution
 ```
 
 ### Voice
@@ -156,13 +236,6 @@ python3 scripts/voice_capture.py          # Always-on mode
 python3 scripts/voice_capture.py --wake   # Wake word mode ("Hey JARVIS")
 ```
 
-### TTS (Optional — Orpheus 3B)
-
-```bash
-python3 tts/setup.py     # Download model (~3GB VRAM)
-python3 tts/server.py    # Start on :5100
-```
-
 ---
 
 ## Interfaces
@@ -170,17 +243,27 @@ python3 tts/server.py    # Start on :5100
 | Interface | URL | Description |
 |-----------|-----|-------------|
 | **Stark HUD** | http://localhost:3000 | Next.js holographic dashboard |
-| **Browser UI** | http://localhost:4000 | Simple browser voice UI |
-| **ReAct API** | http://localhost:7900 | Tool-augmented Ollama proxy |
-| **Orpheus TTS** | http://localhost:5100 | Local TTS server (optional) |
+| **ReAct API** | http://localhost:7900 | Main agent server |
+| **Kokoro TTS** | http://localhost:5100 | Local TTS (Kokoro/Orpheus) |
+| **PTY Bridge** | ws://localhost:4010 | Terminal WebSocket |
+| **llama.cpp** | http://localhost:8081 | Memory router model |
 
 ### API Endpoints
 
 ```
-POST /api/chat          ReAct loop with tools (Ollama-compatible)
-GET  /api/health        Health check
-GET  /api/skills        List loaded skills and their tools
-GET  /api/timers        Active countdown timers
+POST /api/chat              ReAct loop — main entry point
+GET  /api/health            Health check + service status
+GET  /api/skills            All loaded skills and tools
+GET  /api/plans             List all plans with step statuses
+GET  /api/plans/{id}        Plan step detail (task status)
+GET  /api/plans/{id}/files  Staging file listing (dev/tested/approved)
+GET  /api/plans/{id}/read   Read a staging file
+POST /api/plans/{id}/approve Promote tested → approved
+GET  /api/events            Recent system events
+POST /api/events            Inbound from n8n (task/event push)
+GET  /api/coding-log        Live agent loop events
+GET  /api/plan-status       Step status for a plan
+GET  /api/timers            Active countdown timers
 ```
 
 ---
@@ -190,45 +273,104 @@ GET  /api/timers        Active countdown timers
 ```
 jarvis-os/
 ├── jarvis.sh                  # Start/stop/restart/status
-├── JARVIS.md                  # Personality file
+├── JARVIS.md                  # Personality and persona file
 ├── scripts/
-│   ├── watcher.sh             # Router + orchestrator
-│   ├── react_server.py        # ReAct loop + skill loader (315 lines)
-│   ├── server.py              # Browser bridge HTTP server
-│   ├── voice_capture.py       # Whisper STT with wake word
-│   └── system_api.py          # System-level APIs
-├── skills/                    # ← Modular skill modules
-│   ├── __init__.py
+│   ├── react_server.py        # Main agent server :7900
+│   ├── plan_runner.py         # Plan execution daemon (Redis consumer)
+│   ├── memory/
+│   │   ├── memory_router.py   # 4-pass Gemma4 classifier
+│   │   └── redis_memory.py    # Working memory helpers
+│   ├── watcher.py             # File/event watcher
+│   ├── voice_capture.py       # Whisper STT + wake word
+│   └── twilio_webhook.py      # Phone/SMS Twilio handler
+├── skills/                    # Modular skill modules (35+)
 │   ├── loader.py              # Dynamic discovery + import
-│   ├── denon.py               # Denon AVR receiver
-│   ├── shield.py              # NVIDIA Shield rooms
-│   ├── radio.py               # Internet radio
-│   ├── volume.py              # System volume
-│   ├── timer.py               # Countdown timers
-│   ├── memory.py              # MemPalace memory
-│   ├── vault.py               # Obsidian vault
-│   ├── web.py                 # Web search + URLs
+│   ├── coding.py              # Code generation
+│   ├── coding_qwen3_coder.py  # qwen3-coder:30b executor
+│   ├── plan.py                # Plan create/proceed/cancel
+│   ├── n8n.py                 # n8n workflow integration
 │   ├── shell.py               # Shell + file reading
-│   └── claude_skills.py       # Claude skill browser
+│   ├── git.py                 # Git operations
+│   ├── web.py                 # Web search + URLs
+│   ├── news.py                # Live news
+│   ├── weather.py             # Weather forecasts
+│   ├── memory.py              # MemPalace vector memory
+│   ├── memory_core.py         # Working memory (Redis)
+│   ├── vault.py               # Obsidian vault
+│   ├── notes.py               # Quick notes
+│   ├── cloud_llm.py           # Cloud LLM APIs
+│   ├── flux.py                # FLUX image generation
+│   ├── email.py               # SMTP/IMAP email
+│   ├── phone.py               # Twilio calls
+│   ├── sms.py                 # Twilio SMS
+│   ├── denon.py               # Denon AVR receiver
+│   ├── shield.py              # NVIDIA Shield
+│   ├── lg_tv.py               # LG TV
+│   ├── hue.py                 # Philips Hue
+│   ├── plex.py                # Plex Media Server
+│   ├── radio.py               # Internet radio
+│   ├── timer.py               # Countdown timers
+│   └── ...                    # More skills
 ├── config/
 │   ├── skills.json            # Enable/disable skills
-│   └── denon.json             # Denon AVR device config
-├── app/                       # Next.js Stark Industries HUD
+│   └── models-config.json     # Model slot assignments
+├── infra/
+│   ├── podman-compose.n8n.yml # n8n container setup
+│   ├── .env.n8n               # n8n env template
+│   └── .env.n8n.local         # Local overrides (gitignored)
+├── app/                       # Next.js Stark HUD
 │   ├── app/
-│   │   ├── page.tsx           # Main HUD dashboard
-│   │   ├── components/        # GPU monitor, system log, timers, etc.
-│   │   └── api/               # Next.js API routes
+│   │   ├── page.tsx           # Main HUD — voice, face, controls
+│   │   ├── components/
+│   │   │   ├── coding-workspace.tsx  # Codex UI + plan picker
+│   │   │   ├── face/                 # Three.js lattice face
+│   │   │   ├── approval-panel.tsx    # SSE approval requests
+│   │   │   └── ...
+│   │   └── api/               # Next.js API proxy routes
+│   │       ├── plans/         # Plan status, files, approve
+│   │       ├── approvals/     # Approval request SSE stream
+│   │       └── ...
 │   └── lib/
-│       └── bridge.ts          # Claude/Ollama bridge
-├── tts/                       # Orpheus 3B TTS server
-│   ├── server.py
-│   ├── engine.py
-│   └── setup.py
+│       └── tts.ts             # Kokoro TTS client
+├── staging/                   # Plan execution output
+│   ├── dev/PLAN-ID/           # In-progress files
+│   ├── tested/PLAN-ID/        # Passed automated tests
+│   └── approved/PLAN-ID/      # Human-approved
+├── tts/                       # Kokoro/Orpheus TTS server
 ├── docs/
-│   ├── ARCHITECTURE.md        # Full system architecture
-│   ├── SKILLS.md              # Skill system guide
+│   ├── ARCHITECTURE.md        # Detailed system architecture
+│   ├── SKILLS.md              # Skill system guide + catalog
 │   └── skills/                # Per-skill documentation
-└── vault/                     # Embedded vault context
+└── memory/                    # MemPalace vector store
+```
+
+---
+
+## n8n Integration
+
+Jarvis and n8n communicate bidirectionally:
+
+**Jarvis → n8n** (trigger workflows):
+```
+"add task to n8n: research competitor pricing"
+→ n8n skill: add_task
+→ POST /webhook/jarvis-task { task, callback_url }
+→ n8n runs workflow → POSTs result back to /api/events
+```
+
+**n8n → Jarvis** (push tasks/events):
+```
+POST http://jarvis:7900/api/events
+{ "type": "workflow_done", "task": "build X", "data": {...} }
+→ Logged as event
+→ If task field present → queued to Redis plan_runner
+```
+
+Configure in `infra/.env.n8n.local`:
+```bash
+N8N_TASK_WEBHOOK=/webhook/jarvis-task
+N8N_EVENT_WEBHOOK=/webhook/jarvis-event
+JARVIS_API_URL=http://<wsl-ip>:7900
 ```
 
 ---
@@ -247,16 +389,17 @@ jarvis-os/
 ## Example Commands
 
 ```
+"build a lottery website with a 7x7 number grid"
+"proceed PLAN-20260619-001"
+"add task to n8n: send weekly report to team"
 "Play Nova radio"
 "Switch Denon to PC"
-"Put on headphones mode"
-"Play Metallica on Spotify in the living room"
-"Set a timer for 10 minutes — pasta is ready"
+"Set a timer for 10 minutes"
 "Search for latest Next.js 15 features"
 "What do you remember about StockWatch?"
-"Turn the volume to 40%"
-"Set surround mode to stereo"
+"Turn the lights blue in the living room"
 "Scan the network for devices"
+"Generate an image of a cyberpunk cityscape at dawn"
 ```
 
 ---

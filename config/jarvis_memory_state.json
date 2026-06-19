@@ -1,0 +1,14 @@
+{
+  "identity": {
+    "user_professional_background": "{\"experience\":\"13 years in big data (hardware to analytics), databases, datawarehouses, data lakes, AI specialization\",\"notable_contacts\":[\"Matt Casters (Pentaho)\",\"Chris Selland (Hewlett-Packard)\",\"Vertica founders\",\"Tamr founders\",\"Postgres founders\"]}",
+    "test_preference": "test_value"
+  },
+  "recent": {},
+  "devices": {},
+  "projects": {},
+  "event_index": {
+    "last_event_type": null,
+    "last_event_at": null,
+    "event_count": 0
+  }
+}
