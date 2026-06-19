@@ -235,6 +235,33 @@ class TelegramGateway:
             raise RuntimeError(f"Telegram sendChatAction failed: {data}")
 
         return data
+    def send_document(self, chat_id: str | int, content: bytes, filename: str, caption: str = "") -> Dict[str, Any]:
+        boundary = "boundary_jarvis_doc"
+        body: list[bytes] = []
+
+        def part(name: str, value: str) -> None:
+            body.append(f'--{boundary}\r\nContent-Disposition: form-data; name="{name}"\r\n\r\n{value}\r\n'.encode())
+
+        part("chat_id", str(chat_id))
+        if caption:
+            part("caption", caption)
+
+        body.append(
+            f'--{boundary}\r\nContent-Disposition: form-data; name="document"; filename="{filename}"\r\n'
+            f"Content-Type: application/json\r\n\r\n".encode()
+        )
+        body.append(content)
+        body.append(f"\r\n--{boundary}--\r\n".encode())
+
+        payload = b"".join(body)
+        req = urllib.request.Request(
+            self._api_url("sendDocument"),
+            data=payload,
+            headers={"Content-Type": f"multipart/form-data; boundary={boundary}"},
+        )
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            return json.loads(resp.read().decode("utf-8"))
+
     def send_message(self, chat_id: str | int, text: str) -> Dict[str, Any]:
         if not self.token:
             raise RuntimeError("Missing JARVIS_TELEGRAM_BOT_TOKEN")
@@ -266,6 +293,48 @@ class TelegramGateway:
             return True
         return str(chat_id) in self.allowed_chat_ids
     
+    def _send_skills_export(self, chat_id: str | int) -> None:
+        try:
+            from skills.loader import get_all_skill_meta, get_loaded_skills
+        except ImportError:
+            self.send_message(chat_id, "⚠️ Skills not loaded yet.")
+            return
+
+        skill_meta = get_all_skill_meta()
+        loaded = get_loaded_skills()
+
+        # Build a skill-name → module description lookup
+        skill_desc: Dict[str, str] = {}
+        for s in loaded:
+            for tool_name in s.get("tools", []):
+                skill_desc[tool_name] = s.get("description", "")
+
+        export: list[Dict[str, Any]] = []
+        for tool_name, meta in skill_meta.items():
+            tool_desc = meta.get("description", "") or skill_desc.get(tool_name, tool_name)
+            # Route skills tell Gemma4 on mobile to dispatch to the desktop
+            prompt = (
+                f"When user asks about {tool_desc or tool_name}, reply with exactly "
+                f"'ROUTE: {tool_name}' on the first line followed by any relevant details. "
+                f"This dispatches the request to main Jarvis which will execute it."
+            )
+            export.append({
+                "name": tool_name,
+                "description": tool_desc or tool_name,
+                "prompt": prompt,
+                "source": "jarvis-desktop",
+            })
+
+        if not export:
+            self.send_message(chat_id, "No skills loaded.")
+            return
+
+        payload = json.dumps(export, ensure_ascii=False, indent=2).encode("utf-8")
+        try:
+            self.send_document(chat_id, payload, "jarvis_skills.json", f"📦 {len(export)} skills from Jarvis desktop")
+        except Exception as e:
+            self.send_message(chat_id, f"⚠️ Failed to send skills: {e}")
+
     def poll_forever(
         self,
         handle_message: Callable[[str, Dict[str, Any]], str],
@@ -315,6 +384,10 @@ class TelegramGateway:
 
                     if not self.is_allowed(chat_id):
                         self.send_message(chat_id, "This chat is not allowed to use this JARVIS bot.")
+                        continue
+
+                    if text.strip().lower() in ("/skills", "/skills@jarvisbot"):
+                        self._send_skills_export(chat_id)
                         continue
 
                     if emit_event:
