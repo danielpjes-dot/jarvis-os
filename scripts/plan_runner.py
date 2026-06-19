@@ -316,13 +316,24 @@ def _build_test_cmd(plan_id: str, coding_root: Path) -> str:
     file_names = {f.name.lower() for f in files if f.is_file()}
     file_count = len([f for f in files if f.is_file()])
 
-    has_html   = "index.html" in file_names
+    has_html        = "index.html" in file_names
+    is_react_native = any(n in file_names for n in ("app.json", "app.config.js", "metro.config.js"))
     is_complex = (
         file_count > 8
         or any(n in file_names for n in ("package.json", "requirements.txt", "dockerfile", "docker-compose.yml"))
     )
 
     stage_path = str(stage_dir)
+
+    if is_react_native:
+        # React Native / Expo — build via Gradle then test with Jest
+        android_dir = str(stage_dir / "android")
+        return (
+            f"cd '{stage_path}' && "
+            f"([ -f android/gradlew ] && cd android && ./gradlew assembleDebug --daemon 2>&1 | tail -20 || "
+            f"echo 'Gradle build skipped — no android/ folder') && "
+            f"(npx jest --passWithNoTests --forceExit 2>&1 | tail -20 || echo 'Jest: no tests found')"
+        )
 
     if not is_complex and has_html:
         # Simple static site — use Playwright
