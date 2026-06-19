@@ -24,6 +24,7 @@ Built by [Sami Porokka](https://poro-it.com) / Poro-IT OÜ
 - **AI Image Gen** — FLUX text-to-image with Qwen3 prompt enhancement + VRAM auto-swap
 - **Phone / SMS / Email** — Twilio calls + SMS, SMTP/IMAP email
 - **Telegram Gateway** — Mobile control, plan approvals, and Telegram-triggered tasks
+- **Companion App** — [JARVIS Mobile](https://github.com/porokka/jarvis-mobile) — React Native (Expo) mobile client with on-device Gemma routing and Telegram dispatch
 - **Unreal Engine 5.8 MCP** — Native MCP plugin connects Claude Code directly to the UE editor: spawn actors, drive MetaHuman expressions, control lighting, trigger animations — replaces the file bridge with live tool calls
 - **Android Testing** — Build and test React Native / Expo apps on an Android emulator via Gradle + Playwright/Podman, wired into the plan system
 
@@ -489,6 +490,24 @@ JARVIS_API_URL=http://<wsl-ip>:7900
 "Turn the lights blue in the living room"
 "Scan the network for devices"
 "Generate an image of a cyberpunk cityscape at dawn"
+```
+
+---
+
+## Companion App
+
+**[JARVIS Mobile](https://github.com/porokka/jarvis-mobile)** — React Native (Expo) mobile client for JARVIS OS.
+
+- On-device Gemma4 model routes requests locally before dispatching to the desktop
+- Communicates with jarvis-os via Telegram bot and direct API
+- Plan approvals, voice commands, and status from your phone
+- Camera input for visual context
+- Built with Expo 52 + React Native
+
+```
+Phone mic → Gemma4 (on-device) → route decision
+                                    ├── simple: answer on-device
+                                    └── complex: dispatch to jarvis-os via Telegram
 ```
 
 ---
