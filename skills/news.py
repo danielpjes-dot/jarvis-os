@@ -1,0 +1,330 @@
+\
+ - Only minimal changes\
+\"}, \"data\": {\"paths\": [\"skills/news.py\"], \"model\": \"qwen3-coder:30b\"}, \"error\": null}"
+    },
+    {
+      "tool": "code_edit",
+      "args": {
+        "task": "Inspect the news module for JSON formatting and Telegram integration",
+        "path": "skills/news.py",
+        "mode": "inspect",
+        "model": "qwen3-coder:30b"
+      },
+      "observation": "{\"ok\": true, \"speech\": \"--- FILE: /mnt/e/coding/jarvis-os/skills/news.py\
+\
+ - import html\
+ - import re\
+ - import urllib.parse\
+ - import urllib.request\
+ - import xml.etree.ElementTree as ET\
+ - from typing import Dict, List, Tuple, Any\
+ + import html\
+ + import re\
+ + import urllib.parse\
+ + import urllib.request\
+ + import xml.etree.ElementTree as ET\
+ + from typing import Dict, List, Tuple, Any\
+ + import json\
+ - def _build_news_result(title: str, items: List[Dict[str, str]], limit: int = 6) -> Dict[str, Any]:\
+ + def\", \"ui\": {\"type\": \"code_patch\", \"content\": \"--- FILE: /mnt/e/coding/jarvis-os/skills/news.py\
+\
+ - import html\
+ - import re\
+ - import urllib.parse\
+ - import urllib.request\
+ - import xml.etree.ElementTree as ET\
+ - from typing import Dict, List, Tuple, Any\
+ + import html\
+ + import re\
+ + import urllib.parse\
+ + import urllib.request\
+ + import xml.etree.ElementTree as ET\
+ + from typing import Dict, List, Tuple, Any\
+ + import json\
+ - def _build_news_result(title: str, items: List[Dict[str, str]], limit: int = 6) -> Dict[str, Any]:\
+ + def _build_news_result(title: str, items: List[Dict[str, str]], limit: int = 6) -> Dict[str, Any]:\
+ +     limit = max(1, min(int(limit), 10))\
+ +     items = _dedupe_items(items)[:limit]\
+ +\
+ +     ui_items: List[Dict[str, Any]] = []\
+ +     for idx, item in enumerate(items, start=1):\
+ +         ui_items.append(\
+ +             {\
+ +                 \\\"id\\\": idx,\
+ +                 \\\"title\\\": _shorten(item.get(\\\"title\\\", \\\"\\\"), 180),\
+ +                 \\\"source\\\": item.get(\\\"source\\\", \\\"\\\").strip(),\
+ +                 \\\"published\\\": item.get(\\\"pubDate\\\", \\\"\\\").strip(),\
+ +                 \\\"story\\\": _shorten(item.get(\\\"description\\\", \\\"\\\"), 260),\
+ +                 \\\"url\\\": item.get(\\\"link\\\", \\\"\\\").strip(),\
+ +             }\
+ +         )\
+ +\
+ +     if not ui_items:\
+ +         speech = f\\\"No news found for {title}.\\\"\
+ +     else:\
+ +         speech = f\\\"I found {len(ui_items)} headlines for {title}.\\\"\
+ +\
+ +     plain = _plain_digest(title, ui_items)\
+ +\
+ +     return {\
+ +     \\\"ok\\\": True,\
+ +     \\\"speech\\\": {\
+ +         \\\"text\\\": speech,\
+ +         \\\"priority\\\": \\\"normal\\\",\
+ +     },\
+ +     \\\"ui\\\": {\
+ +         \\\"placement\\\": \\\"tab\\\",\
+ +         \\\"format\\\": \\\"news\\\",\
+ +         \\\"title\\\": title,\
+ +         \\\"summary\\\": speech,\
+ +         \\\"items\\\": ui_items,\
+ +         \\\"ttl_seconds\\\": 600,\
+ +         \\\"closable\\\": True,\
+ +         \\\"actions\\\": [\
+ +             {\
+ +                 \\\"type\\\": \\\"close_tab\\\",\
+ +                 \\\"label\\\": \\\"Close news\\\",\
+ +             }\
+ +         ],\
+ +     },\
+ +     \\\"action\\\": {\
+ +         \\\"type\\\": \\\"open_tab\\\",\
+ +         \\\"payload\\\": {\
+ +             \\\"tab_id\\\": \\\"news\\\",\
+ +             \\\"label\\\": \\\"NEWS\\\",\
+ +         },\
+ +     },\
+ +     \\\"data\\\": {\
+ +         \\\"title\\\": title,\
+ +         \\\"items\\\": ui_items,\
+ +         \\\"plain\\\": plain,\
+ +     },\
+ + }\
+ +\
+ + def _telegram_format(item
+
+[truncated to 3000 chars]"
+    },
+    {
+      "tool": "code_edit",
+      "args": {
+        "task": "Check Telegram bot implementation for message handling patterns",
+        "path": "skills/news.py",
+        "mode": "inspect",
+        "model": "qwen3-coder:30b"
+      },
+      "observation": "{\"ok\": true, \"speech\": \"--- FILE: /mnt/e/coding/jarvis-os/skills/news.py\
+\
+    \\\"response_style\\\": {\
+        \\\"default\\\": \\\"structured_news_ui\\\",\
+        \\\"avoid_raw_dump\\\": True,\
+        \\\"followup_hint\\\": False,\
+    },\
+}\
+\", \"ui\": {\"type\": \"code_patch\", \"content\": \"--- FILE: /mnt/e/coding/jarvis-os/skills/news.py\
+\
+    \\\"response_style\\\": {\
+        \\\"default\\\": \\\"structured_news_ui\\\",\
+        \\\"avoid_raw_dump\\\": True,\
+        \\\"followup_hint\\\": False,\
+    },\
+}\
+\"}, \"data\": {\"paths\": [\"skills/news.py\"], \"model\": \"qwen3-coder:30b\"}, \"error\": null}"
+    },
+    {
+      "tool": "code_edit",
+      "args": {
+        "task": "Verify API endpoint responses for JSON structure consistency",
+        "path": "skills/news.py",
+        "mode": "inspect",
+        "model": "qwen3-coder:30b"
+      },
+      "observation": "{\"ok\": false, \"speech\": \"Coding failed: timed out\", \"ui\": null, \"data\": {\"paths\": [\"skills/news.py\"]}, \"error\": \"timed out\"}"
+    },
+    {
+      "tool": "code_edit",
+      "args": {
+        "task": "Inspect news module for JSON formatting and Telegram integration",
+        "path": "skills/news.py",
+        "mode": "inspect",
+        "model": "qwen3-coder:30b"
+      },
+      "observation": "{\"ok\": true, \"speech\": \"--- FILE: /mnt/e/coding/jarvis-os/skills/news.py\
+\
+ import html\
+ import re\
+ import urllib.parse\
+ import urllib.request\
+ import xml.etree.ElementTree as ET\
+ from typing import Dict, List, Tuple, Any\
+ import json\
+\
+ # Telegram integration constants\
+ TELEGRAM_API_URL = \\\"https://api.telegram.org/bot\\\"\
+ TELEGRAM_BOT_TOKEN = \\\"\\\"  # This s\", \"ui\": {\"type\": \"code_patch\", \"content\": \"--- FILE: /mnt/e/coding/jarvis-os/skills/news.py\
+\
+ import html\
+ import re\
+ import urllib.parse\
+ import urllib.request\
+ import xml.etree.ElementTree as ET\
+ from typing import Dict, List, Tuple, Any\
+ import json\
+\
+ # Telegram integration constants\
+ TELEGRAM_API_URL = \\\"https://api.telegram.org/bot\\\"\
+ TELEGRAM_BOT_TOKEN = \\\"\\\"  # This should be set in environment\
+ TELEGRAM_CHAT_ID = \\\"\\\"    # This should be set in environment\
+\
+ def _send_telegram_message(message: str) -> bool:\
+     \\\"\\\"\\\"Send message to Telegram chat if credentials are available.\\\"\\\"\\\"\
+     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:\
+         return False\
+\
+     try:\
+         url = f\\\"{TELEGRAM_API_URL}{TELEGRAM_BOT_TOKEN}/sendMessage\\\"\
+         data = {\
+             \\\"chat_id\\\": TELEGRAM_CHAT_ID,\
+             \\\"text\\\": message,\
+             \\\"parse_mode\\\": \\\"HTML\\\"\
+         }\
+         req = urllib.request.Request(\
+             url,\
+             data=urllib.parse.urlencode(data).encode(),\
+             headers={\\\"Content-Type\\\": \\\"application/x-www-form-urlencoded\\\"},\
+         )\
+         with urllib.request.urlopen(req, timeout=10) as resp:\
+             response = json.loads(resp.read().decode())\
+             return response.get(\\\"ok\\\", False)\
+     except Exception:\
+         return False\
+\
+ def _format_telegram_news(items: List[Dict[str, str]], title: str) -> str:\
+     \\\"\\\"\\\"Format news items for Telegram with HTML formatting.\\\"\\\"\\\"\
+     if not items:\
+         return f\\\"<b>{title}</b>\\\
+\\\
+No news found.\\\"\
+\
+     formatted = [f\\\"<b>{title}</b>\\\
+\\\"]\
+     for idx, item in enumerate(items[:6], start=1):\
+         title_text = html.escape(item.get(\\\"title\\\", \\\"\\\"))\
+         source = item.get(\\\"source\\\", \\\"\\\")\
+         link = item.get(\\\"link\\\", \\\"\\\")\
+\
+         if link:\
+             formatted.append(f\\\"{idx}. <a href='{link}'>{title_text}</a>\\\")\
+         else:\
+             formatted.append(f\\\"{idx}. {title_text}\\\")\
+\
+         if source:\
+             formatted[-1] += f\\\" <i>({source})</i>\\\"\
+\
+         formatted.append(\\\"\\\")  # Empty line for spacing\
+\
+     return \\\"\\\
+\\\".join(formatted)\
+\
+ def _build_news_result(title: str, items:
+
+[truncated to 3000 chars]"
+    },
+    {
+      "tool": "code_edit",
+      "args": {
+        "task": "Inspect news module for JSON formatting and Telegram integration",
+        "path": "skills/news.py",
+        "mode": "inspect",
+        "model": "qwen3-coder:30b"
+      },
+      "observation": "{\"ok\": true, \"speech\": \"--- FILE: /mnt/e/coding/jarvis-os/skills/news.py\
+\
+ import html\
+ import re\
+ import urllib.parse\
+ import urllib.request\
+ import xml.etree.ElementTree as ET\
+ from typing import Dict, List, Tuple, Any\
+ import json\
+ import os\
+\
+ # Telegram integration constants\
+ TELEGRAM_API_URL = \\\"https://api.telegram.org/bot\\\"\
+ TELEGRAM_CHAT_ID = os\", \"ui\": {\"type\": \"code_patch\", \"content\": \"--- FILE: /mnt/e/coding/jarvis-os/skills/news.py\
+\
+ import html\
+ import re\
+ import urllib.parse\
+ import urllib.request\
+ import xml.etree.ElementTree as ET\
+ from typing import Dict, List, Tuple, Any\
+ import json\
+ import os\
+\
+ # Telegram integration constants\
+ TELEGRAM_API_URL = \\\"https://api.telegram.org/bot\\\"\
+ TELEGRAM_CHAT_ID = os.environ.get(\\\"TELEGRAM_CHAT_ID\\\")\
+ TELEGRAM_BOT_TOKEN = os.environ.get(\\\"TELEGRAM_BOT_TOKEN\\\")\
+\
+ def _send_telegram_message(message: str) -> bool:\
+     \\\"\\\"\\\"Send message to Telegram if credentials are available.\\\"\\\"\\\"\
+     if not TELEGRAM_CHAT_ID or not TELEGRAM_BOT_TOKEN:\
+         return False\
+\
+     try:\
+         url = f\\\"{TELEGRAM_API_URL}{TELEGRAM_BOT_TOKEN}/sendMessage\\\"\
+         data = {\
+             \\\"chat_id\\\": TELEGRAM_CHAT_ID,\
+             \\\"text\\\": message,\
+             \\\"parse_mode\\\": \\\"HTML\\\"\
+         }\
+         req = urllib.request.Request(url, data=urllib.parse.urlencode(data).encode())\
+         req.add_header(\\\"Content-Type\\\", \\\"application/x-www-form-urlencoded\\\")\
+         with urllib.request.urlopen(req, timeout=10) as resp:\
+             response = json.loads(resp.read().decode(\\\"utf-8\\\"))\
+             return response.get(\\\"ok\\\", False)\
+     except Exception:\
+         return False\
+\
+ def _format_telegram_news(items: List[Dict[str, Any]], title: str) -> str:\
+     \\\"\\\"\\\"Format news items for Telegram message.\\\"\\\"\\\"\
+     if not items:\
+         return f\\\"<b>{title}</b>\\\
+No news found.\\\"\
+\
+     message = f\\\"<b>{title}</b>\\\
+\\\
+\\\"\
+     for idx, item in enumerate(items, start=1):\
+         title_text = item.get(\\\"title\\\", \\\"\\\")\
+         source = item.get(\\\"source\\\", \\\"\\\")\
+         url = item.get(\\\"url\\\", \\\"\\\")\
+         story = item.get(\\\"story\\\", \\\"\\\")\
+\
+         if url:\
+             message += f\\\"<a href='{url}'>{idx}. {title_text}</a>\\\
+\\\"\
+         else:\
+             message += f\\\"{idx}. {title_text}\\\
+\\\"\
+\
+         if source:\
+             message += f\\\"<i>{source}</i>\\\
+\\\"\
+\
+         if story:\
+             message += f\\\"{story}\\\
+\\\"\
+\
+         message += \\\"\\\
+\\\"\
+\
+     return message\
+\
+ def _send_news_to_telegram(title: str, items: List[Dict[str, Any]
+
+[truncated to 3000 chars]"
+    }
+  ]
+}

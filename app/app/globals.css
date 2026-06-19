@@ -248,18 +248,34 @@ body {
 
 /* ─── Scrollbar ─── */
 .scrollbar-hud::-webkit-scrollbar {
-  width: 3px;
+  width: 6px;
 }
 
 .scrollbar-hud::-webkit-scrollbar-track {
-  background: transparent;
+  background: rgba(255,255,255,0.04);
 }
 
 .scrollbar-hud::-webkit-scrollbar-thumb {
-  background: rgba(64, 160, 240, 0.2);
-  border-radius: 2px;
+  background: rgba(64,160,240,0.35);
+  border-radius: 999px;
+}
+.scrollbar-tab::-webkit-scrollbar {
+  width: 8px;
 }
 
+.scrollbar-tab::-webkit-scrollbar-track {
+  background: rgba(255,255,255,0.04);
+}
+
+.scrollbar-tab::-webkit-scrollbar-thumb {
+  background: rgba(64,160,240,0.45);
+  border-radius: 999px;
+}
+
+.scrollbar-tab {
+  scrollbar-width: thin;
+  scrollbar-color: rgba(64,160,240,0.45) rgba(255,255,255,0.04);
+}
 /* ─── Input Field Focus ─── */
 .hud-input:focus {
   box-shadow: 0 0 12px rgba(64, 160, 240, 0.15), inset 0 0 6px rgba(64, 160, 240, 0.05);

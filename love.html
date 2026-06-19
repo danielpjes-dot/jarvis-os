@@ -1,0 +1,41 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Love Message</title>
+    <style>
+        body {
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            height: 100vh;
+            margin: 0;
+            background-color: #ffe6f0;
+            font-family: Arial, sans-serif;
+        }
+
+        .heart {
+            font-size: 100px;
+            animation: pump 0.8s infinite;
+        }
+
+        @keyframes pump {
+            0% { transform: scale(1); }
+            50% { transform: scale(1.2); }
+            100% { transform: scale(1); }
+        }
+
+        .message {
+            position: absolute;
+            top: 50%;
+            left: 50%;
+            transform: translate(-50%, -50%);
+            font-size: 30px;
+            color: #ff66b2;
+        }
+    </style>
+</head>
+<body>
+    <div class="heart">❤️</div>
+    <div class="message">I love you inga</div>
+</body>
+</html>

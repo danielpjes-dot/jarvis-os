@@ -1,0 +1,22 @@
+{
+  "tier": "HIGH (24GB)",
+  "total_vram_mb": 24576,
+  "gpu_count": 1,
+  "models": {
+    "live": "gemma4:e4b",
+    "fast": "gemma4:e4b",
+    "tools":"qwen3:14b",
+    "reason": "gemma4:26b",
+    "code": "qwen3-coder:30b",
+    "deep": "gemma4:26b"
+  },
+  "skill_models": {
+    "coding": "qwen3-coder:30b",
+    "web": "qwen3:14b",
+    "memory": "qwen3:14b",
+    "shell": "qwen3:14b"
+  },
+  "planner_model": "qwen3:14b",
+  "tts": "orpheus",
+  "updated": "2026-04-14T00:00:00+03:00"
+}

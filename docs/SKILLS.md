@@ -1,44 +1,52 @@
 # JARVIS Skill System
 
-The skill system lets you add, remove, and configure JARVIS capabilities as self-contained Python modules. Each skill registers its own tools, keywords, and executors — the ReAct server discovers them automatically.
+Skills are self-contained Python modules in `skills/`. Drop a file in, restart — it's live. The agent automatically uses your tools via the memory router and ReAct loop.
 
 ---
 
 ## How It Works
 
 ```
-jarvis-os/skills/
-├── __init__.py          # Package init
-├── loader.py            # Discovery + import engine
-├── denon.py             # ← Each file = one skill
-├── shield.py
-├── radio.py
-└── ...
+jarvis.sh start
+    │
+react_server.py → load_skills()
+    │
+    ├── scan skills/*.py
+    ├── check config/skills.json (enabled/disabled)
+    ├── import module → read TOOLS, TOOL_MAP, KEYWORDS, SKILL_META
+    ├── call init() if defined
+    └── merge into tool registry
 ```
 
-On startup, `react_server.py` calls `load_skills()` which:
-
-1. Scans `skills/*.py` (skips `__init__.py`, `loader.py`, `_private.py`)
-2. Checks `config/skills.json` — skips disabled skills
-3. Imports each module and reads: `TOOLS`, `TOOL_MAP`, `KEYWORDS`
-4. Calls `init()` if the skill defines one (for config loading, etc.)
-5. Merges everything into the ReAct server's tool registry
+Every incoming request goes through the **4-pass memory router** (Gemma4:4b) which classifies intent, fetches memory context, and selects the relevant tools — before the ReAct loop even starts.
 
 ---
 
-## Quick Start
-
-### Add a new skill
+## Quick Start — Write a Skill
 
 Create `skills/my_device.py`:
 
 ```python
-SKILL_NAME = "my_device"
+SKILL_NAME        = "my_device"
 SKILL_DESCRIPTION = "Controls my custom device"
+SKILL_VERSION     = "1.0.0"
+SKILL_CATEGORY    = "hardware"
+SKILL_TAGS        = ["device", "control"]
 
-def exec_my_command(action: str) -> str:
-    """Do something with the device."""
-    return f"Executed: {action}"
+SKILL_META = {
+    "name":          SKILL_NAME,
+    "description":   SKILL_DESCRIPTION,
+    "entrypoint":    "exec_my_command",
+    "route":         "tools",
+    "intent_aliases": ["my device", "device on", "device off"],
+    "keywords":      ["my device", "turn on", "turn off"],
+    "direct_match":  ["my device"],
+}
+
+def exec_my_command(action: str) -> dict:
+    if action == "on":
+        return {"ok": True, "speech": {"text": "Device on."}}
+    return {"ok": True, "speech": {"text": f"Action: {action}"}}
 
 TOOLS = [
     {
@@ -49,10 +57,7 @@ TOOLS = [
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "action": {
-                        "type": "string",
-                        "description": "Action: on, off, status",
-                    }
+                    "action": {"type": "string", "description": "on / off / status"}
                 },
                 "required": ["action"],
             },
@@ -60,28 +65,114 @@ TOOLS = [
     },
 ]
 
-TOOL_MAP = {
-    "my_command": exec_my_command,
-}
+TOOL_MAP = {"my_command": exec_my_command}
 
-KEYWORDS = {
-    "my_command": ["my device", "turn on", "turn off"],
+KEYWORDS = {"my_command": ["my device", "turn on", "turn off"]}
+```
+
+Restart → `bash jarvis.sh restart` → your skill is live.
+
+---
+
+## Module API Reference
+
+### Required Variables
+
+| Variable | Type | Description |
+|----------|------|-------------|
+| `SKILL_NAME` | `str` | Unique identifier (no spaces) |
+| `TOOLS` | `list[dict]` | Ollama function-calling format tool definitions |
+| `TOOL_MAP` | `dict[str, callable]` | `{"tool_name": executor_fn}` |
+| `KEYWORDS` | `dict[str, list[str]]` | Fallback keyword trigger phrases |
+
+### Optional Variables
+
+| Variable | Type | Description |
+|----------|------|-------------|
+| `SKILL_DESCRIPTION` | `str` | One-line description shown in `/api/skills` |
+| `SKILL_VERSION` | `str` | Semver string |
+| `SKILL_CATEGORY` | `str` | `automation`, `hardware`, `productivity`, etc. |
+| `SKILL_TAGS` | `list[str]` | Search tags |
+| `SKILL_META` | `dict` | Full metadata including `intent_aliases`, `direct_match`, `route` |
+| `init()` | `function` | Called once after import — load configs, connect to devices |
+
+### SKILL_META Fields
+
+```python
+SKILL_META = {
+    "name":           "my_skill",
+    "description":    "What it does",
+    "entrypoint":     "exec_fn_name",   # main executor function name
+    "route":          "tools",          # tools / code / reason / chat
+    "intent_aliases": ["..."],          # memory router intent matching
+    "keywords":       ["..."],          # fallback keyword matching
+    "direct_match":   ["exact phrase"], # exact trigger phrases
+    "writes_files":   False,            # declares file write capability
+    "reads_files":    False,
+    "network_access": True,
+    "response_style": {
+        "default": "structured_status_ui",  # or "plain", "markdown"
+        "avoid_raw_dump": True,
+    },
 }
 ```
 
-Restart the server — your skill is live. The planner and keyword matcher automatically include your new tools.
+### Tool Definition Format
 
-### Disable a skill
+```python
+{
+    "type": "function",
+    "function": {
+        "name": "tool_name",          # unique across all skills
+        "description": "...",          # LLM reads this to decide when to call
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "param": {
+                    "type": "string",  # string / number / boolean / object / array
+                    "description": "...",
+                    "enum": ["a", "b"] # optional allowed values
+                }
+            },
+            "required": ["param"],
+            "additionalProperties": False,
+        },
+    },
+}
+```
+
+### Executor Return Format
+
+Return a **dict** for rich responses, or a plain **str** for simple text:
+
+```python
+def exec_my_tool(param: str) -> dict:
+    return {
+        "ok": True,
+        "speech": {
+            "text": "Done.",           # spoken by TTS
+            "priority": "normal",      # normal / high / low
+        },
+        "ui": {
+            "placement": "right-side-hud",
+            "format": "status",        # status / list / code / markdown
+            "title": "My Tool",
+            "summary": "Result summary",
+            "ttl_seconds": 60,
+        },
+        "data": {"key": "value"},      # raw data for downstream use
+    }
+```
+
+### Disable a Skill
 
 Edit `config/skills.json`:
 
 ```json
 {
   "enabled": {
-    "denon": true,
-    "shield": true,
     "radio": false,
-    "my_device": true
+    "lg_tv": false
   }
 }
 ```
@@ -90,185 +181,179 @@ Skills not listed default to **enabled**.
 
 ---
 
-## Skill Module API
+## Skill Catalog
 
-Every skill module must define these top-level variables:
+### Coding & Plans
 
-### Required
+| Skill | File | Key Tools | Description |
+|-------|------|-----------|-------------|
+| **coding** | `coding.py` | `coding` | Code generation and editing — diff/patch format |
+| **coding_qwen3_coder** | `coding_qwen3_coder.py` | `code_edit` | qwen3-coder:30b direct executor for plan_runner |
+| **plan** | `plan.py` | `plan_create` `plan_proceed` `plan_cancel` | Agentic multi-step plan system with staging pipeline |
+| **shell** | `shell.py` | `shell_command` `read_file` | Safe shell execution + file reading in WSL |
+| **git** | `git.py` | `git` | Git — status, diff, commit, push, pull, branch, PR |
+| **podman** | `podman.py` | `podman` | Podman container management — run, build, ps, logs |
+| **app_scaff_skill** | `app_scaff_skill.py` | `scaffold_app` | Project scaffolding from templates |
+| **project_ops** | `project_ops.py` | `project_ops` | Project management — create, archive, list projects |
 
-| Variable | Type | Description |
-|----------|------|-------------|
-| `SKILL_NAME` | `str` | Unique skill identifier |
-| `TOOLS` | `list[dict]` | Ollama-format tool definitions |
-| `TOOL_MAP` | `dict[str, callable]` | `{tool_name: executor_function}` |
-| `KEYWORDS` | `dict[str, list[str]]` | `{tool_name: [trigger_keywords]}` for fallback routing |
+### Automation & Integration
 
-### Optional
+| Skill | File | Key Tools | Description |
+|-------|------|-----------|-------------|
+| **n8n** | `n8n.py` | `n8n` | n8n workflow control — trigger webhooks, add tasks, list executions, bidirectional event push |
+| **claude_skills** | `claude_skills.py` | `use_skill` | Load and run 34 Claude Code skills on demand |
+| **cloud_llm** | `cloud_llm.py` | `cloud_llm` | Cloud LLM APIs — Claude, GPT-4, Gemini, Groq, Mistral, OpenRouter |
+| **model_skill** | `model_skill.py` | `switch_model` | Switch active Ollama model slot at runtime |
 
-| Variable / Function | Type | Description |
-|---------------------|------|-------------|
-| `SKILL_DESCRIPTION` | `str` | One-line description (shown in `/api/skills`) |
-| `init()` | `function` | Called once after import — load configs, validate deps |
+### Information & Research
 
-### Tool Definition Format
+| Skill | File | Key Tools | Description |
+|-------|------|-----------|-------------|
+| **web** | `web.py` | `web_search` `open_url` | DuckDuckGo search + browser open |
+| **news** | `news.py` | `get_news` | Live news headlines via RSS / newsapi |
+| **weather** | `weather.py` | `weather` | Current weather and multi-day forecasts |
+| **flux** | `flux.py` | `flux` | FLUX text-to-image generation with Qwen3 prompt enhancement |
 
-Tools use the Ollama function-calling format:
+### Memory & Knowledge
 
-```python
-{
-    "type": "function",
-    "function": {
-        "name": "tool_name",           # Unique across all skills
-        "description": "What it does",  # LLM reads this to decide when to call
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "param_name": {
-                    "type": "string",   # string, number, boolean
-                    "description": "What this param is for",
-                }
-            },
-            "required": ["param_name"],
-        },
-    },
-}
-```
+| Skill | File | Key Tools | Description |
+|-------|------|-----------|-------------|
+| **memory** | `memory.py` | `memory_search` `memory_add` `memory_status` | MemPalace long-term vector memory (2000+ entries) |
+| **memory_core** | `memory_core.py` | `remember` `recall` | Working memory in Redis — fast in-session recall |
+| **vault** | `vault.py` | `read_vault_file` `list_vault_dir` | Obsidian vault file access and search |
+| **notes** | `notes.py` | `create_note` `search_notes` | Quick note creation and search in vault |
+| **mindmap** | `mindmap.py` | `mindmap` | Generate structured mind maps from topics |
+| **document_editor** | `document_editor.py` | `edit_document` | Edit and format structured documents |
+| **chat_log** | `chat_log.py` | `chat_log` | Read and search conversation history |
+| **accounting** | `accounting.py` | `accounting` | Financial queries, invoices, and basic bookkeeping |
 
-### Executor Function Signature
+### Communication
 
-Executor functions receive keyword arguments matching the tool's `parameters.properties`:
+| Skill | File | Key Tools | Description |
+|-------|------|-----------|-------------|
+| **email** | `email.py` | `email` | Send, read inbox, search — SMTP/IMAP |
+| **phone** | `phone.py` | `phone` | Twilio calls — make/receive, voicemail, call log |
+| **sms** | `sms.py` | `sms` | Twilio SMS — send messages, read inbox |
+| **dictate** | `dictate.py` | `dictate` | Continuous dictation mode — transcribe to file |
 
-```python
-def exec_my_tool(param_name: str) -> str:
-    # Do work...
-    return "Result string shown to LLM"
-```
+### Home Automation
 
-- **Always return a string** — the LLM sees this as the tool result
-- Keep results under 4000 chars for context efficiency
-- Return clear error messages on failure (the LLM may retry)
+| Skill | File | Key Tools | Description |
+|-------|------|-----------|-------------|
+| **denon** | `denon.py` | `denon_input` `denon_volume` `denon_preset` `denon_surround` `denon_power` | Denon AVR-X4100W receiver — inputs, volume, surround modes, zones |
+| **shield** | `shield.py` | `room_command` | NVIDIA Shield TV per-room control via network |
+| **lg_tv** | `lg_tv.py` | `lg_tv` | LG webOS TV — power, volume, inputs, apps, cursor |
+| **panasonic_bd** | `panasonic_bd.py` | `bluray` | Panasonic UB9000 4K Blu-ray — play, pause, skip chapters |
+| **hue** | `hue.py` | `hue` | Philips Hue — on/off, brightness, colors, scenes, rooms |
+| **radio** | `radio.py` | `play_radio` | Internet radio streaming via mpv |
+| **volume** | `volume.py` | `set_volume` | Windows system volume (0-100%) |
+| **plex** | `plex.py` | `plex` | Plex Media Server — browse library, search, control playback |
+
+### System
+
+| Skill | File | Key Tools | Description |
+|-------|------|-----------|-------------|
+| **timer** | `timer.py` | `set_timer` | Countdown timers with TTS alerts |
+| **network** | `network.py` | `scan_network` | Network scan with device identification and topology map |
 
 ---
 
 ## Cross-Skill Communication
 
-Skills can import from each other. For example, `shield.py` delegates to `denon.py`:
+Skills can call each other. Use `try/except ImportError` so the skill still loads if the dependency is disabled:
 
 ```python
-def _denon_switch_input(input_name: str) -> str:
+def exec_room_av(room: str, input_name: str) -> dict:
     try:
         from skills.denon import exec_denon_input
-        return exec_denon_input(input_name)
+        exec_denon_input(input_name)
     except ImportError:
-        return "Denon skill not loaded"
+        pass
+    # ... rest of logic
 ```
-
-Use `try/except ImportError` so the skill still works if the dependency is disabled.
 
 ---
 
 ## Config Loading Pattern
-
-For skills that need device configs, use an `init()` function:
 
 ```python
 import json
 from pathlib import Path
 
 CONFIG_PATH = Path(__file__).parent.parent / "config" / "my_device.json"
-CONFIG = {}
+CONFIG: dict = {}
 
-def init():
+def init() -> None:
     global CONFIG
-    CONFIG = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
-    print(f"[MY_DEVICE] Loaded config: {CONFIG.get('name')}")
+    if CONFIG_PATH.exists():
+        CONFIG = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
 ```
 
-Store device configs in `config/` as JSON or YAML files.
+Device configs live in `config/` as JSON files. The `init()` function is called once at startup.
 
 ---
 
-## API Endpoints
+## n8n Skill — Bidirectional Integration
 
-| Endpoint | Method | Description |
-|----------|--------|-------------|
-| `/api/skills` | GET | List all loaded skills with their tools |
-| `/api/health` | GET | Server health check |
-| `/api/timers` | GET | Active countdown timers (from timer skill) |
+The `n8n` skill supports full bidirectional communication:
 
-### Example: GET /api/skills
+**Jarvis → n8n:**
+```python
+exec_n8n(action="add_task", payload={
+    "task": "research competitor pricing",
+    "assignee": "sami"
+})
+# POSTs to N8N_TASK_WEBHOOK with callback_url pointing to /api/events
+```
 
+**n8n → Jarvis** (n8n calls `/api/events` when workflow completes):
 ```json
+POST http://jarvis:7900/api/events
 {
-  "skills": [
-    {
-      "name": "denon",
-      "description": "Denon AVR-X4100W receiver — inputs, volume, presets, surround, zones",
-      "tools": ["denon_input", "denon_volume", "denon_preset", "denon_surround", "denon_power"]
-    },
-    {
-      "name": "radio",
-      "description": "Internet radio — Finnish stations + custom streams via mpv",
-      "tools": ["play_radio"]
-    }
-  ]
+  "type": "workflow_done",
+  "task": "build invoice PDF",
+  "source": "n8n",
+  "data": { "file": "/tmp/invoice.pdf" }
 }
 ```
+If the payload includes a `task` field, it gets queued to `jarvis:tasks` Redis list and executed by `plan_runner.py`.
 
----
-
-## Tool Selection
-
-The ReAct server picks tools for each request using a two-stage process:
-
-1. **LLM Planner** (primary) — Asks `qwen3:30b-a3b` which tools are needed
-2. **Keyword Fallback** — If the planner fails, scores tools by keyword matches
-
-Each skill's `KEYWORDS` dict feeds the fallback matcher. Write keywords as lowercase phrases the user might say.
+Configure webhook paths in `infra/.env.n8n.local`:
+```bash
+N8N_TASK_WEBHOOK=/webhook/jarvis-task
+N8N_EVENT_WEBHOOK=/webhook/jarvis-event
+JARVIS_API_URL=http://<wsl-ip>:7900
+```
 
 ---
 
 ## Debugging
 
-Skill loading is logged at startup:
-
+**Skill loading** is logged at startup:
 ```
-[SKILLS] Loaded: denon — 5 tools (denon_input, denon_volume, denon_preset, denon_surround, denon_power)
-[SKILLS] Loaded: shield — 2 tools (room_command, scan_network)
-[SKILLS] Loaded: radio — 1 tools (play_radio)
-[SKILLS] Skipping disabled skill: my_broken_skill
-[SKILLS] Failed to load bad_skill: ModuleNotFoundError: No module named 'foo'
-[SKILLS] Total: 10 skills, 20 tools
+[SKILLS] Loaded: n8n — 1 tools (n8n) [automation]
+[SKILLS] Loaded: coding — 1 tools (coding) [code]
+[SKILLS] Skipping disabled skill: lg_tv
+[SKILLS] Failed to load bad_skill: ModuleNotFoundError
+[SKILLS] Total: 35 skills, 64 tools
 ```
 
-Tool calls are logged during execution:
+**Tool calls** during execution:
+```
+[REACT] Tool: n8n({"action": "add_task", "payload": {"task": "..."}})
+[REACT] Result: Task sent to n8n: research competitor pricing
+```
 
-```
-[REACT] Tool: denon_input({"input_name": "pc"})
-[REACT] Result: Switched Denon to pc
-```
+**Live events** at `/api/coding-log` (also shown in Codex UI AGENT panel).
 
 ---
 
-## Skill Index
+## API: Skill Endpoints
 
-| Skill | File | Guide |
-|-------|------|-------|
-| Denon AVR | `skills/denon.py` | [docs/skills/denon.md](skills/denon.md) |
-| NVIDIA Shield | `skills/shield.py` | [docs/skills/shield.md](skills/shield.md) |
-| Internet Radio | `skills/radio.py` | [docs/skills/radio.md](skills/radio.md) |
-| System Volume | `skills/volume.py` | [docs/skills/volume.md](skills/volume.md) |
-| Timers | `skills/timer.py` | [docs/skills/timer.md](skills/timer.md) |
-| Memory | `skills/memory.py` | [docs/skills/memory.md](skills/memory.md) |
-| Vault | `skills/vault.py` | [docs/skills/vault.md](skills/vault.md) |
-| Web Search | `skills/web.py` | [docs/skills/web.md](skills/web.md) |
-| Shell | `skills/shell.py` | [docs/skills/shell.md](skills/shell.md) |
-| Claude Skills | `skills/claude_skills.py` | [docs/skills/claude_skills.md](skills/claude_skills.md) |
-| LG TV | `skills/lg_tv.py` | [docs/skills/lg_tv.md](skills/lg_tv.md) |
-| Panasonic Blu-ray | `skills/panasonic_bd.py` | [docs/skills/panasonic_bd.md](skills/panasonic_bd.md) |
-| Network | `skills/network.py` | [docs/skills/network.md](skills/network.md) |
-| Git | `skills/git.py` | [docs/skills/git.md](skills/git.md) |
-| FLUX Image Gen | `skills/flux.py` | [docs/skills/flux.md](skills/flux.md) |
-| Plex | `skills/plex.py` | [docs/skills/plex.md](skills/plex.md) |
-| Philips Hue | `skills/hue.py` | [docs/skills/hue.md](skills/hue.md) |
-| Cloud LLM | `skills/cloud_llm.py` | [docs/skills/cloud_llm.md](skills/cloud_llm.md) |
+| Endpoint | Method | Description |
+|----------|--------|-------------|
+| `/api/skills` | GET | All loaded skills with tool names |
+| `/api/health` | GET | Server health including skill count |
+| `/api/events` | GET | Recent system events |
+| `/api/events` | POST | Inbound from n8n or external services |
+| `/api/coding-log` | GET | Live agent loop events (last 120) |

@@ -12,38 +12,27 @@ interface HudPanelProps {
   glow?: boolean;
   onClick?: () => void;
 }
-
 export function HudPanel({
   title,
   children,
   className = "",
-  corners = true,
-  glow = false,
-  onClick,
-}: HudPanelProps) {
+}: {
+  title?: string;
+  children: React.ReactNode;
+  className?: string;
+}) {
   return (
-    <div
-      onClick={onClick}
-      className={`
-        hud-panel rounded-sm
-        ${glow ? "glow-strong" : "glow-border"}
-        ${onClick ? "cursor-pointer" : ""}
-        ${className}
-      `}
-    >
-      {/* Inner corners overlay */}
-      {corners && <div className="hud-panel-corners absolute inset-0 pointer-events-none" />}
-
-      {/* Title bar */}
+    <div className={`h-full min-h-0 flex flex-col ${className}`}>
       {title && (
-        <div className="hud-title flex items-center gap-2">
-          <span className="w-1.5 h-1.5 rounded-full bg-[var(--accent)] opacity-60" />
-          <span>{title}</span>
+        <div className="shrink-0 px-3 py-2 text-[10px] tracking-[3px] uppercase text-[var(--accent)] border-b border-white/10">
+          {title}
         </div>
       )}
 
-      {/* Content */}
-      <div className="relative z-[1]">{children}</div>
+      {/* 🔥 THIS IS CRITICAL */}
+      <div className="flex-1 min-h-0 overflow-hidden">
+        {children}
+      </div>
     </div>
   );
 }

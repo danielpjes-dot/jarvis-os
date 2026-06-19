@@ -28,6 +28,11 @@ certs/
 # Env
 .env
 .env.local
+.env.*.local
+infra/.env.*.local
+infra/.env.local
+exported*
+netum*
 
 # Runtime state files
 input.txt
@@ -42,10 +47,21 @@ entities.json
 mempalace.yaml
 *.log
 bridge/
+orpheus_env/
 
+# Jarvis OS sqlite data
+data/
+
+# Plan runner staging output (generated files, not source)
+staging/
+
+# Test scripts
+test_plan.sh
 # Next.js
 .next/
 app/.next/
+# Secrets management
+scripts/keepass_secrets.py
 
 # Personal configs (use .example files as templates)
 config/denon.json
@@ -61,3 +77,4 @@ config/plex.json
 config/cloud_llm.json
 config/twilio.json
 config/email.json
+config/*.json
