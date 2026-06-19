@@ -234,6 +234,8 @@ JARVIS uses a modular skill system. Each skill is a self-contained Python module
 - **Python 3.12+**
 - **Ollama** with models pulled
 - **Redis** (for plan queue, working memory, task status)
+- **Unreal Engine 5.8** *(optional)* — for MetaHuman face and 3D scene control via MCP
+- **Android Studio + SDK** *(optional)* — for Android emulator testing (Pixel_6 AVD)
 
 ---
 
@@ -268,6 +270,29 @@ cd app && npm run dev
 # Optional: TTS server (Kokoro)
 python3 tts/server.py   # :5100
 ```
+
+### Unreal Engine 5.8 MCP (optional)
+
+1. Open your UE 5.8 project
+2. `Edit → Plugins` → search **Unreal MCP** → enable → restart editor
+3. UE Output Log console: `ModelContextProtocol.GenerateClientConfig` — note the port
+4. Add to `.env` in jarvis-os root:
+   ```bash
+   UE_MCP_URL=http://localhost:3000/mcp
+   UE_TCP_PORT=55557
+   ```
+5. Restart jarvis — the `unreal` skill loads automatically
+
+### Android Emulator (optional)
+
+1. Install [Android Studio](https://developer.android.com/studio) + Android SDK
+2. Create a **Pixel_6** AVD (API 33+) in the AVD Manager
+3. Add to `.env`:
+   ```bash
+   ANDROID_HOME=C:/Users/yourname/AppData/Local/Android/Sdk
+   JAVA_HOME=C:/Program Files/Microsoft/jdk-21
+   ```
+4. The `android` skill handles emulator start/stop automatically on build
 
 ---
 
@@ -309,6 +334,8 @@ python3 scripts/voice_capture.py --wake   # Wake word mode ("Hey JARVIS")
 | **Kokoro TTS** | http://localhost:5100 | Local TTS (Kokoro/Orpheus) |
 | **PTY Bridge** | ws://localhost:4010 | Terminal WebSocket |
 | **llama.cpp** | http://localhost:8081 | Memory router model |
+| **UE MCP** | http://localhost:3000/mcp | Unreal Engine 5.8 built-in MCP server |
+| **UE TCP Bridge** | localhost:55557 | Custom MetaHuman / Blueprint tools |
 
 ### API Endpoints
 
