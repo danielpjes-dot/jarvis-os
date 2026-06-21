@@ -384,6 +384,13 @@ class TelegramGateway:
 
                     if not self.is_allowed(chat_id):
                         self.send_message(chat_id, "This chat is not allowed to use this JARVIS bot.")
+                        if emit_event:
+                            emit_event(
+                                "telegram_unauthorized",
+                                f"Unauthorized Telegram access attempt",
+                                {"chat_id": chat_id, "text": text[:200], "username": message.get("from", {}).get("username", "")},
+                            )
+                        print(f"[TELEGRAM] UNAUTHORIZED chat_id={chat_id} username={message.get('from', {}).get('username', '')} text={text[:100]!r}", flush=True)
                         continue
 
                     if text.strip().lower() in ("/skills", "/skills@jarvisbot"):
