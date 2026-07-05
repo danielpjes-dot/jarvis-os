@@ -1,0 +1,15 @@
+[Unit]
+Description=JARVIS n8n automation hub (:5678, podman-compose) — optional
+PartOf=jarvis.target
+After=network.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+WorkingDirectory=/mnt/e/coding/jarvis-os
+EnvironmentFile=-/mnt/e/coding/jarvis-os/.env
+ExecStart=/bin/bash /mnt/e/coding/jarvis-os/scripts/n8n.sh start
+ExecStop=/bin/bash /mnt/e/coding/jarvis-os/scripts/n8n.sh stop
+
+[Install]
+WantedBy=jarvis.target

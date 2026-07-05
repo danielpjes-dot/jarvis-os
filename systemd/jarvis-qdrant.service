@@ -1,0 +1,17 @@
+[Unit]
+Description=JARVIS Qdrant vector DB (podman)
+PartOf=jarvis.target
+After=network.target
+
+[Service]
+ExecStartPre=-/usr/bin/podman rm -f qdrant
+ExecStart=/usr/bin/podman run --rm --name qdrant \
+  -p 6333:6333 \
+  -v /mnt/d/Jarvis_vault/qdrant_storage:/qdrant/storage \
+  docker.io/qdrant/qdrant:latest
+ExecStop=/usr/bin/podman stop -t 10 qdrant
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=jarvis.target

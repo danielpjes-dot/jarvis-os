@@ -1,0 +1,16 @@
+[Unit]
+Description=JARVIS Claude proxy (Ollama-compatible :11434, Claude API backend) — optional
+# Mutually exclusive with Ollama: both want port 11434
+Conflicts=jarvis-ollama.service
+After=network.target
+
+[Service]
+WorkingDirectory=/mnt/e/coding/jarvis-os
+EnvironmentFile=-/mnt/e/coding/jarvis-os/.env
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/usr/bin/python3 -u /mnt/e/coding/jarvis-os/scripts/claude_proxy.py
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=jarvis.target

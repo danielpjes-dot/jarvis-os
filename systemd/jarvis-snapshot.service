@@ -1,0 +1,18 @@
+[Unit]
+Description=JARVIS memory snapshot on shutdown (runs redis_snapshot.py while Redis is still up)
+PartOf=jarvis.target
+# Stop order is reverse of start order: being After= redis means this unit
+# STOPS FIRST, so the snapshot runs while Redis is still alive.
+After=jarvis-redis.service jarvis-init.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+WorkingDirectory=/mnt/e/coding/jarvis-os
+EnvironmentFile=-/mnt/e/coding/jarvis-os/.env
+Environment=VAULT_DIR=/mnt/d/Jarvis_vault
+ExecStart=/bin/true
+ExecStop=/usr/bin/python3 /mnt/e/coding/jarvis-os/scripts/redis_snapshot.py
+
+[Install]
+WantedBy=jarvis.target

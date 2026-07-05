@@ -1,0 +1,16 @@
+[Unit]
+Description=JARVIS dictation daemon (:5110, orpheus_env)
+PartOf=jarvis.target
+After=network.target
+
+[Service]
+WorkingDirectory=/mnt/e/coding/jarvis-os
+EnvironmentFile=-/mnt/e/coding/jarvis-os/.env
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/mnt/e/coding/jarvis-os/orpheus_env/bin/python -u \
+  /mnt/e/coding/jarvis-os/services/dictation_daemon.py --host 127.0.0.1 --port 5110
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=jarvis.target

@@ -1,0 +1,15 @@
+[Unit]
+Description=JARVIS browser bridge (:4000)
+PartOf=jarvis.target
+After=jarvis-react.service
+
+[Service]
+WorkingDirectory=/mnt/e/coding/jarvis-os
+EnvironmentFile=-/mnt/e/coding/jarvis-os/.env
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/usr/bin/python3 -u /mnt/e/coding/jarvis-os/scripts/server.py
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=jarvis.target

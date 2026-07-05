@@ -1,0 +1,17 @@
+[Unit]
+Description=JARVIS llama.cpp vision server (gemma4, :8091)
+PartOf=jarvis.target
+After=network.target
+
+[Service]
+ExecStart=/mnt/e/coding/llama.cpp/build/bin/llama-server \
+  --model /mnt/e/models/gemma4-e4b/gemma-4-E4B-it-UD-Q4_K_XL.gguf \
+  --mmproj /mnt/e/models/gemma4-e4b/mmproj-BF16.gguf \
+  --n-gpu-layers 99 \
+  --ctx-size 8192 \
+  --port 8091
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=jarvis.target

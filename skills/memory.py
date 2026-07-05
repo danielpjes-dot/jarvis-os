@@ -10,26 +10,80 @@ import subprocess
 import os
 from pathlib import Path
 
-SKILL_NAME = "memory"
-SKILL_DESCRIPTION = "MemPalace long-term memory — search, add, status"
+# NOTE: named "mempalace" (not "memory") — memory_core.py owns SKILL_NAME
+# "memory"; two skills with the same name overwrite each other in the
+# plan_runner registry.
+SKILL_NAME = "mempalace"
+SKILL_DESCRIPTION = "MemPalace long-term memory — search, add, status (vault-search fallback)"
 
 VAULT_DIR = Path("D:/Jarvis_vault") if os.name == "nt" else Path("/mnt/d/Jarvis_vault")
 
 
-def exec_memory_search(query: str) -> str:
+def _mempalace_available() -> bool:
     try:
-        result = subprocess.run(
-            ["python3", "-m", "mempalace", "search", query],
-            capture_output=True,
-            text=True,
-            timeout=30,
-        )
-        output = (result.stdout + result.stderr).strip()
-        return output[:6000] if output else "No results found."
-    except subprocess.TimeoutExpired:
-        return "Memory search timed out."
+        import importlib.util
+        return importlib.util.find_spec("mempalace") is not None
+    except Exception:
+        return False
+
+
+def _vault_text_search(query: str, max_results: int = 8) -> str:
+    """Fallback search: scan vault .md files directly for the query terms."""
+    if not VAULT_DIR.exists():
+        return f"Vault not found at {VAULT_DIR}"
+
+    terms = [t for t in query.lower().split() if len(t) > 2] or [query.lower()]
+    results = []
+
+    try:
+        for md in sorted(VAULT_DIR.rglob("*.md"),
+                         key=lambda f: f.stat().st_mtime, reverse=True):
+            if ".trash" in md.parts or ".obsidian" in md.parts:
+                continue
+            try:
+                text = md.read_text(encoding="utf-8", errors="ignore")
+            except Exception:
+                continue
+            low = text.lower()
+            if all(t in low for t in terms) or (len(terms) > 1 and sum(t in low for t in terms) >= 2):
+                lines = text.splitlines()
+                snippet_lines = []
+                for i, line in enumerate(lines):
+                    if any(t in line.lower() for t in terms):
+                        start, end = max(0, i - 2), min(len(lines), i + 3)
+                        snippet_lines.append("\n".join(lines[start:end]))
+                        if len(snippet_lines) >= 2:
+                            break
+                rel = md.relative_to(VAULT_DIR)
+                results.append(f"[{rel}]\n" + "\n…\n".join(snippet_lines))
+                if len(results) >= max_results:
+                    break
     except Exception as e:
-        return f"Memory search error: {e}"
+        return f"Vault search error: {e}"
+
+    if not results:
+        return f"No results found in vault for '{query}'."
+    return "\n\n---\n\n".join(results)[:6000]
+
+
+def exec_memory_search(query: str) -> str:
+    if _mempalace_available():
+        try:
+            result = subprocess.run(
+                ["python3", "-m", "mempalace", "search", query],
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+            output = (result.stdout + result.stderr).strip()
+            if output:
+                return output[:6000]
+        except subprocess.TimeoutExpired:
+            return "Memory search timed out."
+        except Exception:
+            pass
+    # mempalace not installed or returned nothing — search the vault directly
+    return _vault_text_search(query)
 
 
 def exec_memory_add(text: str, room: str = "general") -> str:
@@ -51,27 +105,43 @@ def exec_memory_add(text: str, room: str = "general") -> str:
         with open(daily_file, "a", encoding="utf-8") as f:
             f.write(f"\n## {time_str} — JARVIS Memory ({room})\n{text}\n")
 
-        subprocess.Popen(
-            ["python3", "-m", "mempalace", "mine", str(VAULT_DIR)],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-        )
+        if _mempalace_available():
+            subprocess.Popen(
+                ["python3", "-m", "mempalace", "mine", str(VAULT_DIR)],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+            return f"Saved to vault: Daily/{date_str}.md and queued for MemPalace mining"
 
-        return f"Saved to vault: Daily/{date_str}.md and queued for MemPalace mining"
+        return f"Saved to vault: Daily/{date_str}.md"
     except Exception as e:
         return f"Memory save error: {e}"
 
 
 def exec_memory_status() -> str:
+    if _mempalace_available():
+        try:
+            result = subprocess.run(
+                ["python3", "-m", "mempalace", "status"],
+                capture_output=True,
+                text=True,
+                timeout=15,
+            )
+            output = (result.stdout + result.stderr).strip()
+            if output:
+                return output[:4000]
+        except Exception as e:
+            return f"Memory status error: {e}"
+
+    # Fallback status: vault stats
     try:
-        result = subprocess.run(
-            ["python3", "-m", "mempalace", "status"],
-            capture_output=True,
-            text=True,
-            timeout=15,
+        md_count = sum(1 for _ in VAULT_DIR.rglob("*.md"))
+        daily_count = sum(1 for _ in (VAULT_DIR / "Daily").glob("*.md")) if (VAULT_DIR / "Daily").exists() else 0
+        return (
+            f"MemPalace not installed — using direct vault search.\n"
+            f"Vault: {VAULT_DIR}\n"
+            f"Notes: {md_count} markdown files, {daily_count} daily logs."
         )
-        output = (result.stdout + result.stderr).strip()
-        return output[:4000] if output else "No mempalace status available."
     except Exception as e:
         return f"Memory status error: {e}"
 

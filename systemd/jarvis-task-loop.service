@@ -1,0 +1,15 @@
+[Unit]
+Description=JARVIS task loop (replaces loop.sh run_forever)
+PartOf=jarvis.target
+After=jarvis-react.service jarvis-redis.service
+
+[Service]
+WorkingDirectory=/mnt/e/coding/jarvis-os
+EnvironmentFile=-/mnt/e/coding/jarvis-os/.env
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/usr/bin/python3 -u /mnt/e/coding/jarvis-os/scripts/task_loop.py
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=jarvis.target

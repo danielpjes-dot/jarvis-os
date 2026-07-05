@@ -2988,7 +2988,13 @@ def request_llama_cpp_chat(payload: Dict[str, Any], timeout: int):
 
 def request_chat_backend(payload: Dict[str, Any], timeout: int, route: str = "fast"):
     if route in LLAMA_CPP_ROUTES:
-        return request_llama_cpp_chat(payload, timeout)
+        try:
+            return request_llama_cpp_chat(payload, timeout)
+        except (urllib.error.URLError, OSError) as e:
+            # llama.cpp down → fall back to Ollama (model guard bumps small
+            # gemma to the Ollama minimum; with the Claude proxy on :11434
+            # this lands on the cloud automatically).
+            print(f"[REACT] llama.cpp unavailable ({e}), falling back to Ollama")
     return request_ollama_chat(payload, timeout)
 
 def normalize_chat_response(data: Dict[str, Any]) -> Dict[str, Any]:
@@ -3803,7 +3809,23 @@ def write_bridge_status(state: str, text: Optional[str] = None) -> None:
         pass
 
 
+# Small gemma models are llama.cpp-only (:8091). If one leaks into an Ollama
+# call (e.g. llama.cpp fallback), bump it to the Ollama minimum model.
+OLLAMA_MIN_MODEL = os.environ.get("JARVIS_OLLAMA_MIN_MODEL", "qwen3:14b")
+_OLLAMA_BANNED_MODEL_PREFIXES = tuple(
+    p.strip().lower()
+    for p in os.environ.get(
+        "JARVIS_OLLAMA_BANNED_MODELS", "gemma4:e4b,gemma4:4b,gemma3:4b,gemma3n"
+    ).split(",")
+    if p.strip()
+)
+
+
 def request_ollama_chat(payload: Dict[str, Any], timeout: int):
+    model = str(payload.get("model", "")).lower()
+    if model.startswith(_OLLAMA_BANNED_MODEL_PREFIXES):
+        print(f"[REACT] Ollama model guard: {payload.get('model')} → {OLLAMA_MIN_MODEL}")
+        payload = {**payload, "model": OLLAMA_MIN_MODEL}
     req = urllib.request.Request(
         f"{OLLAMA_HOST}/api/chat",
         data=json.dumps(payload).encode("utf-8"),
@@ -4280,10 +4302,14 @@ def normalized_route(requested_route: Optional[str], selected_tools: List[Dict[s
         return requested_route
     return infer_route_from_tools(selected_tools)
 
-def request_llama_cpp_chat(
+def request_llama_cpp_chat_raw(
     payload: Dict[str, Any],
     timeout: int = CHAT_TIMEOUT_SEC,
 ):
+    """POST an already-OpenAI-format payload to llama.cpp as-is.
+    NOTE: must NOT be named request_llama_cpp_chat — that name is the
+    Ollama→OpenAI translating version defined earlier; a same-name def here
+    silently overrode it and broke request_chat_backend's payload format."""
     req = urllib.request.Request(
         f"{LLAMA_CPP_HOST}/v1/chat/completions",
         data=json.dumps(payload).encode("utf-8"),
@@ -4318,30 +4344,36 @@ def call_ollama_once(
             "temperature": 0.3,
         }
 
-        with request_llama_cpp_chat(
-            payload,
-            timeout=CHAT_TIMEOUT_SEC,
-        ) as resp:
-            data = json.loads(resp.read().decode("utf-8"))
+        try:
+            with request_llama_cpp_chat_raw(
+                payload,
+                timeout=CHAT_TIMEOUT_SEC,
+            ) as resp:
+                data = json.loads(resp.read().decode("utf-8"))
 
-        content = (
-            data.get("choices", [{}])[0]
-            .get("message", {})
-            .get("content", "")
-        )
+            content = (
+                data.get("choices", [{}])[0]
+                .get("message", {})
+                .get("content", "")
+            )
 
-        return {
-            "model":      model,
-            "created_at": now_iso(),
-            "message":    {
-                "role":    "assistant",
-                "content": content,
-            },
-            "done":     True,
-            "route":    route,
-            "provider": "llama.cpp",
-            "raw":      data,
-        }
+            return {
+                "model":      model,
+                "created_at": now_iso(),
+                "message":    {
+                    "role":    "assistant",
+                    "content": content,
+                },
+                "done":     True,
+                "route":    route,
+                "provider": "llama.cpp",
+                "raw":      data,
+            }
+        except (urllib.error.URLError, OSError) as e:
+            # llama.cpp down → fall through to the Ollama path below.
+            # The Ollama model guard replaces small gemma with qwen3:14b;
+            # with the Claude proxy on :11434 this transparently goes cloud.
+            print(f"[REACT] llama.cpp unavailable ({e}), route={route} → Ollama fallback")
 
     payload: Dict[str, Any] = {
         "model":    model,

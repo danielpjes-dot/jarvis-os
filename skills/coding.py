@@ -203,7 +203,11 @@ def exec_code_edit(
 
     model = _active_model(args)
 
-    if _is_qwen_coder(model):
+    # Route to qwen coder when the model is a qwen coder OR when no model
+    # hint exists at all — qwen3-coder is the local default coding backend.
+    # The generic backend only handles file creation and errors on
+    # everything else, so it must never be the silent default.
+    if _is_qwen_coder(model) or (not model and exec_qwen3_code_edit is not None):
         if exec_qwen3_code_edit is None:
             return _error_result(
                 "Qwen coder backend is not available.",
@@ -212,7 +216,7 @@ def exec_code_edit(
 
         enriched_args = dict(args)
         enriched_args["selected_backend"] = "qwen3_coder"
-        enriched_args["active_model"] = model
+        enriched_args["active_model"] = model or "qwen3-coder:30b"
         return exec_qwen3_code_edit(**enriched_args)
 
     if exec_generic_code_edit is None:

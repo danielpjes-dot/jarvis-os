@@ -40,14 +40,20 @@ REDIS_STATUS_KEY = "jarvis:task_status"   # hash: task_uid → status JSON
 REDIS_RESULTS_KEY = "jarvis:task_results" # hash: task_uid → result string
 
 SKILLS_DIR       = Path(os.getenv("JARVIS_SKILLS_DIR", "/mnt/e/coding/jarvis-os/skills"))
+MAX_WORKERS      = int(os.getenv("JARVIS_PLAN_WORKERS", "4"))   # concurrent task workers
 EXECUTOR_URL     = os.getenv("JARVIS_EXECUTOR_URL",    "http://localhost:8765")
 AGENT_LOOP_URL   = os.getenv("JARVIS_LOOP_URL",        "http://localhost:8100")
 OLLAMA_URL       = os.getenv("JARVIS_OLLAMA_URL",      "http://localhost:11434")
 CODER_MODEL      = os.getenv("JARVIS_CODER_MODEL",     "qwen3-coder:30b")
+DIAG_MODEL       = os.getenv("JARVIS_DIAG_MODEL",      "qwen3:14b")   # failure diagnosis
 STAGING_ROOT     = Path(os.getenv("JARVIS_STAGING_ROOT", "/mnt/e/coding/staging"))
+VAULT_DIR        = Path(os.getenv("VAULT_DIR", "/mnt/d/Jarvis_vault"))
+FAILURE_LOG      = VAULT_DIR / ".jarvis" / "plan_failures.md"
 
 POLL_INTERVAL    = 0.5   # seconds between Redis polls
-DEP_TIMEOUT      = 300   # seconds to wait for a dependency to complete
+# Dependency wait must cover a cold qwen3-coder:30b load + full generation.
+# 300s caused cascade failures when task 1 ran long.
+DEP_TIMEOUT      = int(os.getenv("JARVIS_DEP_TIMEOUT", "1200"))
 MAX_RETRIES      = 2     # retry failed tasks this many times
 
 # ── Redis ──────────────────────────────────────────────────────────────────────
@@ -128,6 +134,11 @@ def _load_skills() -> dict:
     registry = {}
     if not SKILLS_DIR.exists():
         return registry
+    # Skills import project modules as `scripts.x` / `services.x` /
+    # `skills.x` — make sure the project root is importable.
+    project_root = str(SKILLS_DIR.parent)
+    if project_root not in sys.path:
+        sys.path.insert(0, project_root)
     # Load ALL *.py skill files (not just *_skill.py)
     skip = {"__init__", "loader", "coding_generic", "coding_qwen3_coder"}
     for skill_file in sorted(SKILLS_DIR.glob("*.py")):
@@ -136,6 +147,10 @@ def _load_skills() -> dict:
         try:
             spec   = importlib.util.spec_from_file_location(skill_file.stem, skill_file)
             module = importlib.util.module_from_spec(spec)
+            # Must be in sys.modules BEFORE exec: @dataclass under
+            # `from __future__ import annotations` resolves type hints via
+            # sys.modules[cls.__module__].__dict__ (None → load error).
+            sys.modules[skill_file.stem] = module
             spec.loader.exec_module(module)
             tool_map = getattr(module, "TOOL_MAP", {})
             if not tool_map:
@@ -163,17 +178,69 @@ def get_skills(force_reload: bool = False) -> dict:
     return _skills_cache
 
 
+def _infer_file_from_goal(goal: str, plan_id: str) -> str:
+    """
+    Infer a staging file path from a task description when none is explicitly set.
+
+    Priority:
+    1. Explicit 'create/write/generate X.ext' pattern
+    2. 'named X.ext' or 'file X.ext' pattern
+    3. Type keyword at start of goal (HTML→index.html, CSS→style.css, JS→script.js)
+    4. First filename.ext mention anywhere in goal
+    5. Fallback: index.html
+    """
+    import re as _re
+    g = goal.lower()
+
+    # 1. Action verb directly before a filename
+    m = _re.search(
+        r"(?:create|write|generate|build|implement)\s+(?:the\s+|a\s+|an\s+)?"
+        r"([\w\-]+\.(?:html|css|js|ts|tsx|py|json|svg|txt|md|sh|yaml|yml))",
+        g,
+    )
+    if m:
+        return f"staging/dev/{plan_id}/{m.group(1)}"
+
+    # 2. Named/file X.ext
+    m = _re.search(r"(?:named?|file)\s+([\w\-]+\.(?:html|css|js|ts|tsx|py|json|svg|txt|md|sh))", g)
+    if m:
+        return f"staging/dev/{plan_id}/{m.group(1)}"
+
+    # 3. Type keyword at start of goal
+    _EXT = {"html": "index.html", "webpage": "index.html", "skeleton": "index.html",
+            "markup": "index.html", "page": "index.html",
+            "css": "style.css", "stylesheet": "style.css", "layout": "style.css",
+            "javascript": "script.js", "js ": "script.js", "script": "script.js",
+            "svg": "graphic.svg", "seo.txt": "seo.txt"}
+    for kw, fname in _EXT.items():
+        if kw in g[:120]:
+            return f"staging/dev/{plan_id}/{fname}"
+
+    # 4. First explicit filename.ext mention
+    m = _re.search(r"\b([\w\-]+\.(?:html|css|js|ts|tsx|py|json|svg|txt|md|sh))\b", g)
+    if m:
+        return f"staging/dev/{plan_id}/{m.group(1)}"
+
+    return f"staging/dev/{plan_id}/index.html"
+
+
 def exec_code_step(task: dict) -> tuple[bool, str]:
     """
     Generate file content via qwen3-coder:30b and write to the target path.
     Used for coding/code_edit plan steps that need to CREATE files in staging.
+    Falls back to inferring the target filename from the task description.
     """
     import urllib.request, urllib.error
 
     goal         = task.get("task", "")
     target_files = task.get("target_files", [])
     args         = task.get("args", {})
-    primary_path = args.get("path") or (target_files[0] if target_files else "")
+    primary_path = (
+        args.get("path")
+        or task.get("primary_path")
+        or (target_files[0] if target_files else "")
+        or _infer_file_from_goal(goal, task.get("plan_id", "unknown"))
+    )
 
     if not primary_path:
         return False, "No target file path for coding step"
@@ -192,10 +259,20 @@ def exec_code_step(task: dict) -> tuple[bool, str]:
                 ".tsx": "TypeScript React", ".sh": "Bash"}
     lang = lang_map.get(ext, "")
 
+    # Diagnosis-guided retry: tell the coder what went wrong last time
+    diag_block = ""
+    if task.get("_diagnosis"):
+        diag_block = (
+            f"\nPrevious attempt FAILED with: {task.get('_last_error', 'unknown')}\n"
+            f"Failure diagnosis:\n{task['_diagnosis'][:500]}\n"
+            "Apply the fix from the diagnosis in this attempt.\n"
+        )
+
     prompt = (
         f"You are an expert {lang} developer. Write the complete file content for this task:\n\n"
         f"Task: {goal}\n\n"
-        f"Target file: {abs_path.name}\n\n"
+        f"Target file: {abs_path.name}\n"
+        f"{diag_block}\n"
         "Rules:\n"
         "- Output ONLY the raw file content. No markdown fences, no explanation.\n"
         "- Write complete, working code — not a skeleton or placeholder.\n"
@@ -241,6 +318,64 @@ def exec_code_step(task: dict) -> tuple[bool, str]:
         return False, f"Ollama HTTP {e.code}: {e.read().decode()[:200]}"
     except Exception as e:
         return False, f"exec_code_step failed: {e}"
+
+
+def _ollama_quick(model: str, prompt: str, timeout: int = 120) -> str:
+    """Small non-streaming Ollama call used for failure diagnosis."""
+    import urllib.request
+    payload = json.dumps({
+        "model": model,
+        "messages": [{"role": "user", "content": prompt}],
+        "stream": False,
+        "think": False,
+        "options": {"temperature": 0, "num_predict": 400},
+    }).encode()
+    req = urllib.request.Request(
+        f"{OLLAMA_URL}/api/chat", data=payload,
+        headers={"Content-Type": "application/json"}, method="POST",
+    )
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        return json.loads(resp.read()).get("message", {}).get("content", "").strip()
+
+
+def diagnose_failure(task: dict, error: str) -> str:
+    """Ask the model why a task failed and how to fix it; log to the vault.
+
+    Returns the diagnosis text ("" if diagnosis itself failed). The log at
+    .jarvis/plan_failures.md is append-only so failure history survives.
+    """
+    goal = task.get("task", "")
+    prompt = (
+        "A JARVIS plan task failed. Diagnose it.\n\n"
+        f"Task: {goal}\n"
+        f"Skill/tool: {task.get('skill','?')}.{task.get('tool','?')}\n"
+        f"Args: {json.dumps(task.get('args', {}))[:300]}\n"
+        f"Error: {error[:600]}\n\n"
+        "Reply with:\n"
+        "CAUSE: <one or two sentences — the most likely root cause>\n"
+        "FIX: <one concrete instruction to apply on retry>\n"
+        "No other text."
+    )
+    try:
+        diagnosis = _ollama_quick(DIAG_MODEL, prompt)
+    except Exception as e:
+        diagnosis = ""
+        print(f"[runner] diagnosis call failed: {e}")
+
+    try:
+        FAILURE_LOG.parent.mkdir(parents=True, exist_ok=True)
+        with open(FAILURE_LOG, "a", encoding="utf-8") as f:
+            f.write(
+                f"\n## {time.strftime('%Y-%m-%d %H:%M:%S')} — {_task_uid(task)}\n"
+                f"- task: {goal[:150]}\n"
+                f"- tool: {task.get('skill','?')}.{task.get('tool','?')}\n"
+                f"- error: {error[:300]}\n"
+                f"- diagnosis: {diagnosis[:600] if diagnosis else '(diagnosis unavailable)'}\n"
+            )
+    except Exception as e:
+        print(f"[runner] failure log write failed: {e}")
+
+    return diagnosis
 
 
 def dispatch_task(task: dict) -> tuple[bool, str]:
@@ -532,6 +667,17 @@ async def run_once(r) -> Optional[dict]:
     _set_status(r, task_uid, "waiting", f"deps={task.get('depends_on', [])}")
     ok, dep_err = await _wait_for_deps(r, task)
     if not ok:
+        # A hard dep FAILURE is terminal; a dep TIMEOUT usually just means a
+        # long chain (each coder task can take minutes) — re-queue to the back
+        # and free this worker instead of failing the whole cascade.
+        dep_requeues = task.get("_dep_requeues", 0)
+        if "Timed out" in dep_err and dep_requeues < 3:
+            task["_dep_requeues"] = dep_requeues + 1
+            r.rpush(REDIS_TASKS_KEY, json.dumps(task))
+            _set_status(r, task_uid, "queued",
+                        f"deps not ready, requeued {dep_requeues+1}/3")
+            print(f"[runner] ⏳ {task_uid} deps not ready, requeued")
+            return task
         _set_status(r, task_uid, "failed", dep_err)
         _set_result(r, task_uid, dep_err)
         print(f"[runner] ✗ dep failed: {dep_err}")
@@ -561,15 +707,36 @@ async def run_once(r) -> Optional[dict]:
         print(f"[runner] ✓ {task_uid}  ({elapsed}s)")
     else:
         if retries < MAX_RETRIES:
-            # Re-queue with retry counter
+            # Brief backoff so a transient outage (e.g. Ollama restarting)
+            # doesn't burn every retry within the same few seconds.
+            await asyncio.sleep(3 * (retries + 1))
+            # Re-queue at FRONT so workers waiting on deps don't starve the retry
             task["_retries"] = retries + 1
-            r.rpush(REDIS_TASKS_KEY, json.dumps(task))
+            r.lpush(REDIS_TASKS_KEY, json.dumps(task))
             _set_status(r, task_uid, "queued", f"retry {retries+1}/{MAX_RETRIES}")
             print(f"[runner] ↺ {task_uid} retry {retries+1}")
+        elif not task.get("_diag_retry"):
+            # Retries exhausted → ask the model WHY it failed, log the
+            # diagnosis to .jarvis/plan_failures.md, and give the task ONE
+            # diagnosis-guided retry (exec_code_step injects it into the prompt).
+            diagnosis = await asyncio.get_event_loop().run_in_executor(
+                None, diagnose_failure, task, result
+            )
+            if diagnosis:
+                task["_diag_retry"] = True
+                task["_diagnosis"] = diagnosis
+                task["_last_error"] = result[:300]
+                r.lpush(REDIS_TASKS_KEY, json.dumps(task))
+                _set_status(r, task_uid, "queued", "diagnosis-guided retry")
+                print(f"[runner] 🩺 {task_uid} diagnosed, guided retry queued")
+            else:
+                _set_status(r, task_uid, "failed", result[:200])
+                _set_result(r, task_uid, result)
+                print(f"[runner] ✗ {task_uid}: {result[:100]}")
         else:
             _set_status(r, task_uid, "failed", result[:200])
             _set_result(r, task_uid, result)
-            print(f"[runner] ✗ {task_uid}: {result[:100]}")
+            print(f"[runner] ✗ {task_uid}: {result[:100]} (after guided retry)")
 
     # Check if this completes the plan
     if plan_id:
@@ -590,9 +757,68 @@ async def run_once(r) -> Optional[dict]:
     return task
 
 
+async def _worker(r, worker_id: int):
+    """Single worker — pops and executes tasks from Redis indefinitely."""
+    idle_count = 0
+    while True:
+        try:
+            task = await run_once(r)
+            if task is None:
+                idle_count += 1
+                if idle_count % 60 == 0:
+                    depth = r.llen(REDIS_TASKS_KEY)
+                    print(f"[runner] w{worker_id} idle  queue_depth={depth}")
+                await asyncio.sleep(POLL_INTERVAL)
+            else:
+                idle_count = 0
+        except Exception as e:
+            print(f"[runner] w{worker_id} loop error: {e}")
+            await asyncio.sleep(2.0)
+
+
+def _recover_stale_tasks(r) -> int:
+    """Re-queue tasks orphaned by a runner crash/restart.
+
+    A popped task that never finished leaves status running/waiting/queued
+    with no matching queue entry (e.g. WSL shut down mid-plan). On a fresh
+    daemon start — before any worker runs — those are safe to re-queue.
+    """
+    active_id = r.get("jarvis:active_plan_id") or ""
+    if not active_id:
+        return 0
+    raw = r.hget(REDIS_PLANS_KEY, active_id)
+    if not raw:
+        return 0
+    plan = json.loads(raw)
+
+    queued_uids = set()
+    for item in r.lrange(REDIS_TASKS_KEY, 0, -1):
+        try:
+            queued_uids.add(_task_uid(json.loads(item)))
+        except Exception:
+            continue
+
+    requeued = 0
+    for t in plan.get("tasks", []):
+        uid = _task_uid(t)
+        st = _get_status(r, uid)
+        state = st["status"] if st else None
+        if state in ("running", "waiting", "queued") and uid not in queued_uids:
+            nt = dict(t)
+            for k in ("_retries", "_dep_requeues", "_diag_retry", "_diagnosis", "_last_error"):
+                nt.pop(k, None)
+            r.rpush(REDIS_TASKS_KEY, json.dumps(nt))
+            _set_status(r, uid, "queued", "recovered after runner restart")
+            requeued += 1
+
+    if requeued:
+        print(f"[runner] recovered {requeued} stale tasks for plan {active_id}")
+    return requeued
+
+
 async def daemon():
-    """Main daemon loop — continuously pops and executes tasks from Redis."""
-    print(f"[runner] JARVIS Plan Runner starting")
+    """Main daemon — spawns MAX_WORKERS concurrent task workers."""
+    print(f"[runner] JARVIS Plan Runner starting  workers={MAX_WORKERS}")
     print(f"[runner] Redis: {REDIS_HOST}:{REDIS_PORT}")
     print(f"[runner] Skills: {SKILLS_DIR}")
     print(f"[runner] Executor: {EXECUTOR_URL}")
@@ -604,26 +830,82 @@ async def daemon():
         print(f"[runner] ✗ {e}")
         sys.exit(1)
 
-    # Initial skill load
+    try:
+        _recover_stale_tasks(r)
+    except Exception as e:
+        print(f"[runner] stale-task recovery failed (non-fatal): {e}")
+
     skills = get_skills()
     print(f"[runner] Loaded {len(skills)} skills: {', '.join(skills.keys())}")
     print(f"[runner] Polling every {POLL_INTERVAL}s...\n")
 
-    idle_count = 0
-    while True:
-        try:
-            task = await run_once(r)
-            if task is None:
-                idle_count += 1
-                if idle_count % 60 == 0:  # log every 30s when idle
-                    depth = r.llen(REDIS_TASKS_KEY)
-                    print(f"[runner] idle  queue_depth={depth}")
-                await asyncio.sleep(POLL_INTERVAL)
-            else:
-                idle_count = 0
-        except Exception as e:
-            print(f"[runner] loop error: {e}")
-            await asyncio.sleep(2.0)
+    await asyncio.gather(*[_worker(r, i) for i in range(MAX_WORKERS)])
+
+
+# ── Plan rerun ────────────────────────────────────────────────────────────────
+
+def _next_plan_id(plan_id: str) -> str:
+    """Return the next versioned plan ID: FOO-001 → FOO-001-2 → FOO-001-3, etc.
+    Only 1–2 digit suffixes are treated as rerun counters; 3-digit sequences are original IDs."""
+    import re as _re
+    m = _re.match(r"^(.+)-(\d{1,2})$", plan_id)
+    if m:
+        return f"{m.group(1)}-{int(m.group(2)) + 1}"
+    return f"{plan_id}-2"
+
+
+def rerun_plan(plan_id: str) -> dict:
+    """
+    Clone an existing plan under a new versioned ID and queue all its tasks.
+
+    The new ID is derived by appending/incrementing a numeric suffix:
+      PLAN-20260629-001 -> PLAN-20260629-001-2 -> PLAN-20260629-001-3
+
+    All task plan_id references are rewritten to the new ID. Task statuses and
+    results from the original run are not copied — the new plan starts clean.
+    """
+    try:
+        r = _redis()
+    except RuntimeError as e:
+        return {"ok": False, "error": str(e)}
+
+    raw = r.hget(REDIS_PLANS_KEY, plan_id)
+    if not raw:
+        return {"ok": False, "error": f"Plan {plan_id} not found in Redis"}
+
+    plan = json.loads(raw)
+
+    new_id = _next_plan_id(plan_id)
+    while r.hexists(REDIS_PLANS_KEY, new_id):
+        new_id = _next_plan_id(new_id)
+
+    new_plan = dict(plan)
+    new_plan["plan_id"] = new_id
+    new_plan["rerun_of"] = plan_id
+
+    new_tasks = []
+    for t in new_plan.get("tasks", []):
+        nt = dict(t)
+        nt["plan_id"] = new_id
+        for k in ("_retries", "_dep_requeues", "_diag_retry", "_diagnosis", "_last_error"):
+            nt.pop(k, None)
+        new_tasks.append(nt)
+    new_plan["tasks"] = new_tasks
+
+    r.hset(REDIS_PLANS_KEY, new_id, json.dumps(new_plan))
+    r.set("jarvis:active_plan_id", new_id)
+
+    for t in new_tasks:
+        r.rpush(REDIS_TASKS_KEY, json.dumps(t))
+
+    print(f"[runner] rerun: {plan_id} → {new_id}  tasks={len(new_tasks)}")
+    return {
+        "ok": True,
+        "original_plan_id": plan_id,
+        "new_plan_id": new_id,
+        "goal": new_plan.get("goal", ""),
+        "tasks_queued": len(new_tasks),
+    }
 
 
 # ── FastAPI status API ─────────────────────────────────────────────────────────
@@ -679,6 +961,10 @@ try:
     def reload_skills():
         skills = get_skills(force_reload=True)
         return {"loaded": list(skills.keys())}
+
+    @app.post("/rerun/{plan_id}")
+    def rerun_endpoint(plan_id: str):
+        return rerun_plan(plan_id)
 
 except ImportError:
     app = None

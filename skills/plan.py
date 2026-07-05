@@ -181,6 +181,28 @@ def delete_plan(plan_id: str, archive: bool = True) -> Dict[str, Any]:
     }
 
 
+def rerun_plan(plan_id: Optional[str] = None) -> Dict[str, Any]:
+    """Re-queue an existing plan under a new versioned ID (FOO → FOO-2 → FOO-3)."""
+    if not plan_id:
+        if not ACTIVE_PLAN_FILE.exists():
+            return {"ok": False, "error": "No active plan and no plan_id provided"}
+        try:
+            data = _read_json(ACTIVE_PLAN_FILE)
+            plan_id = data.get("plan_id")
+        except Exception as e:
+            return {"ok": False, "error": str(e)}
+        if not plan_id:
+            return {"ok": False, "error": "Could not determine plan_id from active plan"}
+
+    try:
+        import sys as _sys
+        _sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "scripts"))
+        from plan_runner import rerun_plan as _rerun
+        return _rerun(plan_id)
+    except Exception as e:
+        return {"ok": False, "error": f"rerun failed: {e}"}
+
+
 def run(args: Dict[str, Any] | None = None) -> Dict[str, Any]:
     args = args or {}
     action = str(args.get("action", "list")).lower().strip()
@@ -204,10 +226,13 @@ def run(args: Dict[str, Any] | None = None) -> Dict[str, Any]:
                 archive=bool(args.get("archive", True)),
             )
 
+        if action == "rerun":
+            return rerun_plan(args.get("plan_id"))
+
         return {
             "ok": False,
             "error": f"Unknown action: {action}",
-            "valid_actions": ["list", "show", "edit", "delete"],
+            "valid_actions": ["list", "show", "edit", "delete", "rerun"],
         }
 
     except Exception as e:
@@ -225,6 +250,9 @@ SKILL = {
         "remove plan",
         "current plan",
         "active plan",
+        "rerun plan",
+        "retry plan",
+        "run plan again",
     ],
     "keywords": [
         "plan",
@@ -234,9 +262,11 @@ SKILL = {
         "delete plan",
         "edit plan",
         "show plan",
+        "rerun plan",
+        "retry plan",
     ],
     "args_schema": {
-        "action": "list | show | edit | delete",
+        "action": "list | show | edit | delete | rerun",
         "plan_id": "optional for show, required for edit/delete",
         "updates": "JSON object for edit",
         "limit": "optional for list",

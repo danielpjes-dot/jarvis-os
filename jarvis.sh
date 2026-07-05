@@ -18,7 +18,7 @@ export OLLAMA_MODELS="/mnt/e/ollama_models"
 OLLAMA_HOST="http://127.0.0.1:11434"
 REACT_HOST="http://127.0.0.1:7900"
 BROWSER_HOST="http://127.0.0.1:4000"
-LLAMA_CPP_HOST="http://127.0.0.1:8081"
+LLAMA_CPP_HOST="http://127.0.0.1:8091"
 STAGING_ROOT="${JARVIS_STAGING:-/mnt/e/coding/staging}"
 source "$PROJECT_DIR/scripts/n8n.sh"
 export OLLAMA_MODELS
@@ -36,7 +36,7 @@ set +a
 LLAMA_SERVER_CMD="$PROJECT_DIR/../llama.cpp/build/bin/llama-server"
 LLAMA_MODEL="/mnt/e/models/gemma4-e4b/gemma-4-E4B-it-UD-Q4_K_XL.gguf"
 LLAMA_MMPROJ="/mnt/e/models/gemma4-e4b/mmproj-BF16.gguf"
-LLAMA_PORT="8081"
+LLAMA_PORT="8091"
 
 # ── llama-server ──────────────────────────────────────────────────────────────
 
@@ -387,6 +387,8 @@ preload_model() {
 # ── Telegram watcher ──────────────────────────────────────────────────────────
 
 telegram_watcher() {
+  pkill -9 -f telegram_watcher.py 2>/dev/null
+  sleep 1
   cd "$PROJECT_DIR" || return 1
   set -a
   [ -f "$PROJECT_DIR/.env" ] && source "$PROJECT_DIR/.env"
@@ -537,8 +539,8 @@ do_start() {
   echo "$! react-server" >> "$PIDFILE"
   sleep 2
 
-  log "Starting Telegram watcher"
-  telegram_watcher
+  # Telegram watcher is started by loop.sh (run_forever auto-restart).
+  # Starting it here TOO caused two instances → Telegram HTTP 409 conflicts.
 
   log "Starting Dictation daemon"
   dictation_daemon

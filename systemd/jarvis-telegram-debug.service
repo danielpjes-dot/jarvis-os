@@ -1,0 +1,15 @@
+[Unit]
+Description=JARVIS Telegram debug tail
+PartOf=jarvis.target
+After=jarvis-telegram.service
+
+[Service]
+WorkingDirectory=/mnt/e/coding/jarvis-os
+EnvironmentFile=-/mnt/e/coding/jarvis-os/.env
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/usr/bin/python3 -u /mnt/e/coding/jarvis-os/scripts/telegram_debug_tail.py
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=jarvis.target
