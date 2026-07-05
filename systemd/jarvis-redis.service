@@ -1,0 +1,17 @@
+[Unit]
+Description=JARVIS Redis (podman, appendonly)
+PartOf=jarvis.target
+After=network.target
+
+[Service]
+ExecStartPre=-/usr/bin/podman rm -f jarvis-redis
+ExecStart=/usr/bin/podman run --rm --name jarvis-redis \
+  -p 6379:6379 \
+  -v jarvis_redis:/data \
+  docker.io/library/redis:7 redis-server --appendonly yes
+ExecStop=/usr/bin/podman stop -t 10 jarvis-redis
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=jarvis.target

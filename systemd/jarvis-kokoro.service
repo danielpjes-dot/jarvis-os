@@ -1,0 +1,15 @@
+[Unit]
+Description=JARVIS Kokoro TTS (:5100)
+PartOf=jarvis.target
+After=network.target
+
+[Service]
+WorkingDirectory=/mnt/e/coding/jarvis-os
+EnvironmentFile=-/mnt/e/coding/jarvis-os/.env
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/usr/bin/python3 -u /mnt/e/coding/jarvis-os/scripts/kokoro_server.py
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=jarvis.target

@@ -157,7 +157,9 @@ def load_skills() -> List[Dict[str, Any]]:
     enabled_map: Dict[str, bool] = {}
     if CONFIG_PATH.exists():
         try:
-            enabled_map = json.loads(CONFIG_PATH.read_text(encoding="utf-8")).get("enabled", {})
+            cfg = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
+            # accept both {"enabled": {...}} and legacy {"skills": {...}}
+            enabled_map = cfg.get("enabled") or cfg.get("skills") or {}
             if not isinstance(enabled_map, dict):
                 enabled_map = {}
         except Exception as e:

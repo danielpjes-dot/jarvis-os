@@ -1,0 +1,6 @@
+[Unit]
+Description=JARVIS OS — all services
+Documentation=file:///mnt/e/coding/jarvis-os/JARVIS.md
+
+[Install]
+WantedBy=default.target

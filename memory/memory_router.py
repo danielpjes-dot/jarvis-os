@@ -27,6 +27,7 @@ Return from route():
 """
 
 import json
+import os
 import requests
 from pathlib import Path
 from qdrant_client import QdrantClient
@@ -48,7 +49,7 @@ except Exception:
 OLLAMA_BASE   = "http://127.0.0.1:11434"
 EMBED_MODEL   = "nomic-embed-text"
 
-LLAMA_CPP_BASE = "http://127.0.0.1:8081"
+LLAMA_CPP_BASE = os.environ.get("LLAMA_CPP_HOST", "http://127.0.0.1:8091")
 FAST_MODEL     = "gemma4:4b"   # label only — llama.cpp serves whatever is loaded
 
 QDRANT_HOST  = "127.0.0.1"
@@ -58,7 +59,13 @@ OBSIDIAN_DIR = Path("/mnt/d/Jarvis_vault")
 CHAT_LOG_PATH = Path("/mnt/d/Jarvis_vault/chat_log.jsonl")
 TOP_K        = 5
 SCORE_MIN    = 0.55
-CHAT_CONFIDENCE_MIN = 0.9   # chat_only and memory paths must meet this threshold
+# chat_only and memory paths must meet this threshold; 0.9 escalated almost
+# every chat to planner (slow). Overridable without code changes.
+CHAT_CONFIDENCE_MIN = float(os.environ.get("JARVIS_CHAT_CONFIDENCE_MIN", "0.75"))
+# Pass 2 (fetch-plan) LLM call: off by default — the fallback plan (query =
+# user message per requested type) is nearly always what the LLM returned
+# anyway, and skipping it saves one Gemma round-trip per memory fetch.
+FETCH_PLAN_USE_LLM = os.environ.get("JARVIS_FETCH_PLAN_LLM", "0") == "1"
 
 REACT_HOST   = "http://127.0.0.1:7900"
 
@@ -66,8 +73,13 @@ REACT_HOST   = "http://127.0.0.1:7900"
 # Helpers
 # ---------------------------------------------------------------------------
 
+FALLBACK_ROUTER_MODEL = os.environ.get("JARVIS_ROUTER_FALLBACK_MODEL", "qwen3:14b")
+
+
 def _llama(prompt: str, system: str, timeout: int = 20) -> str:
-    """Call llama.cpp server (Gemma 4B) for fast routing passes."""
+    """Call llama.cpp server (Gemma 4B) for fast routing passes.
+    Falls back to Ollama when llama.cpp is down — with the Claude proxy on
+    :11434 that fallback transparently runs on the cloud."""
     try:
         resp = requests.post(f"{LLAMA_CPP_BASE}/v1/chat/completions", json={
             "model":       "gemma",
@@ -82,8 +94,25 @@ def _llama(prompt: str, system: str, timeout: int = 20) -> str:
         if "<think>" in raw:
             raw = raw.split("</think>")[-1].strip()
         return raw
-    except Exception as e:
-        return f"ERROR: {e}"
+    except Exception as llama_err:
+        try:
+            resp = requests.post(f"{OLLAMA_BASE}/api/chat", json={
+                "model": FALLBACK_ROUTER_MODEL,
+                "messages": [
+                    {"role": "system", "content": system},
+                    {"role": "user",   "content": prompt}
+                ],
+                "stream": False,
+                "think": False,
+                "options": {"temperature": 0.1},
+            }, timeout=max(timeout, 60))
+            raw = resp.json()["message"]["content"].strip()
+            if "<think>" in raw:
+                raw = raw.split("</think>")[-1].strip()
+            print(f"[ROUTER] llama.cpp down, used Ollama fallback ({FALLBACK_ROUTER_MODEL})")
+            return raw
+        except Exception:
+            return f"ERROR: {llama_err}"
 
 
 def _embed(text: str) -> list[float] | None:
@@ -320,6 +349,14 @@ def classify(user_input: str, recent_turns: list[str] | None = None) -> dict:
     if not parsed:
         fallback = _empty_live()
         fallback["_parse_error"] = result[:200]
+        if result.startswith("ERROR:"):
+            # llama.cpp unreachable — don't mask it as a mishearing.
+            # Route to reason so the main model still answers.
+            fallback["speak"] = ""
+            fallback["action"] = "planner"
+            fallback["route"] = "reason"
+            fallback["transcript"] = user_input
+            print(f"[ROUTER] classify LLM failed, escalating to reason: {result[:120]}")
         return fallback
 
     defaults = _empty_live()
@@ -425,11 +462,14 @@ def build_fetch_plan(user_input: str, memory_types: list[dict]) -> dict:
     if "tools" in type_names:
         fixed_plan["tools"] = None
 
-    prompt = f"Memory types needed: {type_names}\nUser message: {user_input}"
-    result = _llama(prompt, BUILD_QUERY_SYSTEM)
-    parsed = _parse_json(result) or {}
+    parsed: dict = {}
+    if FETCH_PLAN_USE_LLM:
+        # Optional Pass-2 LLM refinement (env JARVIS_FETCH_PLAN_LLM=1)
+        prompt = f"Memory types needed: {type_names}\nUser message: {user_input}"
+        result = _llama(prompt, BUILD_QUERY_SYSTEM)
+        parsed = _parse_json(result) or {}
 
-    # Merge LLM plan, but do not allow it to null recent_chat
+    # Merge fixed rules, but do not allow the LLM to null recent_chat
     parsed.update(fixed_plan)
 
     for t in type_names:

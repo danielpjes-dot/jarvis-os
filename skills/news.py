@@ -162,33 +162,11 @@ def _dedupe_items(items: List[Dict[str, str]]) -> List[Dict[str, str]]:
 # Telegram push
 # ---------------------------------------------------------------------------
 
-def _push_to_telegram(title: str, items: List[Dict[str, Any]]) -> None:
-    """Fire-and-forget Telegram push. Never raises — skill result is unaffected."""
-    token   = os.environ.get("TELEGRAM_BOT_TOKEN")
-    chat_id = os.environ.get("TELEGRAM_CHAT_ID")
-    if not token or not chat_id:
-        return
-
-    lines = [f"<b>{html.escape(title)}</b>\n"]
-    for item in items:
-        t     = html.escape(item.get("title", ""))
-        src   = html.escape(item.get("source", ""))
-        story = html.escape(item.get("story", ""))
-        url   = item.get("url", "")
-
-        line = f'<a href="{url}">{t}</a>' if url else t
-        if src:
-            line += f" <i>({src})</i>"
-        if story:
-            line += f"\n<i>{story}</i>"
-        lines.append(line + "\n")
-
-    message = "\n".join(lines)
-
+def _send_telegram_message(token: str, chat_id: str, message: str) -> bool:
+    """Send one Telegram message. Returns False on failure, never raises."""
     # Telegram hard limit is 4096 chars
     if len(message) > 4000:
         message = message[:4000].rsplit("\n", 1)[0] + "\n\n<i>...truncated</i>"
-
     try:
         url  = f"https://api.telegram.org/bot{token}/sendMessage"
         data = urllib.parse.urlencode({
@@ -204,8 +182,42 @@ def _push_to_telegram(title: str, items: List[Dict[str, Any]]) -> None:
             ),
             timeout=8,
         )
+        return True
     except Exception:
-        pass  # Never let Telegram failure break the skill response
+        return False  # Never let Telegram failure break the skill response
+
+
+def _push_to_telegram(title: str, items: List[Dict[str, Any]]) -> None:
+    """Fire-and-forget Telegram push — one message per news item.
+    Never raises — skill result is unaffected."""
+    token = (
+        os.environ.get("TELEGRAM_BOT_TOKEN")
+        or os.environ.get("JARVIS_TELEGRAM_BOT_TOKEN")
+    )
+    chat_id = (
+        os.environ.get("TELEGRAM_CHAT_ID")
+        or os.environ.get("JARVIS_TELEGRAM_ALLOWED_CHAT_IDS", "").split(",")[0].strip()
+    )
+    if not token or not chat_id:
+        return
+
+    if items:
+        _send_telegram_message(token, chat_id, f"<b>{html.escape(title)}</b>")
+
+    for item in items:
+        t     = html.escape(item.get("title", ""))
+        src   = html.escape(item.get("source", ""))
+        story = html.escape(item.get("story", ""))
+        url   = item.get("url", "")
+
+        line = f'<a href="{url}">{t}</a>' if url else t
+        if src:
+            line += f" <i>({src})</i>"
+        if story:
+            line += f"\n<i>{story}</i>"
+
+        if not _send_telegram_message(token, chat_id, line):
+            break  # bot blocked / rate-limited — stop spamming attempts
 
 
 # ---------------------------------------------------------------------------

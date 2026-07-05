@@ -1,0 +1,13 @@
+[Unit]
+Description=JARVIS Ollama model server (:11434)
+PartOf=jarvis.target
+After=network.target
+
+[Service]
+Environment=OLLAMA_MODELS=/mnt/e/ollama_models
+ExecStart=/usr/local/bin/ollama serve
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=jarvis.target

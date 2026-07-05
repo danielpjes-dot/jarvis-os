@@ -1,0 +1,18 @@
+[Unit]
+Description=JARVIS Telegram watcher (SINGLE instance — two watchers cause HTTP 409)
+PartOf=jarvis.target
+After=jarvis-react.service
+
+[Service]
+WorkingDirectory=/mnt/e/coding/jarvis-os
+EnvironmentFile=-/mnt/e/coding/jarvis-os/.env
+Environment=PYTHONUNBUFFERED=1
+# Kill any stray manually-started watcher before claiming the bot token
+ExecStartPre=-/usr/bin/pkill -9 -f telegram_watcher.py
+ExecStartPre=/bin/sleep 1
+ExecStart=/usr/bin/python3 -u /mnt/e/coding/jarvis-os/scripts/telegram_watcher.py
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=jarvis.target

@@ -1,0 +1,15 @@
+[Unit]
+Description=JARVIS plan runner (Redis task consumer, 4 parallel workers)
+PartOf=jarvis.target
+After=jarvis-redis.service jarvis-init.service jarvis-ollama.service
+
+[Service]
+WorkingDirectory=/mnt/e/coding/jarvis-os
+EnvironmentFile=-/mnt/e/coding/jarvis-os/.env
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/usr/bin/python3 -u /mnt/e/coding/jarvis-os/scripts/plan_runner.py
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=jarvis.target

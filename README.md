@@ -10,6 +10,12 @@ Built by [Sami Porokka](https://poro-it.com) / Poro-IT OÜ
 
 - **4-Pass Memory Router** — Ambiguity, memory, tool selection, and route classification in one fast Gemma4 pass
 - **Agentic Plan System** — `build X` → structured 8-10 step plan → human approval → plan_runner executes → staging pipeline
+- **Self-Healing Plan Runner** — 4 parallel workers, crash auto-recovery (orphaned tasks re-queued at boot), dep-timeout re-queue, retry backoff, and an LLM failure-diagnosis loop (CAUSE/FIX logged to the vault + one diagnosis-guided retry)
+- **Plan Rerun & Versioning** — `POST /rerun/{plan_id}` clones any plan under a versioned ID (`PLAN-X-001` → `-2` → `-3`)
+- **systemd Services** — 17 units + installer; everything auto-starts at WSL boot via linger (`systemctl --user start jarvis.target`)
+- **Claude API Mode** — `claude_proxy.py` emulates Ollama + llama.cpp APIs over the Claude API; the whole stack runs cloud-only with zero code changes (optional Voyage AI embeddings)
+- **Backend Fallback Chain** — llama.cpp down → automatic Ollama fallback (with a minimum-model guard) → or the Claude proxy if that's what is on :11434
+- **Multi-Message Telegram** — any skill or model reply containing a `---next---` line is auto-split into separate Telegram messages; long replies chunk instead of truncating
 - **Staging Pipeline** — `staging/dev/` → Playwright/Podman testing → `staging/tested/` → human approval → `staging/approved/`
 - **Codex UI** — In-browser coding workspace with plan picker, step status, file browser, PTY terminal, and approve button
 - **ReAct Agent Loop** — Think → Tool → Observe → Repeat until task complete (max 8 iterations)
@@ -301,12 +307,46 @@ python3 tts/server.py   # :5100
 
 ### Start / Stop / Status
 
+**systemd (recommended — auto-starts at WSL boot):**
+
+```bash
+bash systemd/install.sh --start        # one-time install + enable + start
+systemctl --user start jarvis.target   # start everything
+systemctl --user stop jarvis.target    # stop everything (snapshots memory first)
+systemctl --user status 'jarvis-*'     # health of all services
+journalctl --user -u jarvis-react -f   # follow a service log
+```
+
+> **WSL note:** WSL2 shuts its VM down when the last `wsl.exe` client exits — services inside don't keep it alive. The installer docs cover a keep-alive (`wsl.exe -e sleep infinity` from the Windows Startup folder); without it Jarvis only lives while a WSL terminal is open.
+
+**Classic script (still works):**
+
 ```bash
 bash jarvis.sh start     # Boot everything (react_server, plan_runner, watcher)
 bash jarvis.sh stop      # Shut down
 bash jarvis.sh status    # Health check all services
 bash jarvis.sh restart   # Restart all services
 ```
+
+### Claude API Mode (no local models)
+
+```bash
+export ANTHROPIC_API_KEY=sk-ant-...             # or config/cloud_llm.json
+sudo systemctl stop ollama                       # free :11434
+systemctl --user stop jarvis-llama               # stop llama.cpp
+systemctl --user enable --now jarvis-claude-proxy
+```
+
+The proxy speaks Ollama (`/api/chat`, `/api/tags`, `/api/embeddings`) and llama.cpp (`/v1/chat/completions`) formats and forwards to Anthropic. Model mapping: small/fast names → Haiku, everything else → Sonnet (`JARVIS_CLAUDE_MODEL` / `JARVIS_CLAUDE_FAST_MODEL`). Embeddings via Voyage AI when `VOYAGE_API_KEY` is set, otherwise semantic search degrades gracefully.
+
+### Plan Rerun
+
+```bash
+curl -X POST http://127.0.0.1:8766/rerun/PLAN-20260629-001
+# → clones as PLAN-20260629-001-2 and queues all tasks fresh
+```
+
+Failed tasks are auto-diagnosed (CAUSE/FIX via qwen3:14b), logged to `<vault>/.jarvis/plan_failures.md`, and retried once with the diagnosis injected into the coder prompt.
 
 ### Plan Commands
 
@@ -332,9 +372,11 @@ python3 scripts/voice_capture.py --wake   # Wake word mode ("Hey JARVIS")
 |-----------|-----|-------------|
 | **Stark HUD** | http://localhost:3000 | Next.js holographic dashboard |
 | **ReAct API** | http://localhost:7900 | Main agent server |
+| **Plan API** | http://localhost:8766 | Plan status + `/rerun/{plan_id}` |
 | **Kokoro TTS** | http://localhost:5100 | Local TTS (Kokoro/Orpheus) |
 | **PTY Bridge** | ws://localhost:4010 | Terminal WebSocket |
-| **llama.cpp** | http://localhost:8081 | Memory router model |
+| **llama.cpp** | http://localhost:8091 | Memory router model (gemma4) |
+| **Claude Proxy** | http://localhost:11434 | Optional — Ollama-compatible Claude API backend |
 | **UE MCP** | http://localhost:3000/mcp | Unreal Engine 5.8 built-in MCP server |
 | **UE TCP Bridge** | localhost:55557 | Custom MetaHuman / Blueprint tools |
 
@@ -362,11 +404,17 @@ GET  /api/timers            Active countdown timers
 
 ```
 jarvis-os/
-├── jarvis.sh                  # Start/stop/restart/status
+├── jarvis.sh                  # Start/stop/restart/status (classic)
+├── systemd/                   # systemd user units + install.sh (recommended)
+│   ├── jarvis.target          # Umbrella target — start/stop everything
+│   ├── jarvis-*.service       # One unit per service (17 units)
+│   └── install.sh             # Installer (--start / --uninstall)
 ├── JARVIS.md                  # Personality and persona file
 ├── scripts/
 │   ├── react_server.py        # Main agent server :7900
-│   ├── plan_runner.py         # Plan execution daemon (Redis consumer)
+│   ├── plan_runner.py         # Plan execution daemon (self-healing, 4 workers)
+│   ├── claude_proxy.py        # Ollama/llama.cpp-compatible Claude API proxy
+│   ├── jarvis_boot_init.py    # One-shot boot init (staging, redis, snapshots)
 │   ├── memory/
 │   │   ├── memory_router.py   # 4-pass Gemma4 classifier
 │   │   └── redis_memory.py    # Working memory helpers

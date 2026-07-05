@@ -19,7 +19,10 @@ from pathlib import Path
 from typing import List, Optional
 
 
-SKILL_NAME = "shell"
+# NOTE: named "shell_diagnostics" (not "shell") — shell_skill.py owns
+# SKILL_NAME "shell"; plan_runner dispatches plan tasks to skill "shell"
+# and duplicate names overwrite each other in its registry.
+SKILL_NAME = "shell_diagnostics"
 SKILL_DESCRIPTION = "Shell diagnostics + source code file reading"
 SKILL_VERSION = "1.2.0"
 SKILL_AUTHOR = "Sami Porokka"
@@ -321,8 +324,10 @@ TOOLS = [
     {
         "type": "function",
         "function": {
-            "name": "read_file",
-            "description": "Read a text/source file from approved coding or vault directories.",
+            # named read_source_file — shell_skill.py owns the generic
+            # "read_file" tool; duplicate tool names get dropped by the loader
+            "name": "read_source_file",
+            "description": "Read a text/source file from approved coding or vault directories (read-only, sandboxed roots).",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -343,7 +348,7 @@ TOOLS = [
 
 TOOL_MAP = {
     "shell_command": exec_shell_command,
-    "read_file": exec_read_file,
+    "read_source_file": exec_read_file,
 }
 
 KEYWORDS = {
@@ -362,13 +367,12 @@ KEYWORDS = {
         "shell",
         "diagnostics",
     ],
-    "read_file": [
-        "read file",
+    "read_source_file": [
+        "read source",
         "show code",
         "check code",
         "source",
-        "open file",
-        "view file",
+        "view source",
     ],
 }
 
@@ -376,5 +380,5 @@ SKILL_EXAMPLES = [
     {"command": "check git status", "tool": "shell_command", "args": {"command": "git status"}},
     {"command": "show python version", "tool": "shell_command", "args": {"command": "python --version"}},
     {"command": "list npm packages", "tool": "shell_command", "args": {"command": "npm list"}},
-    {"command": "read watcher script", "tool": "read_file", "args": {"path": "/mnt/e/coding/jarvis-os/scripts/watcher.sh"}},
+    {"command": "read watcher script", "tool": "read_source_file", "args": {"path": "/mnt/e/coding/jarvis-os/scripts/watcher.sh"}},
 ]

@@ -1,0 +1,17 @@
+[Unit]
+Description=JARVIS boot init (staging, bridge state, redis init, snapshot ingestion)
+PartOf=jarvis.target
+After=jarvis-redis.service jarvis-qdrant.service jarvis-ollama.service
+Wants=jarvis-redis.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+WorkingDirectory=/mnt/e/coding/jarvis-os
+EnvironmentFile=-/mnt/e/coding/jarvis-os/.env
+Environment=PYTHONUNBUFFERED=1
+ExecStartPre=/bin/sleep 3
+ExecStart=/usr/bin/python3 /mnt/e/coding/jarvis-os/scripts/jarvis_boot_init.py
+
+[Install]
+WantedBy=jarvis.target

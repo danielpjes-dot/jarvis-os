@@ -1,0 +1,15 @@
+[Unit]
+Description=JARVIS ReAct tool server (:7900)
+PartOf=jarvis.target
+After=jarvis-ollama.service jarvis-redis.service jarvis-init.service
+
+[Service]
+WorkingDirectory=/mnt/e/coding/jarvis-os
+EnvironmentFile=-/mnt/e/coding/jarvis-os/.env
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/usr/bin/python3 -u /mnt/e/coding/jarvis-os/scripts/react_server.py
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=jarvis.target

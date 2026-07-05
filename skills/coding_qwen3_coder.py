@@ -106,6 +106,15 @@ def exec_code_edit(
         paths=paths,
     )
 
+# Directories that must never be bulk-read into a prompt
+_SKIP_DIRS = {
+    "__pycache__", "node_modules", ".git", ".venv", "venv",
+    "orpheus_env", "site-packages", "dist", "build", ".next",
+}
+_MAX_DIR_FILES = 20        # max files pulled from a directory read
+_MAX_TOTAL_CHARS = 120000  # hard cap on total prompt payload from files
+
+
 def _read_path(path: str, max_chars: int = 20000) -> str:
     p = _safe_path(path)
 
@@ -115,11 +124,22 @@ def _read_path(path: str, max_chars: int = 20000) -> str:
 
     if p.is_dir():
         parts: List[str] = []
+        total = 0
+        count = 0
         for f in sorted(p.rglob("*.py")):
-            if "__pycache__" in str(f):
+            if any(part in _SKIP_DIRS for part in f.parts):
                 continue
+            if count >= _MAX_DIR_FILES or total >= _MAX_TOTAL_CHARS:
+                parts.append(
+                    f"\n\n### NOTE: directory truncated at {count} files "
+                    f"({total} chars). Pass explicit paths for more."
+                )
+                break
             text = f.read_text(encoding="utf-8", errors="replace")
-            parts.append(f"\n\n### FILE: {f}\n```\n{text[:max_chars]}\n```")
+            block = f"\n\n### FILE: {f}\n```\n{text[:max_chars]}\n```"
+            parts.append(block)
+            total += len(block)
+            count += 1
         return "\n".join(parts)
 
     # New file case

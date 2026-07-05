@@ -1,0 +1,15 @@
+[Unit]
+Description=JARVIS plan runner HTTP API (:8766 — status + /rerun endpoint)
+PartOf=jarvis.target
+After=jarvis-redis.service
+
+[Service]
+WorkingDirectory=/mnt/e/coding/jarvis-os/scripts
+EnvironmentFile=-/mnt/e/coding/jarvis-os/.env
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/usr/bin/python3 -m uvicorn plan_runner:app --host 127.0.0.1 --port 8766
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=jarvis.target

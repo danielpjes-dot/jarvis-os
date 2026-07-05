@@ -262,29 +262,59 @@ class TelegramGateway:
         with urllib.request.urlopen(req, timeout=15) as resp:
             return json.loads(resp.read().decode("utf-8"))
 
+    # Any reply containing this marker (on its own line, dashes flexible) is
+    # split and sent as SEPARATE Telegram messages. Skills and models can emit
+    # "---next---" between sections to get multi-message output for free.
+    _SPLIT_MARKER = re.compile(r"\s*\n\s*-{3,}\s*next\s*-{3,}\s*\n?\s*", re.IGNORECASE)
+    _TELEGRAM_LIMIT = 3900
+
+    @classmethod
+    def _split_for_telegram(cls, text: str) -> list[str]:
+        """Split on ---next--- markers, then chunk anything still over the
+        Telegram limit at line boundaries (no more silent truncation)."""
+        parts = [p.strip() for p in cls._SPLIT_MARKER.split(text) if p.strip()]
+
+        chunks: list[str] = []
+        for part in parts:
+            while len(part) > cls._TELEGRAM_LIMIT:
+                cut = part.rfind("\n", 0, cls._TELEGRAM_LIMIT)
+                if cut < cls._TELEGRAM_LIMIT // 2:
+                    cut = cls._TELEGRAM_LIMIT
+                chunks.append(part[:cut].rstrip())
+                part = part[cut:].lstrip()
+            if part:
+                chunks.append(part)
+        return chunks
+
     def send_message(self, chat_id: str | int, text: str) -> Dict[str, Any]:
         if not self.token:
             raise RuntimeError("Missing JARVIS_TELEGRAM_BOT_TOKEN")
 
-        payload = urllib.parse.urlencode(
-            {
-                "chat_id": str(chat_id),
-                "text": text[:3900],
-            }
-        ).encode("utf-8")
+        data: Dict[str, Any] = {}
+        pieces = self._split_for_telegram(text) or [""]
+        for i, piece in enumerate(pieces):
+            if i:
+                time.sleep(0.3)   # keep ordering stable, stay under rate limits
 
-        req = urllib.request.Request(
-            self._api_url("sendMessage"),
-            data=payload,
-            headers={"Content-Type": "application/x-www-form-urlencoded"},
-            method="POST",
-        )
+            payload = urllib.parse.urlencode(
+                {
+                    "chat_id": str(chat_id),
+                    "text": piece[: self._TELEGRAM_LIMIT],
+                }
+            ).encode("utf-8")
 
-        with urllib.request.urlopen(req, timeout=20) as resp:
-            data = json.loads(resp.read().decode("utf-8"))
+            req = urllib.request.Request(
+                self._api_url("sendMessage"),
+                data=payload,
+                headers={"Content-Type": "application/x-www-form-urlencoded"},
+                method="POST",
+            )
 
-        if not data.get("ok"):
-            raise RuntimeError(f"Telegram sendMessage failed: {data}")
+            with urllib.request.urlopen(req, timeout=20) as resp:
+                data = json.loads(resp.read().decode("utf-8"))
+
+            if not data.get("ok"):
+                raise RuntimeError(f"Telegram sendMessage failed: {data}")
 
         return data
 
@@ -293,6 +323,166 @@ class TelegramGateway:
             return True
         return str(chat_id) in self.allowed_chat_ids
     
+    def send_audio(self, chat_id: str | int, wav_bytes: bytes, caption: str = "") -> Dict[str, Any]:
+        """Send a WAV file as a Telegram audio message (voice note)."""
+        boundary = "boundary_jarvis_audio"
+        body: list[bytes] = []
+
+        body.append(f"--{boundary}\r\nContent-Disposition: form-data; name=\"chat_id\"\r\n\r\n{chat_id}\r\n".encode())
+        if caption:
+            body.append(f"--{boundary}\r\nContent-Disposition: form-data; name=\"caption\"\r\n\r\n{caption[:200]}\r\n".encode())
+        body.append(
+            f"--{boundary}\r\nContent-Disposition: form-data; name=\"audio\"; filename=\"jarvis_reply.wav\"\r\nContent-Type: audio/wav\r\n\r\n".encode()
+            + wav_bytes
+            + b"\r\n"
+        )
+        body.append(f"--{boundary}--\r\n".encode())
+        raw = b"".join(body)
+
+        req = urllib.request.Request(
+            f"https://api.telegram.org/bot{self.token}/sendAudio",
+            data=raw,
+            headers={"Content-Type": f"multipart/form-data; boundary={boundary}"},
+            method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            return json.loads(resp.read().decode("utf-8"))
+
+    def _tts_wav(self, text: str, port: int = 5100) -> Optional[bytes]:
+        """Call local Kokoro TTS. Returns WAV bytes or None if unavailable."""
+        try:
+            payload = json.dumps({"text": text, "voice": "af_heart", "speed": 1.0}).encode()
+            req = urllib.request.Request(
+                f"http://127.0.0.1:{port}/tts/speak",
+                data=payload,
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                return resp.read()
+        except Exception:
+            return None
+
+    def _handle_mobile_packet(
+        self,
+        raw_text: str,
+        chat_id: str | int,
+        handle_message: Callable[[str, Dict[str, Any]], str],
+        update: Dict[str, Any],
+        emit_event: Optional[Callable] = None,
+    ) -> None:
+        """Parse JARVIS_MOBILE packet, get reply from handle_message, respond with text + TTS audio."""
+        try:
+            packet = json.loads(raw_text[len("JARVIS_MOBILE "):])
+        except Exception:
+            return
+
+        pkt_type = packet.get("type", "query")
+
+        # TTS-only request: mobile local model replied, wants Kokoro voice
+        if pkt_type == "tts":
+            tts_text = packet.get("text", "").strip()
+            if tts_text:
+                wav = self._tts_wav(tts_text)
+                if wav:
+                    self.send_audio(chat_id, wav)
+                    print(f"[TELEGRAM] TTS sent ({len(wav)} bytes)", flush=True)
+                else:
+                    print("[TELEGRAM] TTS requested but Kokoro unavailable", flush=True)
+            return
+
+        user_text = packet.get("text", "").strip()
+        input_type = packet.get("input", "text")   # voice | text | image
+        model_state = packet.get("model", "offline")  # offline | online | routed
+
+        if not user_text:
+            return
+
+        if emit_event:
+            emit_event("telegram_in", "Mobile query received",
+                       {"chat_id": chat_id, "input": input_type, "model": model_state, "text": user_text[:200]})
+
+        # Route through normal handle_message (Claude / skills / etc.)
+        reply_text = handle_message(user_text, update)
+        if not reply_text:
+            return
+
+        # Send structured reply text
+        reply_packet = json.dumps({"type": "reply", "text": reply_text})
+        self.send_message(chat_id, f"JARVIS_REPLY {reply_packet}")
+
+        # Attempt TTS — send audio if Kokoro is running
+        wav = self._tts_wav(reply_text)
+        if wav:
+            self.send_audio(chat_id, wav)
+
+    def _handle_mobile_voice(
+        self,
+        file_id: str,
+        caption: str,
+        chat_id: str | int,
+        handle_message: Callable[[str, Dict[str, Any]], str],
+        update: Dict[str, Any],
+        emit_event: Optional[Callable] = None,
+    ) -> None:
+        """Download voice from Telegram, transcribe with local Whisper.
+        JARVIS_VOICE_TRANSCRIBE → send transcript back (mobile routes locally).
+        JARVIS_VOICE_QUERY      → full reply + TTS audio."""
+        import base64 as _b64
+        transcribe_only = "JARVIS_VOICE_TRANSCRIBE" in caption
+        try:
+            # Resolve Telegram file path
+            url = self._api_url("getFile") + f"?file_id={file_id}"
+            with urllib.request.urlopen(url, timeout=10) as resp:
+                file_info = json.loads(resp.read())
+            file_path = file_info["result"]["file_path"]
+
+            # Download audio bytes
+            audio_url = f"https://api.telegram.org/file/bot{self.token}/{file_path}"
+            with urllib.request.urlopen(audio_url, timeout=30) as resp:
+                audio_bytes = resp.read()
+
+            # Transcribe via local Whisper at :7900
+            audio_b64 = _b64.b64encode(audio_bytes).decode()
+            payload = json.dumps({"audio": audio_b64}).encode()
+            req = urllib.request.Request(
+                "http://127.0.0.1:7900/transcribe",
+                data=payload,
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                result = json.loads(resp.read())
+            transcript = result.get("text", "").strip()
+
+            print(f"[TELEGRAM] voice transcript ({('transcribe_only' if transcribe_only else 'full')}): {transcript[:100]!r}", flush=True)
+
+            if not transcript:
+                self.send_message(chat_id, "JARVIS_REPLY " + json.dumps({"type": "reply", "text": "[no speech detected]"}))
+                return
+
+            if emit_event:
+                emit_event("telegram_in", "Mobile voice", {"chat_id": chat_id, "mode": "transcribe" if transcribe_only else "full", "text": transcript[:200]})
+
+            if transcribe_only:
+                # Mobile has local model — just return the transcript
+                self.send_message(chat_id, "JARVIS_TRANSCRIPT " + json.dumps({"text": transcript}))
+                return
+
+            # Full handling: route through Claude, reply with TTS
+            reply_text = handle_message(transcript, update)
+            if not reply_text:
+                return
+            self.send_message(chat_id, "JARVIS_REPLY " + json.dumps({"type": "reply", "text": reply_text}))
+            wav = self._tts_wav(reply_text)
+            if wav:
+                self.send_audio(chat_id, wav)
+
+        except Exception as e:
+            print(f"[TELEGRAM] voice handling error: {e}", flush=True)
+            if emit_event:
+                emit_event("telegram_error", "Voice handling error", {"error": str(e)})
+
     def _send_skills_export(self, chat_id: str | int) -> None:
         try:
             from skills.loader import get_all_skill_meta, get_loaded_skills
@@ -377,10 +567,21 @@ class TelegramGateway:
                     chat_id = chat.get("id")
                     text = message.get("text", "")
 
-                    print(f"[TELEGRAM] chat_id={chat_id} text={text!r}", flush=True)
-
-                    if not chat_id or not text:
+                    if not chat_id:
                         continue
+
+                    # Handle voice/audio messages from mobile (JARVIS_VOICE_QUERY)
+                    voice_obj = message.get("voice") or message.get("audio")
+                    if voice_obj and not text:
+                        if self.is_allowed(chat_id):
+                            caption = message.get("caption", "")
+                            self._handle_mobile_voice(voice_obj["file_id"], caption, chat_id, handle_message, update, emit_event)
+                        continue
+
+                    if not text:
+                        continue
+
+                    print(f"[TELEGRAM] chat_id={chat_id} text={text!r}", flush=True)
 
                     if not self.is_allowed(chat_id):
                         self.send_message(chat_id, "This chat is not allowed to use this JARVIS bot.")
@@ -408,6 +609,11 @@ class TelegramGateway:
 
                     if text.strip().lower() in ("/skills", "/skills@jarvisbot"):
                         self._send_skills_export(chat_id)
+                        continue
+
+                    # Structured mobile packet — handle separately with TTS response
+                    if text.startswith("JARVIS_MOBILE "):
+                        self._handle_mobile_packet(text, chat_id, handle_message, update, emit_event)
                         continue
 
                     if emit_event:
